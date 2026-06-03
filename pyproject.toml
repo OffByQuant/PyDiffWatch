@@ -5,7 +5,7 @@ description = "Rules-driven PyPI supply-chain malware scanner (open-source PyDif
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "Ankit Prateek" }]
+authors = [{ name = "Appy" }]
 dependencies = ["PyYAML>=6.0"]
 
 [project.optional-dependencies]

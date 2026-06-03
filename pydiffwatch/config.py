@@ -29,7 +29,7 @@ class Config:
     db_path: Path = Path(".diffwatch/diffwatch.sqlite")
     cache_dir: Path = Path(".diffwatch/artifact_cache")
     lock_path: Path = Path(".diffwatch/diffwatch.lock")
-    # containment caps (ported verbatim from main DiffWatch)
+    # containment caps
     max_download_bytes: int = 50 * 1024 * 1024
     max_members: int = 2000
     max_member_bytes: int = 10 * 1024 * 1024
@@ -44,7 +44,7 @@ class Config:
     max_releases_per_run: int = 2000
     fetch_concurrency: int = 4
     new_package_policy: str = "surface"   # "surface" | "skip" | "full"
-    threshold_t: float = 40.0             # baseline default; production-tuned value held back in main
+    threshold_t: float = 40.0             # baseline default; tune for your tolerance
     pypi_base: str = "https://pypi.org"
     webhook_url: str | None = None
     evidence_max_chars: int = 200_000

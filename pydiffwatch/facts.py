@@ -2,10 +2,9 @@
 primitive categories, encoded-blob signal, syntax-error, location weight; plus normalized binary/dep
 findings and the maintainer-change flag. Pure and deterministic. Static AST analysis only — no execution.
 
-The import-binding machinery (_build_import_table / _resolve_call / _PRIM_BINDINGS) is the PUBLIC half of
-main DiffWatch's triage: a call counts as a dangerous primitive only when its receiver resolves via the
-file's import table to an origin in the name's allowlist (so re.compile != exec, json.loads != decode).
-The private decode->exec dataflow taint chain is NOT part of this engine (held back upstream)."""
+The import-binding machinery (_build_import_table / _resolve_call / _PRIM_BINDINGS) is what makes primitive
+detection precise: a call counts as a dangerous primitive only when its receiver resolves via the
+file's import table to an origin in the name's allowlist (so re.compile != exec, json.loads != decode)."""
 import ast
 import math
 import posixpath

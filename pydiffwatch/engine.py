@@ -1,9 +1,8 @@
 """Rules-engine triage: build facts from a diff, run the loaded ruleset over them, sum weights.
 
-Drop-in replacement for main DiffWatch's hardwired `triage.triage`, emitting the same public types
-(`FiredRule`, `TriageResult`) so the orchestrator/notifier/store are unchanged. The detection opinions
+Emits `FiredRule` / `TriageResult` for the orchestrator/notifier/store. The detection opinions
 live entirely in the loaded rules (`rules/community/*.yaml`); this module owns only scoring + scope
-iteration. The decode->exec taint chain and production-tuned weights are NOT here (held back upstream)."""
+iteration."""
 from .facts import build_facts
 from .models import FiredRule, TriageResult
 from .rules import evaluate

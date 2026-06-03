@@ -5,9 +5,8 @@ diffs each against its prior version, runs a **community-extensible rules engine
 escalates anything suspicious to an LLM reviewer for a verdict — so a malicious update can be caught and
 reported **before** it spreads.
 
-PyDiffWatch is the open-source sibling of a private upstream scanner. The pipeline, the rules engine, and
-a starter ruleset are all here and MIT-licensed; you bring your own compute, your own LLM endpoint, and
-your own rules.
+The pipeline, the rules engine, and a starter ruleset are all here and MIT-licensed; you bring your own
+compute, your own LLM endpoint, and your own rules.
 
 **New here?** [HOWTO.md](HOWTO.md) is a step-by-step setup-to-deployment guide (endpoints, API keys,
 cron/systemd/Docker/CI). This README is the overview.
@@ -118,14 +117,12 @@ code. Example: flag a base64 decode and an exec/eval co-occurring in the same ch
 See **[RULES.md](RULES.md)** for the full schema, the predicate reference, and worked examples — written
 for both humans and LLM assistants, so you (or your agent) can author a valid rule in a few minutes.
 
-## What's here vs. upstream
+## What's here
 
 PyDiffWatch ships the full pipeline and a baseline ruleset: import-bound primitive detection, auto-exec
 location weighting, decode/fetch/credential combos, foreign-language-source, added-dependency reputation,
-and maintainer-change signals. The private upstream additionally carries a dataflow taint-tracking
-loader detector and production-tuned weights; those are not part of this open release. The engine and
-rule format here are the same ones the community extends — and the same ones upstream publishes vetted
-rules into over time.
+and maintainer-change signals. The scoring weights and threshold are baselines you can tune. The engine
+and rule format here are the ones the community extends.
 
 ## License
 

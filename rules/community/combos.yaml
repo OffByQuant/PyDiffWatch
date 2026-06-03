@@ -1,5 +1,5 @@
-# Co-occurring import-bound primitive categories in the same changed file. Loose combos (no dataflow):
-# the precise decode->exec taint chain ("obfuscated-loader") is NOT shipped here (held back upstream).
+# Co-occurring import-bound primitive categories in the same changed file. Loose combos (no dataflow
+# taint tracking): a decode and an exec in the same file score, without proving the bytes flow between them.
 - id: combo-fetch-exec
   description: A network fetch and an exec/eval co-occur (download-and-run a second stage).
   applies_to: code
