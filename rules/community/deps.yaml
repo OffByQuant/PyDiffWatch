@@ -1,0 +1,22 @@
+# Added-dependency reputation findings (precomputed by deps.screen_added_deps in the fetcher).
+# Typosquat and nonexistent escalate alone; brand-new accumulates.
+- id: dep-typosquat
+  description: A newly-added dependency is edit-distance-close to a popular package (typosquat target).
+  applies_to: dep
+  weight: 40
+  attack_type: dependency-typosquat
+  match: {dep_reason: typosquat}
+
+- id: dep-nonexistent
+  description: A newly-added dependency does not exist on the index (404) — possible dependency confusion.
+  applies_to: dep
+  weight: 40
+  attack_type: dependency-confusion
+  match: {dep_reason: nonexistent}
+
+- id: dep-brand-new
+  description: A newly-added dependency was first published very recently (brand-new account/package).
+  applies_to: dep
+  weight: 20
+  attack_type: dependency-brand-new
+  match: {dep_reason: brand-new}

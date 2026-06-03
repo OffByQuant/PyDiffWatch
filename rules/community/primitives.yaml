@@ -1,0 +1,36 @@
+# Code-level primitive and obfuscation signals. Weights are baseline defaults — tune for your corpus.
+- id: syntax-error-suspicious
+  description: A complete .py/.pyx/.pyi file fails to parse (often obfuscation, packing, or a dropped binary blob).
+  applies_to: code
+  weight: 20
+  location_scaled: true
+  attack_type: obfuscation
+  match: {syntax_error: true}
+
+- id: primitives
+  description: >
+    Any import-bound dangerous primitive (process/exec/network/decode/credential) OR an encoded blob is
+    present on added lines. Corroboration only — fixed low weight; the combos and auto-exec rules escalate.
+  applies_to: code
+  weight: 5
+  location_scaled: true
+  attack_type: primitive-use
+  match:
+    any:
+      - bound_call: {category: [decode, exec, process, network, credential]}
+      - blob_present: true
+
+- id: autoexec-location
+  description: >
+    A dangerous primitive (process/exec/network) in an auto-exec location (setup.py, pyproject.toml,
+    __init__.py, .pth) — where install/import-time supply-chain malware must live.
+  applies_to: code
+  weight: 45
+  attack_type: install-hook
+  match:
+    all:
+      - location_at_least: 3.0
+      - any:
+          - bound_call: {category: process}
+          - bound_call: {category: exec}
+          - bound_call: {category: network}

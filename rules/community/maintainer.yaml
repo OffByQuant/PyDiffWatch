@@ -1,0 +1,7 @@
+# Ownership change vs the prior release we stored — an account-takeover signal. Fires once per release.
+- id: maintainer-set-change
+  description: The current owner set differs from the prior release's stored owners (possible account takeover).
+  applies_to: maintainer
+  weight: 20
+  attack_type: account-takeover
+  match: {maintainer_changed: true}

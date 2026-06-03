@@ -1,0 +1,9 @@
+# Local OpenAI-compatible endpoint (llama-swap / vLLM / LM Studio serving e.g. Qwen). No API key.
+# This is the default profile. Point base_url at your server.
+threshold_t = 40.0
+
+[reviewer]
+provider = "openai"
+base_url = "http://localhost:8000/v1"
+model = "qwen-singleshot"
+structured_output = "json_schema"

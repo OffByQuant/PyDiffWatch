@@ -1,0 +1,22 @@
+# Signals carried from the fetcher about non-source / oversized / foreign-language members.
+# Each fires once per matching added binary; weights from multiple firings sum naturally.
+- id: binary-source-too-large
+  description: A source file exceeded the per-file size cap and was recorded as a binary (evasion via bulk).
+  applies_to: binary
+  weight: 20
+  attack_type: size-evasion
+  match: {binary_reason: source-too-large}
+
+- id: foreign-language-source
+  description: Source in another programming language (e.g. .php/.c) inside a Python package — anomaly. Two escalate.
+  applies_to: binary
+  weight: 25
+  attack_type: foreign-code
+  match: {binary_reason: foreign-language-source}
+
+- id: binary-new-binary
+  description: A newly-added compiled/opaque binary member (recorded by hash; contents not analyzable statically).
+  applies_to: binary
+  weight: 10
+  attack_type: opaque-binary
+  match: {binary_reason: new-binary}

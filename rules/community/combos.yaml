@@ -1,0 +1,31 @@
+# Co-occurring import-bound primitive categories in the same changed file. Loose combos (no dataflow):
+# the precise decode->exec taint chain ("obfuscated-loader") is NOT shipped here (held back upstream).
+- id: combo-fetch-exec
+  description: A network fetch and an exec/eval co-occur (download-and-run a second stage).
+  applies_to: code
+  weight: 45
+  attack_type: network-exec
+  match:
+    all:
+      - bound_call: {category: network}
+      - bound_call: {category: exec}
+
+- id: combo-decode-exec
+  description: A decode (base64/pickle/marshal/zlib) and an exec/eval co-occur (loose loader signal).
+  applies_to: code
+  weight: 45
+  attack_type: obfuscated-loader
+  match:
+    all:
+      - bound_call: {category: decode}
+      - bound_call: {category: exec}
+
+- id: combo-cred-network
+  description: A credential read (env tokens / ~ expansion) and a network call co-occur (possible exfil).
+  applies_to: code
+  weight: 45
+  attack_type: credential-exfil
+  match:
+    all:
+      - bound_call: {category: credential}
+      - bound_call: {category: network}

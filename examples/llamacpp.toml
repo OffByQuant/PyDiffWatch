@@ -1,0 +1,7 @@
+# llama.cpp server: `llama-server -m model.gguf --port 8080`. Exposes an OpenAI-compatible /v1 API.
+# Recent builds support json_schema (GBNF-backed); fall back to json_object on older builds.
+[reviewer]
+provider = "openai"
+base_url = "http://localhost:8080/v1"
+model = "local"
+structured_output = "json_schema"

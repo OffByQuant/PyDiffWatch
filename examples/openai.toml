@@ -1,0 +1,8 @@
+# OpenAI (or any hosted OpenAI-compatible service: OpenRouter, Groq, Together, ...).
+# api_key_env names the env var holding your key — the key itself is NEVER stored in this file.
+[reviewer]
+provider = "openai"
+base_url = "https://api.openai.com/v1"
+model = "gpt-4o-mini"
+api_key_env = "OPENAI_API_KEY"
+structured_output = "json_schema"

@@ -1,0 +1,7 @@
+# Ollama via its OpenAI-compatible endpoint. `ollama serve` exposes /v1 on port 11434.
+# json_object (loose JSON) is the safe default; the client validates the verdict against the schema.
+[reviewer]
+provider = "openai"
+base_url = "http://localhost:11434/v1"
+model = "qwen2.5-coder"
+structured_output = "json_object"

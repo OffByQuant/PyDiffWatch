@@ -1,0 +1,25 @@
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.sqlite
+*.sqlite3
+*.db
+.diffwatch/
+quarantine/
+artifact_cache/
+.env
+*.local
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.DS_Store
+
+# Agent guidance — not shipped product, references private upstream
+CLAUDE.md

@@ -1,0 +1,9 @@
+# Anthropic native SDK. Install the optional extra: `pip install pydiffwatch[claude]`.
+# The SDK reads your key directly from the ANTHROPIC_API_KEY environment variable, so `api_key_env`
+# is NOT used for this provider — just `export ANTHROPIC_API_KEY=...`. Optional Opus escalation on
+# low-confidence Sonnet verdicts.
+[reviewer]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+escalation_model = "claude-opus-4-8"
+structured_output = "json_schema"
