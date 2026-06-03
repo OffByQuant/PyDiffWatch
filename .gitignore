@@ -20,3 +20,6 @@ artifact_cache/
 .ruff_cache/
 .coverage
 .DS_Store
+
+# stray empty file from a shell-redirect mishap (e.g. a lost `2>` target); never track it
+/2
