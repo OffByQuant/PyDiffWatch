@@ -20,6 +20,19 @@ Community rules are **pure data** (structured YAML) walked by a matcher with no 
 contributed rule can describe matches but can never execute code. This is the property that lets you run
 other people's detection rules safely.
 
+## Strongly recommended: run in an isolated environment
+
+The no-execution design above is the primary safeguard — treat it as one layer, not the only one.
+PyDiffWatch ingests untrusted bytes from PyPI and evaluates community-authored rules, so run it somewhere a
+broken assumption stays contained: a dedicated container, VM, or unprivileged user, with outbound network
+restricted to PyPI, your reviewer endpoint, and your webhook. The built-in default-deny egress allowlist
+(`pydiffwatch/egress.py`) enforces this in-process, but an OS-level boundary is what holds if the process
+itself is compromised. **Do not run it on a workstation or a host with credentials or data you care about.**
+
+See [`docs/hardening/`](docs/hardening/) for concrete recipes — an OS-level egress boundary
+([`egress-allowlist.md`](docs/hardening/egress-allowlist.md)) and running the byte-parsing stage under a
+container/gVisor or a no-network sandboxed subprocess ([`parse-sandbox.md`](docs/hardening/parse-sandbox.md)).
+
 ## Install
 
 ```bash
