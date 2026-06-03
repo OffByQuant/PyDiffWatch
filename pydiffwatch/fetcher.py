@@ -83,7 +83,7 @@ def extract_sdist(blob: bytes, cfg: Config):
 def _download(url: str, cfg: Config) -> bytes:
     egress.assert_web_scheme(url)   # url is from PyPI's JSON — reject file:// before urllib reads a local path
     req = urllib.request.Request(url, headers={"User-Agent": "diffwatch/0.1"})
-    with urllib.request.urlopen(req, timeout=cfg.fetch_timeout_s) as r:
+    with urllib.request.urlopen(req, timeout=cfg.fetch_timeout_s) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
         buf = bytearray()                             # amortized O(1) append; bytes += is O(n^2)
         while chunk := r.read(65536):
             buf += chunk
@@ -100,7 +100,7 @@ def _is_surface(path: str) -> bool:
 def _package_json(package: str, cfg: Config) -> dict:
     url = f"{cfg.pypi_base}/pypi/{package}/json"
     egress.assert_web_scheme(url)
-    with urllib.request.urlopen(url, timeout=cfg.fetch_timeout_s) as r:
+    with urllib.request.urlopen(url, timeout=cfg.fetch_timeout_s) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
         return json.load(r)
 
 def _sdist(files) -> dict | None:
@@ -118,7 +118,7 @@ def _requires_dist(package: str, version: str, cfg: Config) -> list:
     try:
         url = f"{cfg.pypi_base}/pypi/{package}/{version}/json"
         egress.assert_web_scheme(url)
-        with urllib.request.urlopen(url, timeout=cfg.fetch_timeout_s) as r:
+        with urllib.request.urlopen(url, timeout=cfg.fetch_timeout_s) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
             return (json.load(r).get("info") or {}).get("requires_dist") or []
     except Exception:
         return []   # can't resolve predecessor deps -> screen nothing rather than false-flag
@@ -128,7 +128,7 @@ def _dep_json(name: str, cfg: Config):
     try:
         url = f"{cfg.pypi_base}/pypi/{name}/json"
         egress.assert_web_scheme(url)
-        with urllib.request.urlopen(url, timeout=cfg.fetch_timeout_s) as r:
+        with urllib.request.urlopen(url, timeout=cfg.fetch_timeout_s) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
             return json.load(r)
     except urllib.error.HTTPError as e:
         if e.code == 404:

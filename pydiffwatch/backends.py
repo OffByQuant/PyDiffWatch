@@ -32,7 +32,8 @@ def _urllib_post_json(url: str, payload: dict, timeout: float, headers: dict | N
     body = json.dumps(payload).encode()
     hdrs = {"Content-Type": "application/json", **(headers or {})}
     req = urllib.request.Request(url, data=body, headers=hdrs)
-    with urllib.request.urlopen(req, timeout=timeout) as r:   # nosec: scheme-guarded; fixed config endpoint, not package-derived
+    # url is the operator-configured reviewer endpoint (scheme-guarded above), never package data.
+    with urllib.request.urlopen(req, timeout=timeout) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
         return json.loads(r.read())
 
 

@@ -1,5 +1,6 @@
 # Firehose source: PyPI XML-RPC changelog_since_serial (verify per Task 0; swap source here if blocked).
-import xmlrpc.client
+# xmlrpc.client is defused at the CLI entry point via defusedxml.xmlrpc.monkey_patch() (see __main__.py).
+import xmlrpc.client  # nosemgrep: python.lang.security.use-defused-xmlrpc.use-defused-xmlrpc
 from .config import Config
 from .models import NewRelease
 

@@ -27,7 +27,8 @@ def emit(cfg, conn, verdict: Verdict, release_id: int):
             body = json.dumps({"text": _render(verdict)}).encode()
             req = urllib.request.Request(cfg.webhook_url, data=body,
                                          headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=cfg.fetch_timeout_s)
+            # webhook_url is operator config (scheme-guarded above), never package data.
+            urllib.request.urlopen(req, timeout=cfg.fetch_timeout_s)  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
         except Exception:
             pass                           # alert already recorded; retry next run
     return True

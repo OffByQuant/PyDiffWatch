@@ -105,7 +105,8 @@ def releases_needing_evidence(conn, release_id=None, all_flagged=False):
                      "OR (a.classification IS NOT NULL AND a.classification != 'benign'))")
     if release_id is not None:
         where.append("r.id = ?"); params.append(release_id)
-    return conn.execute(base + " WHERE " + " AND ".join(where) + " ORDER BY r.id", params).fetchall()
+    # `where` is code-controlled literal fragments only; every user value is a bound `?` param (sqlite3, not SQLAlchemy).
+    return conn.execute(base + " WHERE " + " AND ".join(where) + " ORDER BY r.id", params).fetchall()  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
 
 def get_release_metadata(conn, package, version):
     """The stored maintainer metadata for a (package, version) as a dict, or None if absent/unset.
@@ -121,7 +122,8 @@ def update_stage(conn, release_id, stage, score=None, rules=None):
     if rules is not None:
         sets.append("triage_rules=?"); params.append(rules)
     params.append(release_id)
-    conn.execute(f"UPDATE releases SET {', '.join(sets)} WHERE id=?", params)
+    # `sets` is code-controlled column=? fragments only; every value is a bound `?` param (sqlite3, not SQLAlchemy).
+    conn.execute(f"UPDATE releases SET {', '.join(sets)} WHERE id=?", params)  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
     conn.commit()
 
 def record_alert(conn, release_id, classification, score, fired_rules_json, dedupe_key) -> bool:
