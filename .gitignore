@@ -20,6 +20,3 @@ artifact_cache/
 .ruff_cache/
 .coverage
 .DS_Store
-
-# Local agent guidance — not part of the published project
-CLAUDE.md
