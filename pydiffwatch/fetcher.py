@@ -2,7 +2,7 @@ import io, gzip, tarfile, hashlib, json, urllib.request, urllib.error, posixpath
 from datetime import datetime, timezone
 from .config import Config
 from .models import NewRelease, ArtifactSet
-from . import quarantine, deps
+from . import quarantine, deps, egress
 
 class RefusedToExtract(Exception): ...
 class RefusedToFetch(Exception): ...
@@ -81,6 +81,7 @@ def extract_sdist(blob: bytes, cfg: Config):
     return files, binaries
 
 def _download(url: str, cfg: Config) -> bytes:
+    egress.assert_web_scheme(url)   # url is from PyPI's JSON — reject file:// before urllib reads a local path
     req = urllib.request.Request(url, headers={"User-Agent": "diffwatch/0.1"})
     with urllib.request.urlopen(req, timeout=cfg.fetch_timeout_s) as r:
         buf = bytearray()                             # amortized O(1) append; bytes += is O(n^2)
@@ -98,6 +99,7 @@ def _is_surface(path: str) -> bool:
 
 def _package_json(package: str, cfg: Config) -> dict:
     url = f"{cfg.pypi_base}/pypi/{package}/json"
+    egress.assert_web_scheme(url)
     with urllib.request.urlopen(url, timeout=cfg.fetch_timeout_s) as r:
         return json.load(r)
 
@@ -115,6 +117,7 @@ def _requires_dist(package: str, version: str, cfg: Config) -> list:
     """`info.requires_dist` for an EXACT version (the package-level JSON only carries the latest's)."""
     try:
         url = f"{cfg.pypi_base}/pypi/{package}/{version}/json"
+        egress.assert_web_scheme(url)
         with urllib.request.urlopen(url, timeout=cfg.fetch_timeout_s) as r:
             return (json.load(r).get("info") or {}).get("requires_dist") or []
     except Exception:
@@ -124,6 +127,7 @@ def _dep_json(name: str, cfg: Config):
     """A candidate dependency's PyPI JSON, or None if it does not exist (404 -> dependency-confusion)."""
     try:
         url = f"{cfg.pypi_base}/pypi/{name}/json"
+        egress.assert_web_scheme(url)
         with urllib.request.urlopen(url, timeout=cfg.fetch_timeout_s) as r:
             return json.load(r)
     except urllib.error.HTTPError as e:

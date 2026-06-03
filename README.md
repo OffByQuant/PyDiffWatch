@@ -38,7 +38,7 @@ container/gVisor or a no-network sandboxed subprocess ([`parse-sandbox.md`](docs
 ```bash
 git clone <your-fork-url> pydiffwatch && cd pydiffwatch
 python3 -m venv .venv && . .venv/bin/activate
-pip install -e .                 # core (stdlib + PyYAML)
+pip install -e .                 # core (stdlib + PyYAML + defusedxml)
 pip install -e ".[claude]"       # optional: Anthropic backend
 ```
 

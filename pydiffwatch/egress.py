@@ -33,6 +33,19 @@ def _host_of(url):
     return urlsplit(url).hostname if url else None
 
 
+_WEB_SCHEMES = frozenset({"http", "https"})
+
+
+def assert_web_scheme(url) -> None:
+    """Fail closed unless `url` is http/https. The host allowlist enforces at socket.getaddrinfo, which
+    schemes that touch no network — notably `file://` — bypass entirely; urllib would then read an
+    arbitrary local path via its FileHandler. A package-influenced download URL (the sdist `url` from
+    PyPI's JSON) resolving to `file:///…` is the concrete risk. Call this at every urlopen site."""
+    scheme = (urlsplit(url).scheme or "").lower() if url else ""
+    if scheme not in _WEB_SCHEMES:
+        raise EgressDenied(f"egress to non-web scheme {scheme!r} denied (url={url!r})")
+
+
 def allowed_hosts(cfg) -> frozenset:
     """The set of hostnames PyDiffWatch may contact, derived from config. Pure.
 

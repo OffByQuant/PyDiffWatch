@@ -15,6 +15,8 @@ import json
 import logging
 import urllib.request
 
+from . import egress
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,10 +28,11 @@ class ReviewUnavailable(Exception):
 def _urllib_post_json(url: str, payload: dict, timeout: float, headers: dict | None = None) -> dict:
     """POST JSON to the configured endpoint and return the parsed JSON response. The single network
     egress in the codebase; `url` is always the backend's configured endpoint (never package data)."""
+    egress.assert_web_scheme(url)
     body = json.dumps(payload).encode()
     hdrs = {"Content-Type": "application/json", **(headers or {})}
     req = urllib.request.Request(url, data=body, headers=hdrs)
-    with urllib.request.urlopen(req, timeout=timeout) as r:   # nosec: fixed config endpoint, not package-derived
+    with urllib.request.urlopen(req, timeout=timeout) as r:   # nosec: scheme-guarded; fixed config endpoint, not package-derived
         return json.loads(r.read())
 
 

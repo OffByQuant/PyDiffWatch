@@ -1,5 +1,5 @@
 import json, urllib.request
-from . import store
+from . import store, egress
 from .models import Verdict
 
 def _render(v: Verdict) -> str:
@@ -23,6 +23,7 @@ def emit(cfg, conn, verdict: Verdict, release_id: int):
     print(_render(verdict))
     if cfg.webhook_url:
         try:
+            egress.assert_web_scheme(cfg.webhook_url)
             body = json.dumps({"text": _render(verdict)}).encode()
             req = urllib.request.Request(cfg.webhook_url, data=body,
                                          headers={"Content-Type": "application/json"})

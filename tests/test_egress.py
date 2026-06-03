@@ -48,6 +48,21 @@ def test_allowed_hosts_custom_pypi_mirror():
     assert "mirror.internal.corp" in egress.allowed_hosts(cfg)
 
 
+# ---- assert_web_scheme (the file:// guard the host allowlist can't catch) ----
+
+@pytest.mark.parametrize("url", ["https://pypi.org/x", "http://localhost:8000/v1"])
+def test_assert_web_scheme_allows_http_https(url):
+    egress.assert_web_scheme(url)   # must not raise
+
+
+@pytest.mark.parametrize("url", [
+    "file:///etc/passwd", "ftp://host/x", "data:text/plain,hi", "", None, "/etc/passwd",
+])
+def test_assert_web_scheme_rejects_non_web(url):
+    with pytest.raises(egress.EgressDenied):
+        egress.assert_web_scheme(url)
+
+
 # ---- install_guard / uninstall_guard ----
 
 def test_guard_allows_listed_host_and_blocks_others():
