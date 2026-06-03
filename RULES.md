@@ -56,7 +56,7 @@ using a predicate outside its scope makes the rule invalid (and dropped).
 | `regex: {pattern: <re>}` | code | any added line matches the regular expression |
 | `blob_present: true` | code | the file has an added line that looks like an encoded blob (long base64 run, very long line, or high-entropy window) |
 | `syntax_error: true` | code | a complete `.py` file fails to parse |
-| `location_at_least: <n>` | code | the file's location weight ≥ `n` (3.0 = auto-exec: `setup.py`/`pyproject.toml`/`__init__.py`/`.pth`; 1.0 = normal; 0.2 = tests/docs/examples) |
+| `location_at_least: <n>` | code | the file's location weight ≥ `n` (3.0 = auto-exec/auto-import: `setup.py`/`setup.cfg`/`pyproject.toml`/`__init__.py`/`conftest.py`/`sitecustomize.py`/`.pth`; 1.0 = normal; 0.2 = tests/docs/examples) |
 | `binary_reason: <r>` | binary | the binary's reason is `r`. `r ∈ source-too-large, foreign-language-source, new-binary` |
 | `dep_reason: <r>` | dep | the dependency finding's reason is `r`. `r ∈ typosquat, nonexistent, brand-new` |
 | `maintainer_changed: true` | maintainer | the owner set changed vs. the prior stored release |
