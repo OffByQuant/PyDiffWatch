@@ -101,6 +101,26 @@ api_key_env = "OPENROUTER_API_KEY"
 structured_output = "json_object"
 ```
 
+**DeepSeek / reasoning ("thinking") models** — `examples/deepseek.toml`:
+
+```toml
+[reviewer]
+provider = "openai"
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-chat"
+api_key_env = "DEEPSEEK_API_KEY"
+structured_output = "json_object"   # DeepSeek 400s on strict json_schema — use json_object
+max_output_tokens = 32000           # reasoning eats the budget; leave room for thinking + the verdict
+
+# Optional: pass provider-specific knobs verbatim (reserved core fields always win).
+# [reviewer.extra_body]
+# reasoning = { enabled = false }   # disable thinking to reclaim output budget (key is provider-specific)
+```
+Reasoning models spend output tokens on internal thinking, so a small `max_output_tokens` truncates the
+JSON verdict; 32000 leaves room for both. The reviewer also asks the model to emit the decision fields
+first, so even a truncated verdict carries the classification. Set `structured_output = "json_object"` —
+the strict `json_schema` variant is an OpenAI extension DeepSeek doesn't accept.
+
 **Anthropic** (needs `pip install -e ".[claude]"`) — `examples/anthropic.toml`:
 
 ```toml
@@ -372,6 +392,8 @@ GPU and no API budget, or to keep monitoring when your endpoint is down.
 | `ReviewUnavailable: non-JSON content` in logs | the model isn't honoring the JSON contract. Lower `structured_output` (`json_schema` → `json_object` → `none`) or use a more capable model. The release still alerted heuristically — nothing was dropped. |
 | Every Anthropic run logs `heuristic-only this run` | `ANTHROPIC_API_KEY` isn't in the environment the *scheduler* uses. Put it in the systemd `EnvironmentFile` / cron wrapper / Actions secret, not just your interactive shell. |
 | `401`/`403` from a hosted endpoint | `api_key_env` names a variable that's unset, empty, or wrong. Check it from the harness's environment: `echo $OPENAI_API_KEY`. |
+| `400`/`ReviewUnavailable: HTTP Error 400` from DeepSeek (or another reasoning model) | the endpoint rejects strict `json_schema` (an OpenAI-only extension). Set `structured_output = "json_object"`. See `examples/deepseek.toml`. |
+| DeepSeek verdicts arrive with empty `reasoning`/`cited_hunk` or `attack_type: none` | the response truncated — reasoning ate the output budget. Raise `max_output_tokens` (try 32000) and/or disable thinking via `[reviewer.extra_body]`. The `classification` still survives (emitted first). |
 | First `run` returns `processed 0 releases` | expected — a fresh DB seeds the cursor to "now" and processes nothing that tick; the next tick polls forward. Use `run --backfill` to process history instead. |
 | `run already in progress; exiting` | a previous tick still holds the lock. Harmless; space your schedule so a tick finishes before the next fires. |
 | Local endpoint refused / connection error | the model server isn't up, or `base_url` is wrong (check the port and the trailing `/v1`). From Docker, use `host.docker.internal`, not `localhost`. |

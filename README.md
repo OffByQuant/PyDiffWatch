@@ -55,7 +55,7 @@ The LLM reviewer talks to **any OpenAI-compatible endpoint** or the **Anthropic*
 config and edit it:
 
 ```bash
-cp examples/ollama.toml pydiffwatch.toml      # or local-qwen / llamacpp / openai / anthropic
+cp examples/ollama.toml pydiffwatch.toml      # or local-qwen / llamacpp / openai / deepseek / anthropic
 ```
 
 | Your endpoint | `provider` | `base_url` | API key |
@@ -65,7 +65,12 @@ cp examples/ollama.toml pydiffwatch.toml      # or local-qwen / llamacpp / opena
 | llama.cpp server | `openai` | `http://localhost:8080/v1` | none |
 | OpenAI | `openai` | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
 | OpenRouter / Groq / Together | `openai` | the gateway's `/v1` URL | that gateway's key |
+| DeepSeek / reasoning models | `openai` | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` |
 | Anthropic | `anthropic` | — (native SDK) | `ANTHROPIC_API_KEY` |
+
+Reasoning ("thinking") models like DeepSeek need `structured_output = "json_object"` (they reject the strict
+`json_schema` variant) and a roomy `max_output_tokens` so internal reasoning doesn't truncate the verdict —
+see `examples/deepseek.toml`.
 
 ### API keys
 

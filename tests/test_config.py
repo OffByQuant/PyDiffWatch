@@ -46,3 +46,20 @@ def test_default_max_output_tokens_fits_reasoning_models():
     # Reasoning models (e.g. DeepSeek) count thinking tokens inside the output budget; a small cap
     # truncates the JSON before all fields emit. The default must leave room for reasoning + verdict.
     assert ReviewerConfig().max_output_tokens == 32000
+
+
+def test_default_extra_body_is_empty():
+    assert ReviewerConfig().extra_body == {}
+
+
+def test_load_config_reads_reviewer_extra_body(tmp_path):
+    # Provider-specific request knobs (e.g. DeepSeek's reasoning toggle) load from a nested TOML table.
+    p = tmp_path / "pydiffwatch.toml"
+    p.write_text(textwrap.dedent('''
+        [reviewer]
+        provider = "openai"
+        [reviewer.extra_body]
+        reasoning = { enabled = false }
+    '''))
+    cfg = load_config(p)
+    assert cfg.reviewer.extra_body == {"reasoning": {"enabled": False}}

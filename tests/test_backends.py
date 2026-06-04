@@ -132,6 +132,33 @@ def test_default_post_sets_user_agent_header(monkeypatch):
     assert captured["req"].get_header("User-agent") == "diffwatch/0.1"
 
 
+def test_extra_body_merged_into_payload():
+    # Provider-specific knobs (e.g. DeepSeek's reasoning toggle) are passed verbatim into the request.
+    cap = {}
+
+    def post(url, payload, timeout, headers=None):
+        cap.update(payload)
+        return _ok()
+    b = OpenAICompatibleBackend("http://x/v1", "m", structured_output="json_object", post=post,
+                                extra_body={"reasoning": {"enabled": False}})
+    b.complete(model="m", system="s", user_text="u", schema=SCHEMA, max_tokens=10)
+    assert cap["reasoning"] == {"enabled": False}
+
+
+def test_extra_body_cannot_clobber_core_payload_fields():
+    # extra_body is operator config, but a stray reserved key must not override the model, the
+    # injection-delimited messages, max_tokens, or the structured-output response_format.
+    cap = {}
+
+    def post(url, payload, timeout, headers=None):
+        cap.update(payload)
+        return _ok()
+    b = OpenAICompatibleBackend("http://x/v1", "m", structured_output="json_object", post=post,
+                                extra_body={"model": "evil", "messages": [], "max_tokens": 1})
+    b.complete(model="m", system="s", user_text="u", schema=SCHEMA, max_tokens=10)
+    assert cap["model"] == "m" and cap["max_tokens"] == 10 and len(cap["messages"]) == 2
+
+
 def test_make_backend_openai_from_config():
     cfg = Config(reviewer=ReviewerConfig(provider="openai", base_url="http://h/v1", model="m"))
     b = make_backend(cfg)

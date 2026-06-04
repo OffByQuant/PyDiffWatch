@@ -70,7 +70,7 @@ class OpenAICompatibleBackend:
     The verdict is always validated client-side against the schema regardless of mode."""
 
     def __init__(self, base_url, model, *, api_key_env=None, structured_output="json_schema",
-                 escalation_model=None, post=None, timeout: float = 120.0):
+                 escalation_model=None, post=None, timeout: float = 120.0, extra_body=None):
         self.endpoint = base_url.rstrip("/")
         self.primary_model = model
         self.escalation_model = escalation_model
@@ -78,6 +78,8 @@ class OpenAICompatibleBackend:
         self.structured_output = structured_output
         self._post = post if post is not None else _urllib_post_json
         self._timeout = timeout
+        # Provider-specific knobs (e.g. DeepSeek reasoning toggle) merged verbatim; core fields override.
+        self.extra_body = extra_body or {}
 
     def _auth_headers(self) -> dict:
         if not self.api_key_env:
@@ -87,7 +89,10 @@ class OpenAICompatibleBackend:
         return {"Authorization": f"Bearer {key}"} if key else {}
 
     def complete(self, *, model, system, user_text, schema, max_tokens) -> str:
+        # extra_body first so the reserved core fields below (and response_format) always win — a stray
+        # operator key can never override the model, the injection-delimited messages, or the token cap.
         payload = {
+            **self.extra_body,
             "model": model,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": user_text}],
@@ -160,7 +165,8 @@ def make_backend(cfg, client=None):
     if rc.provider == "openai":
         return OpenAICompatibleBackend(rc.base_url, rc.model, api_key_env=rc.api_key_env,
                                        structured_output=rc.structured_output,
-                                       escalation_model=rc.escalation_model, timeout=rc.timeout)
+                                       escalation_model=rc.escalation_model, timeout=rc.timeout,
+                                       extra_body=rc.extra_body)
     if rc.provider == "anthropic":
         return AnthropicBackend(rc.model, rc.escalation_model, client=client)
     raise ValueError(f"unknown reviewer provider: {rc.provider!r}")

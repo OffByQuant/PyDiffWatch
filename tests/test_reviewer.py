@@ -181,6 +181,26 @@ def test_review_schema_emits_decision_fields_before_prose():
         assert keys.index(decision) < keys.index("cited_hunk")
 
 
+def test_system_prompt_directs_decision_first_field_order():
+    # The schema reorder only steers generation in strict json_schema mode; json_object/none modes
+    # ignore the schema. State the order in the prompt too, so the benefit is mode-independent. The
+    # stated order must match the schema property order (single source of truth).
+    from pydiffwatch import reviewer
+    schema_order = ", ".join(reviewer.REVIEW_SCHEMA["properties"].keys())
+    assert schema_order in reviewer.SYSTEM_PROMPT
+
+
+def test_system_prompt_lists_allowed_enum_values():
+    # In loose modes (json_object/none) nothing enforces enums server-side, so the prompt must name the
+    # exact allowed values or the model invents synonyms and the verdict is discarded (observed live: a
+    # real model returned recommended_action="block_and_report").
+    from pydiffwatch import reviewer
+    sp = reviewer.SYSTEM_PROMPT
+    for field in ("recommended_action", "attack_type"):
+        for val in reviewer.REVIEW_SCHEMA["properties"][field]["enum"]:
+            assert val in sp, f"{field} value {val!r} missing from system prompt"
+
+
 import pytest
 from pydiffwatch.config import Config, ReviewerConfig
 
