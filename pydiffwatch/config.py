@@ -20,7 +20,9 @@ class ReviewerConfig:
     escalation_model: str | None = None
     timeout: float = 120.0
     max_input_chars: int = 200_000
-    max_output_tokens: int = 8192
+    # Reasoning models (e.g. DeepSeek) count thinking tokens inside the output budget; a small cap
+    # truncates the JSON before all fields emit. Sized to leave room for reasoning + the full verdict.
+    max_output_tokens: int = 32000
     opus_escalation_confidence: float = 0.6
 
 

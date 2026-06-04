@@ -40,3 +40,9 @@ def test_load_config_from_toml(tmp_path):
 def test_load_config_missing_file_returns_defaults(tmp_path):
     cfg = load_config(tmp_path / "nope.toml")
     assert cfg.reviewer.base_url == "http://localhost:8000/v1"
+
+
+def test_default_max_output_tokens_fits_reasoning_models():
+    # Reasoning models (e.g. DeepSeek) count thinking tokens inside the output budget; a small cap
+    # truncates the JSON before all fields emit. The default must leave room for reasoning + verdict.
+    assert ReviewerConfig().max_output_tokens == 32000

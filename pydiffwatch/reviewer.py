@@ -26,23 +26,31 @@ TRUNCATION_NOTE = "\n[TRUNCATED: lowest-risk hunks omitted to fit the input cap.
 
 _FIRST_RELEASE_TOP_FILES = 40   # §7: first releases -> top 40 files by per-file score
 
+# Property order matters: a reasoning model that counts thinking tokens inside its output budget can
+# truncate the JSON tail. The decision fields (classification, confidence, urgent, recommended_action,
+# attack_type) are emitted FIRST so they survive truncation; the verbose prose (cited_hunk, reasoning)
+# trails and is the only thing at risk if the budget runs short.
 REVIEW_SCHEMA = {
     "type": "object",
     "properties": {
         "classification": {"type": "string", "enum": ["malicious", "suspicious", "benign"]},
         "confidence": {"type": "number"},   # 0.0-1.0; range not enforceable in schema -> clamped client-side
+        "urgent": {"type": "boolean"},
+        "recommended_action": {"type": "string", "enum": ["report-to-pypi", "monitor", "dismiss"]},
         "attack_type": {"type": "string", "enum": [
             "install-hook-rce", "credential-exfil", "typosquat", "obfuscated-loader",
             "dropper", "build-backend-rce", "vcs-dep", "none"]},
-        "reasoning": {"type": "string"},
         "cited_hunk": {"type": "string"},
-        "recommended_action": {"type": "string", "enum": ["report-to-pypi", "monitor", "dismiss"]},
-        "urgent": {"type": "boolean"},
+        "reasoning": {"type": "string"},
     },
     "required": ["classification", "confidence", "attack_type", "reasoning",
                  "cited_hunk", "recommended_action", "urgent"],
     "additionalProperties": False,
 }
+
+# Out-of-enum attack_type from a loose/prompt-only endpoint is clamped here rather than discarding the
+# verdict (backends._SOFT_ENUM_KEYS lets it past validation); the decision signal is preserved.
+_ATTACK_TYPES = frozenset(REVIEW_SCHEMA["properties"]["attack_type"]["enum"])
 
 SYSTEM_PROMPT = f"""You are DiffWatch's malware reviewer. You receive the version-to-version diff of a \
 PyPI package that a cheap static-triage stage has already flagged as suspicious, plus pointers to the \
@@ -229,10 +237,11 @@ class Reviewer:
         text = self.backend.complete(model=model, system=SYSTEM_PROMPT, user_text=user_text,
                                      schema=REVIEW_SCHEMA, max_tokens=self.cfg.reviewer.max_output_tokens)
         d = json.loads(text)                                  # schema-constrained output -> valid JSON
+        attack_type = d["attack_type"] if d["attack_type"] in _ATTACK_TYPES else "none"
         return Verdict(
             package=diff.package, version=diff.version,
             classification=d["classification"], score=triage.score,
             fired_rules=triage.fired_rules, urgent=bool(d["urgent"]),
-            confidence=_clamp01(d["confidence"]), attack_type=d["attack_type"],
+            confidence=_clamp01(d["confidence"]), attack_type=attack_type,
             reasoning=d["reasoning"], cited_hunk=d["cited_hunk"],
             recommended_action=d["recommended_action"], model=model)
