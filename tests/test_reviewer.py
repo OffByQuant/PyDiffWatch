@@ -181,6 +181,26 @@ def test_review_schema_emits_decision_fields_before_prose():
         assert keys.index(decision) < keys.index("cited_hunk")
 
 
+def test_system_prompt_directs_decision_first_field_order():
+    # The schema reorder only steers generation in strict json_schema mode; json_object/none modes
+    # ignore the schema. State the order in the prompt too, so the benefit is mode-independent. The
+    # stated order must match the schema property order (single source of truth).
+    from pydiffwatch import reviewer
+    schema_order = ", ".join(reviewer.REVIEW_SCHEMA["properties"].keys())
+    assert schema_order in reviewer.SYSTEM_PROMPT
+
+
+def test_system_prompt_lists_allowed_enum_values():
+    # In loose modes (json_object/none) nothing enforces enums server-side, so the prompt must name the
+    # exact allowed values or the model invents synonyms and the verdict is discarded (observed live: a
+    # real model returned recommended_action="block_and_report").
+    from pydiffwatch import reviewer
+    sp = reviewer.SYSTEM_PROMPT
+    for field in ("recommended_action", "attack_type"):
+        for val in reviewer.REVIEW_SCHEMA["properties"][field]["enum"]:
+            assert val in sp, f"{field} value {val!r} missing from system prompt"
+
+
 import pytest
 from pydiffwatch.config import Config, ReviewerConfig
 
@@ -237,6 +257,27 @@ def test_unknown_attack_type_clamped_to_none():
                       "cited_hunk": "setup.py:1-3", "reasoning": "r"})
     v = reviewer.Reviewer(Config(), backend=_FakeBackend([bad])).review(_diff(), _triage())
     assert v.attack_type == "none" and v.classification == "malicious"
+
+
+def test_unknown_recommended_action_on_malicious_clamps_to_report():
+    # A loose-mode model can emit an action synonym (observed live: "block_and_report"). Rather than
+    # discard a correct malicious verdict, clamp toward caution: malicious -> report-to-pypi.
+    import json
+    bad = json.dumps({"classification": "malicious", "confidence": 0.9, "urgent": True,
+                      "recommended_action": "block_and_report", "attack_type": "install-hook-rce",
+                      "cited_hunk": "setup.py:1-3", "reasoning": "r"})
+    v = reviewer.Reviewer(Config(), backend=_FakeBackend([bad])).review(_diff(), _triage())
+    assert v.recommended_action == "report-to-pypi" and v.classification == "malicious"
+
+
+def test_unknown_recommended_action_on_non_malicious_clamps_to_monitor():
+    # Never clamp to dismiss: a non-malicious verdict with a garbage action gets monitored, not dropped.
+    import json
+    bad = json.dumps({"classification": "suspicious", "confidence": 0.9, "urgent": False,
+                      "recommended_action": "investigate", "attack_type": "none",
+                      "cited_hunk": "x:1-2", "reasoning": "r"})
+    v = reviewer.Reviewer(Config(), backend=_FakeBackend([bad])).review(_diff(), _triage())
+    assert v.recommended_action == "monitor"
 
 
 def test_low_confidence_escalates_when_backend_has_escalation_model():

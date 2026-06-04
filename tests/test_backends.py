@@ -113,6 +113,50 @@ def test_validate_verdict_clamps_unknown_attack_type_instead_of_rejecting():
         validate_verdict({"classification": "safe", "attack_type": "none"}, schema)
 
 
+def test_validate_verdict_clamps_unknown_recommended_action_instead_of_rejecting():
+    # recommended_action is clamped toward caution downstream (reviewer.py), so an out-of-enum value
+    # must pass client validation rather than discard a verdict whose classification is sound.
+    schema = {"type": "object",
+              "properties": {"classification": {"type": "string", "enum": ["malicious", "benign"]},
+                             "recommended_action": {"type": "string",
+                                                    "enum": ["report-to-pypi", "monitor", "dismiss"]}},
+              "required": ["classification", "recommended_action"]}
+    validate_verdict({"classification": "benign", "recommended_action": "block_and_report"}, schema)  # no raise
+
+
+def test_missing_key_error_hints_truncation_fix():
+    with pytest.raises(ReviewUnavailable, match="max_output_tokens"):
+        validate_verdict({"confidence": 0.9}, SCHEMA)   # missing classification
+
+
+def test_http_400_error_hints_json_object():
+    # The DeepSeek landmine: strict json_schema 400s. The error must tell the operator the fix.
+    class _HTTPErr(Exception):
+        code = 400
+
+    def post(url, payload, timeout, headers=None):
+        raise _HTTPErr("Bad Request")
+    b = OpenAICompatibleBackend("http://x/v1", "m", post=post)
+    with pytest.raises(ReviewUnavailable, match="json_object"):
+        b.complete(model="m", system="s", user_text="u", schema=SCHEMA, max_tokens=10)
+
+
+def test_connection_error_hints_base_url():
+    def post(url, payload, timeout, headers=None):
+        raise ConnectionRefusedError("Connection refused")
+    b = OpenAICompatibleBackend("http://x/v1", "m", post=post)
+    with pytest.raises(ReviewUnavailable, match="base_url"):
+        b.complete(model="m", system="s", user_text="u", schema=SCHEMA, max_tokens=10)
+
+
+def test_non_json_content_hints_structured_output():
+    def post(url, payload, timeout, headers=None):
+        return {"choices": [{"message": {"content": "I cannot help with that."}}]}
+    b = OpenAICompatibleBackend("http://x/v1", "m", structured_output="none", post=post)
+    with pytest.raises(ReviewUnavailable, match="structured_output"):
+        b.complete(model="m", system="s", user_text="u", schema=SCHEMA, max_tokens=10)
+
+
 def test_default_post_sets_user_agent_header(monkeypatch):
     # Some API gateways (Cloudflare/WAF) 403 the stdlib default "Python-urllib/3.x" UA. Send an explicit
     # one matching fetcher.py's egress identity.
@@ -130,6 +174,33 @@ def test_default_post_sets_user_agent_header(monkeypatch):
     monkeypatch.setattr(backends.urllib.request, "urlopen", fake_urlopen)
     _real_urllib_post_json("http://x/v1/chat/completions", {"a": 1}, 5.0)
     assert captured["req"].get_header("User-agent") == "diffwatch/0.1"
+
+
+def test_extra_body_merged_into_payload():
+    # Provider-specific knobs (e.g. DeepSeek's reasoning toggle) are passed verbatim into the request.
+    cap = {}
+
+    def post(url, payload, timeout, headers=None):
+        cap.update(payload)
+        return _ok()
+    b = OpenAICompatibleBackend("http://x/v1", "m", structured_output="json_object", post=post,
+                                extra_body={"reasoning": {"enabled": False}})
+    b.complete(model="m", system="s", user_text="u", schema=SCHEMA, max_tokens=10)
+    assert cap["reasoning"] == {"enabled": False}
+
+
+def test_extra_body_cannot_clobber_core_payload_fields():
+    # extra_body is operator config, but a stray reserved key must not override the model, the
+    # injection-delimited messages, max_tokens, or the structured-output response_format.
+    cap = {}
+
+    def post(url, payload, timeout, headers=None):
+        cap.update(payload)
+        return _ok()
+    b = OpenAICompatibleBackend("http://x/v1", "m", structured_output="json_object", post=post,
+                                extra_body={"model": "evil", "messages": [], "max_tokens": 1})
+    b.complete(model="m", system="s", user_text="u", schema=SCHEMA, max_tokens=10)
+    assert cap["model"] == "m" and cap["max_tokens"] == 10 and len(cap["messages"]) == 2
 
 
 def test_make_backend_openai_from_config():
