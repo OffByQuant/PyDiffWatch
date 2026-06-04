@@ -137,6 +137,30 @@ location weighting, decode/fetch/credential combos, foreign-language-source, add
 and maintainer-change signals. The scoring weights and threshold are baselines you can tune. The engine
 and rule format here are the ones the community extends.
 
+### Detection scope on brand-new packages
+
+The pipeline's core signal is the **version-to-version diff**, so a package's first-ever release has no
+prior version to diff against. `new_package_policy` controls how those are handled:
+
+| Value | First-release behavior |
+|---|---|
+| `surface` (**default**) | Scan only the files PyPI auto-runs at install/import — `setup.py`, `setup.cfg`, `pyproject.toml`, `__init__.py`, `conftest.py`, `sitecustomize.py`, `.pth` — treating each as fully added. |
+| `full` | Scan **every** `.py` file in the new package as added (complete coverage, higher volume/noise). |
+| `skip` | Ignore new packages entirely. |
+
+Under the default, malware that lives in a non-auto-exec module of a brand-new package (e.g.
+`src/pkg/utils/helper.py`) is **not** scanned — first-release ≠ full scan. Set `new_package_policy = "full"`
+if you want complete coverage of first releases and can absorb the extra volume.
+
+## Data attribution
+
+The vendored popularity/typosquat corpus (`pydiffwatch/data/top_pypi_names.txt`, ~5000 names) is a
+PEP 503-normalized snapshot derived from [hugovk/top-pypi-packages](https://github.com/hugovk/top-pypi-packages),
+which in turn aggregates PyPI download counts from the public BigQuery dataset. It is vendored (not fetched
+at runtime); refresh it manually from that source. The upstream repository ships no explicit license — the
+file holds package names (facts), not creative content; credit the source if you redistribute it.
+
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). Applies to PyDiffWatch's own code, rules, and docs; see **Data attribution**
+above for the vendored corpus.

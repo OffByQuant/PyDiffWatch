@@ -1,5 +1,4 @@
 import argparse
-from defusedxml.xmlrpc import monkey_patch as _defuse_xmlrpc
 from . import egress
 from .config import Config, load_config
 from .orchestrator import run_once, seed_now, list_pending, adjudicate, get_evidence, backfill_evidence
@@ -38,7 +37,8 @@ def main():
                            "alerts) to EVERY release with a fired rule (far more PyPI re-fetches)")
     args = p.parse_args()
     cfg = _cfg(args)
-    _defuse_xmlrpc()            # harden stdlib xmlrpc.client against entity-expansion / decompression bombs
+    # xmlrpc.client is defused at import in ingest.py (covers library importers too). The egress guard
+    # mutates global socket state, so it stays a CLI-entry concern (see egress.py docstring).
     egress.install_guard(cfg)   # default-deny host allowlist for the whole process (see egress.py)
     if args.cmd == "run":
         n = run_once(cfg, seed_if_fresh=not args.backfill)

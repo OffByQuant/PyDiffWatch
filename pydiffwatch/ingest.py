@@ -1,6 +1,10 @@
 # Firehose source: PyPI XML-RPC changelog_since_serial (verify per Task 0; swap source here if blocked).
-# xmlrpc.client is defused at the CLI entry point via defusedxml.xmlrpc.monkey_patch() (see __main__.py).
+# Defuse xmlrpc.client against entity-expansion / decompression bombs at IMPORT time, so every importer
+# (CLI or library use via the orchestrator) gets a hardened parser before the first ServerProxy call —
+# not only __main__. monkey_patch() is global and idempotent.
+from defusedxml.xmlrpc import monkey_patch as _defuse_xmlrpc
 import xmlrpc.client  # nosemgrep: python.lang.security.use-defused-xmlrpc.use-defused-xmlrpc
+_defuse_xmlrpc()
 from .config import Config
 from .models import NewRelease
 
