@@ -1,4 +1,4 @@
-# PyDiffWatch HOWTO
+# Getting Started with PyDiffWatch
 
 A step-by-step guide from install to running PyDiffWatch continuously under your own harness. For the
 project overview and the no-execution security model, see the [README](README.md); for authoring
@@ -15,6 +15,7 @@ detection rules, see [RULES.md](RULES.md).
 8. [Alerts](#8-alerts)
 9. [Heuristic-only mode (no LLM)](#9-heuristic-only-mode-no-llm)
 10. [Troubleshooting](#10-troubleshooting)
+11. [Detection scope on brand-new packages](#11-detection-scope-on-brand-new-packages)
 
 ---
 
@@ -397,3 +398,20 @@ GPU and no API budget, or to keep monitoring when your endpoint is down.
 | First `run` returns `processed 0 releases` | expected — a fresh DB seeds the cursor to "now" and processes nothing that tick; the next tick polls forward. Use `run --backfill` to process history instead. |
 | `run already in progress; exiting` | a previous tick still holds the lock. Harmless; space your schedule so a tick finishes before the next fires. |
 | Local endpoint refused / connection error | the model server isn't up, or `base_url` is wrong (check the port and the trailing `/v1`). From Docker, use `host.docker.internal`, not `localhost`. |
+
+---
+
+## 11. Detection scope on brand-new packages
+
+The pipeline's core signal is the **version-to-version diff**, so a package's first-ever release has no
+prior version to diff against. `new_package_policy` controls how those are handled:
+
+| Value | First-release behavior |
+|---|---|
+| `surface` (**default**) | Scan only the files PyPI auto-runs at install/import — `setup.py`, `setup.cfg`, `pyproject.toml`, `__init__.py`, `conftest.py`, `sitecustomize.py`, `.pth` — treating each as fully added. |
+| `full` | Scan **every** `.py` file in the new package as added (complete coverage, higher volume/noise). |
+| `skip` | Ignore new packages entirely. |
+
+Under the default, malware that lives in a non-auto-exec module of a brand-new package (e.g.
+`src/pkg/utils/helper.py`) is **not** scanned — first-release ≠ full scan. Set `new_package_policy = "full"`
+if you want complete coverage of first releases and can absorb the extra volume.

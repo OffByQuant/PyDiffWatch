@@ -4,7 +4,7 @@ PyDiffWatch polls PyPI for new releases, statically reviews each version-to-vers
 code embeddings, and alerts before a compromised release spreads. Open-source, MIT.
 
 This file is guidance for AI coding agents (and humans) operating or extending PyDiffWatch on any harness.
-For setup and deployment see [HOWTO.md](HOWTO.md); for writing detection rules see [RULES.md](RULES.md);
+For setup and deployment see [GETTING-STARTED.md](GETTING-STARTED.md); for writing detection rules see [RULES.md](RULES.md);
 for the project overview see [README.md](README.md).
 
 ## The one hard invariant: NO EXECUTION

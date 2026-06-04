@@ -1,176 +1,95 @@
 # PyDiffWatch
 
-A rules-driven supply-chain malware scanner for the PyPI firehose. It polls new package releases,
-diffs each against its prior version, runs a **community-extensible rules engine** over the change, and
-escalates anything suspicious to an LLM reviewer for a verdict — so a malicious update can be caught and
-reported **before** it spreads.
+**Catch malicious PyPI updates before they spread — with a cheap local model and rules anyone can write.**
 
-The pipeline, the rules engine, and a starter ruleset are all here and MIT-licensed; you bring your own
-compute, your own LLM endpoint, and your own rules.
+Supply-chain attacks on open-source packages are escalating: an attacker ships a compromised version of a
+trusted package, and it's pulled into thousands of installs before anyone notices. Defending against that
+shouldn't require a security budget or a SaaS subscription. PyDiffWatch is an open-source (MIT) scanner
+that watches the PyPI release firehose, statically reviews what changed in each new version, and alerts
+you **before** a malicious update spreads — running on hardware you already have.
 
-**New here?** [HOWTO.md](HOWTO.md) is a step-by-step setup-to-deployment guide (endpoints, API keys,
-cron/systemd/Docker/CI). This README is the overview.
+It's built for the community to **extend** and to **afford**: the per-release review runs on a **local,
+open-source LLM** (no per-token bill), and detection logic is **plain YAML rules** anyone can contribute.
 
-## The one hard invariant: no execution
+## How it works
 
-PyDiffWatch **never installs, builds, imports, or runs** the packages it analyzes. It downloads the
-sdist into memory under strict size caps, reads the source statically (AST + text diff), and discards it.
-Analyzed package bytes reach the LLM only as request-body **text**, never as a URL the model fetches.
-Community rules are **pure data** (structured YAML) walked by a matcher with no `eval`/`exec` — a
-contributed rule can describe matches but can never execute code. This is the property that lets you run
-other people's detection rules safely.
+```
+new PyPI releases → diff against the prior version → community rules score the change
+   → anything suspicious goes to a local LLM reviewer → you get alerted
+```
 
-## Strongly recommended: run in an isolated environment
+State lives in a local SQLite database; nothing is hosted, and nothing leaves your machine except the
+calls to PyPI and the model endpoint you point it at.
 
-The no-execution design above is the primary safeguard — treat it as one layer, not the only one.
-PyDiffWatch ingests untrusted bytes from PyPI and evaluates community-authored rules, so run it somewhere a
-broken assumption stays contained: a dedicated container, VM, or unprivileged user, with outbound network
-restricted to PyPI, your reviewer endpoint, and your webhook. The built-in default-deny egress allowlist
-(`pydiffwatch/egress.py`) enforces this in-process, but an OS-level boundary is what holds if the process
-itself is compromised. **Do not run it on a workstation or a host with credentials or data you care about.**
+## Why PyDiffWatch
 
-The in-process guard is installed by the **CLI entry point only** — a library has no business monkey-patching
-the whole process's socket resolution on its caller's behalf. If you embed PyDiffWatch (importing the
-orchestrator instead of running the CLI), rely on the OS-level boundary below, or opt in explicitly with
-`egress.install_guard(cfg)`; `run_once()` logs a warning when neither is in place so the gap is never silent.
+- **Cheap by design.** The reviewer is meant to run on a local open-source model — the only setup it has
+  been tested against — so watching the whole firehose costs you compute, not API credits. Hosted and
+  frontier APIs (OpenAI, Anthropic, OpenRouter, DeepSeek, …) work too, but local keeps it free.
+- **It never runs what it inspects.** Analyzed packages are *data, never code*: PyDiffWatch downloads an
+  sdist into memory, reads the source statically, and discards it — no install, build, import, or `exec`.
+  Package bytes reach the model only as request-body text, never as a URL it fetches. [More ↓](#run-it-safely)
+- **Community rules, run safely.** Detection rules are pure structured data (YAML) evaluated by a matcher
+  with no `eval`/`exec` — so you can run other people's rules without running their code. See [RULES.md](RULES.md).
 
-See [`docs/hardening/`](docs/hardening/) for concrete recipes — an OS-level egress boundary
-([`egress-allowlist.md`](docs/hardening/egress-allowlist.md)) and running the byte-parsing stage under a
-container/gVisor or a no-network sandboxed subprocess ([`parse-sandbox.md`](docs/hardening/parse-sandbox.md)).
+## Get started — the easy way
 
-## Install
+Clone it, open your favorite agent harness (**Claude Code**, **opencode**, or similar), and give it one prompt:
+
+> *"Install the dependencies and let's configure the API endpoint to use a local model and start polling."*
+
+The agent handles setup and drives the polling loop; your local model does the reviews. That's the
+two-tier idea in a nutshell — a frontier model can **orchestrate** while a cheap local model does the
+**per-release review work**.
+
+## Get started — by hand
+
+No agent required. Plain commands poll the firehose and still use your local LLM for every review:
 
 ```bash
-git clone <your-fork-url> pydiffwatch && cd pydiffwatch
+git clone https://github.com/OffByQuant/PyDiffWatch pydiffwatch && cd pydiffwatch
 python3 -m venv .venv && . .venv/bin/activate
-pip install -e .                 # core (stdlib + PyYAML + defusedxml)
-pip install -e ".[claude]"       # optional: Anthropic backend
+pip install -e .                                # requires Python 3.11+
+
+cp examples/local-qwen.toml pydiffwatch.toml    # point at your local model endpoint
+pydiffwatch -c pydiffwatch.toml seed-now        # start watching "from now"
+pydiffwatch -c pydiffwatch.toml run             # process new releases (repeat on a schedule)
+pydiffwatch -c pydiffwatch.toml pending         # see suspicious releases awaiting your verdict
 ```
 
-Requires Python 3.11+.
+Drop `run` into a cron job, `systemd` timer, container, or CI schedule to monitor continuously. You can
+also run with **no model at all** (rules-only heuristic alerts) when you have no GPU or budget.
 
-## Configure the reviewer (any model, any harness)
+**→ Full setup — endpoints, API keys, scheduling, heuristic-only mode, troubleshooting:
+[GETTING-STARTED.md](GETTING-STARTED.md)**
 
-The LLM reviewer talks to **any OpenAI-compatible endpoint** or the **Anthropic** API. Copy an example
-config and edit it:
+## Run it safely
 
-```bash
-cp examples/ollama.toml pydiffwatch.toml      # or local-qwen / llamacpp / openai / deepseek / anthropic
-```
+PyDiffWatch ingests untrusted bytes from PyPI and runs community-authored rules. The no-execution design
+is the primary safeguard, but treat it as one layer: run it in a container, VM, or unprivileged user with
+outbound network restricted to PyPI, your model endpoint, and your webhook — **not on a workstation that
+holds credentials or data you care about.** A built-in default-deny egress allowlist enforces this
+in-process; an OS-level boundary is what holds if the process itself is ever compromised.
 
-| Your endpoint | `provider` | `base_url` | API key |
-|---|---|---|---|
-| llama-swap / vLLM / LM Studio (local) | `openai` | `http://localhost:8000/v1` | none |
-| Ollama | `openai` | `http://localhost:11434/v1` | none |
-| llama.cpp server | `openai` | `http://localhost:8080/v1` | none |
-| OpenAI | `openai` | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
-| OpenRouter / Groq / Together | `openai` | the gateway's `/v1` URL | that gateway's key |
-| DeepSeek / reasoning models | `openai` | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` |
-| Anthropic | `anthropic` | — (native SDK) | `ANTHROPIC_API_KEY` |
+→ Concrete isolation recipes: [`docs/hardening/`](docs/hardening/).
 
-Reasoning ("thinking") models like DeepSeek need `structured_output = "json_object"` (they reject the strict
-`json_schema` variant) and a roomy `max_output_tokens` so internal reasoning doesn't truncate the verdict —
-see `examples/deepseek.toml`.
+## Bring your own rules
 
-### API keys
+PyDiffWatch ships a **basic starter set** of detection rules — enough to get you catching the obvious
+attacks out of the box, not the last word. The rules live as plain YAML in the [`rules/community/`](rules/community)
+folder, and the whole point is that **you extend them with your own**: structured YAML over
+engine-provided facts, no code. If you can describe an attack pattern (say, "a base64 decode and an
+`exec` in the same changed file"), you can add a rule in a few minutes — drop another `.yaml` file in
+that folder and it's picked up automatically.
 
-**The config holds the env-var NAME; the shell holds the key** — no secret ever lands in a file you might
-commit. Wire a hosted endpoint in two steps:
+[RULES.md](RULES.md) has the schema, the predicate reference, and worked examples — written for humans and
+LLM assistants alike, so you (or your agent) can author and contribute one quickly.
 
-```toml
-# pydiffwatch.toml
-[reviewer]
-provider = "openai"
-base_url = "https://api.openai.com/v1"
-model = "gpt-4o-mini"
-api_key_env = "OPENAI_API_KEY"       # the NAME of the env var — never the key itself
-structured_output = "json_schema"
-```
+## License & attribution
 
-```bash
-export OPENAI_API_KEY="sk-..."        # in the environment that runs pydiffwatch
-```
-
-At request time the key is read from that variable and sent as `Authorization: Bearer <key>`. The name is
-yours — point `api_key_env` at `OPENROUTER_API_KEY`, `GROQ_API_KEY`, or anything else, so multiple configs
-coexist. **Local endpoints need no key:** omit `api_key_env`. **Anthropic** is the exception — its SDK
-reads `ANTHROPIC_API_KEY` from the environment directly, so `api_key_env` is ignored for that provider;
-just `export ANTHROPIC_API_KEY=...` and install the extra (`pip install -e ".[claude]"`).
-
-If a model can't produce strict schema-constrained JSON, drop `structured_output` from `json_schema` to
-`json_object` (loose JSON) or `none` (prompt-only). The verdict is validated client-side in every mode,
-and an invalid one falls back to a heuristic alert rather than being dropped.
-
-→ Per-server recipes and getting the key to your scheduler: **[HOWTO.md](HOWTO.md)**.
-
-## Run
-
-```bash
-pydiffwatch -c pydiffwatch.toml seed-now   # set the cursor to PyPI's current serial (start "from now")
-pydiffwatch -c pydiffwatch.toml run        # process one tick of new releases (repeat on a schedule)
-pydiffwatch -c pydiffwatch.toml pending    # review suspicious releases awaiting your verdict
-```
-
-It's a plain CLI over a local SQLite DB (state lives in `.diffwatch/`); nothing is hosted. To monitor
-continuously, run `run` on a schedule under **whatever harness you like** — a one-line crontab entry, a
-`systemd` timer, a container, or a CI cron job:
-
-```cron
-*/15 * * * * cd /opt/pydiffwatch && .venv/bin/pydiffwatch -c pydiffwatch.toml run >> run.log 2>&1
-```
-
-→ systemd unit, Dockerfile, and GitHub Actions recipes (with key injection): **[HOWTO.md](HOWTO.md)**.
-
-## Add your own detection rules
-
-Detection lives in `rules/community/*.yaml`. A rule is structured YAML over engine-provided facts — no
-code. Example: flag a base64 decode and an exec/eval co-occurring in the same changed file:
-
-```yaml
-- id: combo-decode-exec
-  applies_to: code
-  weight: 45
-  attack_type: obfuscated-loader
-  match:
-    all:
-      - bound_call: {category: decode}
-      - bound_call: {category: exec}
-```
-
-See **[RULES.md](RULES.md)** for the full schema, the predicate reference, and worked examples — written
-for both humans and LLM assistants, so you (or your agent) can author a valid rule in a few minutes.
-
-## What's here
-
-PyDiffWatch ships the full pipeline and a baseline ruleset: import-bound primitive detection, auto-exec
-location weighting, decode/fetch/credential combos, foreign-language-source, added-dependency reputation,
-and maintainer-change signals. The scoring weights and threshold are baselines you can tune. The engine
-and rule format here are the ones the community extends.
-
-### Detection scope on brand-new packages
-
-The pipeline's core signal is the **version-to-version diff**, so a package's first-ever release has no
-prior version to diff against. `new_package_policy` controls how those are handled:
-
-| Value | First-release behavior |
-|---|---|
-| `surface` (**default**) | Scan only the files PyPI auto-runs at install/import — `setup.py`, `setup.cfg`, `pyproject.toml`, `__init__.py`, `conftest.py`, `sitecustomize.py`, `.pth` — treating each as fully added. |
-| `full` | Scan **every** `.py` file in the new package as added (complete coverage, higher volume/noise). |
-| `skip` | Ignore new packages entirely. |
-
-Under the default, malware that lives in a non-auto-exec module of a brand-new package (e.g.
-`src/pkg/utils/helper.py`) is **not** scanned — first-release ≠ full scan. Set `new_package_policy = "full"`
-if you want complete coverage of first releases and can absorb the extra volume.
-
-## Data attribution
-
-The vendored popularity/typosquat corpus (`pydiffwatch/data/top_pypi_names.txt`, ~5000 names) is a
-PEP 503-normalized snapshot derived from [hugovk/top-pypi-packages](https://github.com/hugovk/top-pypi-packages),
-which in turn aggregates PyPI download counts from the public BigQuery dataset. It is vendored (not fetched
-at runtime); refresh it manually from that source. The upstream repository ships no explicit license — the
-file holds package names (facts), not creative content; credit the source if you redistribute it.
-
-## License
-
-MIT — see [LICENSE](LICENSE). Applies to PyDiffWatch's own code, rules, and docs; see **Data attribution**
-above for the vendored corpus.
+MIT — see [LICENSE](LICENSE); applies to PyDiffWatch's own code, rules, and docs. The vendored
+popularity/typosquat corpus (`pydiffwatch/data/top_pypi_names.txt`, ~5000 names) is a PEP 503-normalized
+snapshot derived from [hugovk/top-pypi-packages](https://github.com/hugovk/top-pypi-packages) (aggregated
+from PyPI's public BigQuery download stats); it's vendored, not fetched at runtime. The upstream ships no
+explicit license — the file holds package names (facts), not creative content; credit the source if you
+redistribute it.
