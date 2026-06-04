@@ -396,7 +396,7 @@ GPU and no API budget, or to keep monitoring when your endpoint is down.
 | `400`/`ReviewUnavailable: HTTP Error 400` from DeepSeek (or another reasoning model) | the endpoint rejects strict `json_schema` (an OpenAI-only extension). Set `structured_output = "json_object"`. See `examples/deepseek.toml`. |
 | DeepSeek verdicts arrive with empty `reasoning`/`cited_hunk` or `attack_type: none` | the response truncated — reasoning ate the output budget. Raise `max_output_tokens` (try 32000) and/or disable thinking via `[reviewer.extra_body]`. The `classification` still survives (emitted first). |
 | First `run` returns `processed 0 releases` | expected — a fresh DB seeds the cursor to "now" and processes nothing that tick; the next tick polls forward. Use `run --backfill` to process history instead. |
-| `run already in progress; exiting` | a previous tick still holds the lock. Harmless; space your schedule so a tick finishes before the next fires. |
+| `a scan is already running …` | another run holds the lock — the message names the holder pid and the lock file. If it's your scheduled tick, harmless; space the schedule. If nothing is actually running, a prior run hung or was killed mid-fetch and still holds the lock: kill the reported pid and re-run. The lock is an OS advisory lock that frees when its process exits — deleting the lock file does **not** release a live lock. |
 | Local endpoint refused / connection error | the model server isn't up, or `base_url` is wrong (check the port and the trailing `/v1`). From Docker, use `host.docker.internal`, not `localhost`. |
 
 ---

@@ -1,4 +1,4 @@
-import dataclasses, fcntl, json, logging, os
+import dataclasses, datetime, fcntl, json, logging, os
 from concurrent.futures import ThreadPoolExecutor
 from . import ingest, fetcher, differ, engine, rules, notifier, store, reviewer, egress
 from .config import Config
@@ -132,11 +132,30 @@ def run_once(cfg: Config, *, seed_if_fresh: bool = True) -> int:
         logger.warning("egress guard not installed; this process has no in-process host allowlist "
                        "(see docs/hardening/egress-allowlist.md or call egress.install_guard(cfg))")
     cfg.lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock = open(cfg.lock_path, "w")
+    # "a+" (not "w"): opening must NOT truncate, so a run that loses the lock can still read the holder
+    # info the winner wrote below and report who's running.
+    lock = open(cfg.lock_path, "a+")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        print("[pydiffwatch] run already in progress; exiting"); return 0
+        lock.seek(0)
+        holder = lock.read().strip()
+        lock.close()
+        who = f" ({holder})" if holder else ""
+        print(
+            f"[pydiffwatch] a scan is already running{who}; this invocation is exiting so the two "
+            f"don't collide.\n"
+            f"  lock file: {cfg.lock_path}\n"
+            f"  - If that's your scheduled run (cron/systemd/CI), this is expected: space the schedule "
+            f"so one tick finishes before the next starts.\n"
+            f"  - If you're sure nothing is running, a previous run was likely killed or hung mid-fetch "
+            f"and still holds the lock. Kill the reported pid and re-run. The lock is an OS-level "
+            f"advisory lock that frees automatically when the holding process exits, so deleting the "
+            f"lock file does NOT release a live lock — leave it in place.")
+        return 0
+    # Lock held. Record who holds it so a colliding run can report it above; flock frees on close/exit.
+    lock.seek(0); lock.truncate()
+    lock.write(f"pid={os.getpid()} since={datetime.datetime.now(datetime.UTC).isoformat()}"); lock.flush()
     try:
         conn = store.connect(cfg); store.init_schema(conn)
         last = store.get_last_serial(conn)
