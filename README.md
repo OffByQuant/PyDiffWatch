@@ -63,6 +63,31 @@ also run with **no model at all** (rules-only heuristic alerts) when you have no
 **→ Full setup — endpoints, API keys, scheduling, heuristic-only mode, troubleshooting:
 [GETTING-STARTED.md](GETTING-STARTED.md)**
 
+## What it records
+
+Everything lives in a single local SQLite database under `.diffwatch/` — nothing is hosted. It keeps a
+**cursor** (how far through PyPI's serial stream you've scanned), one **releases** row per version it
+processed (the diff basis, the triage score, and which rules fired), an **alerts** row per notification
+sent, and a **verdicts** row with the reviewer's call — classification, confidence, attack type, reasoning,
+and model — plus your own `human_label` once you adjudicate it with `pending`.
+
+A `releases` × `verdicts` slice from a real run (triage score is an unbounded sum of fired-rule weights;
+the default escalation threshold is 40, so anything below it never reaches the reviewer):
+
+```text
+package  version  triage_score  attack_type       classification
+-------  -------  ------------  ----------------  --------------
+pkg-a    9.1.0          21135   install-hook-rce  malicious
+pkg-b    2.9.32         16400   typosquat         malicious
+pkg-c    0.7.2           5975   dropper           malicious
+pkg-d    1.0.44          2510   typosquat         suspicious
+pkg-e    3.13.0        167740   none              benign
+```
+
+*(Package names anonymized.)* The last row is why the LLM reviewer earns its place: a brand-new package can
+rack up a huge heuristic score yet be correctly cleared as benign on inspection — catching the false
+positive before it ever becomes an alert.
+
 ## Run it safely
 
 PyDiffWatch ingests untrusted bytes from PyPI and runs community-authored rules. The no-execution design
