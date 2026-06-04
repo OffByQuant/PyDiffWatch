@@ -259,6 +259,27 @@ def test_unknown_attack_type_clamped_to_none():
     assert v.attack_type == "none" and v.classification == "malicious"
 
 
+def test_unknown_recommended_action_on_malicious_clamps_to_report():
+    # A loose-mode model can emit an action synonym (observed live: "block_and_report"). Rather than
+    # discard a correct malicious verdict, clamp toward caution: malicious -> report-to-pypi.
+    import json
+    bad = json.dumps({"classification": "malicious", "confidence": 0.9, "urgent": True,
+                      "recommended_action": "block_and_report", "attack_type": "install-hook-rce",
+                      "cited_hunk": "setup.py:1-3", "reasoning": "r"})
+    v = reviewer.Reviewer(Config(), backend=_FakeBackend([bad])).review(_diff(), _triage())
+    assert v.recommended_action == "report-to-pypi" and v.classification == "malicious"
+
+
+def test_unknown_recommended_action_on_non_malicious_clamps_to_monitor():
+    # Never clamp to dismiss: a non-malicious verdict with a garbage action gets monitored, not dropped.
+    import json
+    bad = json.dumps({"classification": "suspicious", "confidence": 0.9, "urgent": False,
+                      "recommended_action": "investigate", "attack_type": "none",
+                      "cited_hunk": "x:1-2", "reasoning": "r"})
+    v = reviewer.Reviewer(Config(), backend=_FakeBackend([bad])).review(_diff(), _triage())
+    assert v.recommended_action == "monitor"
+
+
 def test_low_confidence_escalates_when_backend_has_escalation_model():
     cfg = Config(reviewer=ReviewerConfig(opus_escalation_confidence=0.6))
     fb = _FakeBackend([_verdict_json(classification="suspicious", confidence=0.3),
