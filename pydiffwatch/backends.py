@@ -30,17 +30,27 @@ def _urllib_post_json(url: str, payload: dict, timeout: float, headers: dict | N
     egress in the codebase; `url` is always the backend's configured endpoint (never package data)."""
     egress.assert_web_scheme(url)
     body = json.dumps(payload).encode()
-    hdrs = {"Content-Type": "application/json", **(headers or {})}
+    # Explicit UA: the stdlib default "Python-urllib/3.x" is silently 403'd by some API gateways
+    # (Cloudflare/WAF). Matches fetcher.py's egress identity. Caller-supplied headers still win.
+    hdrs = {"Content-Type": "application/json", "User-Agent": "diffwatch/0.1", **(headers or {})}
     req = urllib.request.Request(url, data=body, headers=hdrs)
     # url is the operator-configured reviewer endpoint (scheme-guarded above), never package data.
     with urllib.request.urlopen(req, timeout=timeout) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
         return json.loads(r.read())
 
 
+# Enum fields that must NOT hard-fail on an out-of-enum value: a loose/prompt-only endpoint may emit a
+# synonym for an INFORMATIONAL field, and discarding the whole verdict over it would throw away the
+# decision signal. These are clamped to a safe default at Verdict construction (reviewer.py). The
+# decision fields (classification, recommended_action) stay hard-fail. This check is non-mutating.
+_SOFT_ENUM_KEYS = frozenset({"attack_type"})
+
+
 def validate_verdict(parsed, schema):
     """Minimal client-side schema check (no jsonschema dep): required keys present, enum membership.
-    Raises ReviewUnavailable on any miss. Used in EVERY structured-output mode so a loose/prompt-only
-    endpoint can never slip an out-of-contract verdict past the reviewer."""
+    Raises ReviewUnavailable on any miss (except _SOFT_ENUM_KEYS, which are clamped downstream). Used
+    in EVERY structured-output mode so a loose/prompt-only endpoint can never slip an out-of-contract
+    verdict past the reviewer. Non-mutating: returns `parsed` unchanged."""
     if not isinstance(parsed, dict):
         raise ReviewUnavailable("verdict is not an object")
     for key in schema.get("required", []):
@@ -48,6 +58,8 @@ def validate_verdict(parsed, schema):
             raise ReviewUnavailable(f"missing required key: {key}")
     for key, spec in schema.get("properties", {}).items():
         if key in parsed and "enum" in spec and parsed[key] not in spec["enum"]:
+            if key in _SOFT_ENUM_KEYS:
+                continue
             raise ReviewUnavailable(f"{key}={parsed[key]!r} not in {spec['enum']}")
     return parsed
 

@@ -2,6 +2,8 @@ import json
 import pytest
 from pydiffwatch.backends import (OpenAICompatibleBackend, AnthropicBackend, make_backend,
                                   ReviewUnavailable, validate_verdict)
+# Captured at import, before the autouse hermetic fixture rebinds the module attribute to a blocker.
+from pydiffwatch.backends import _urllib_post_json as _real_urllib_post_json
 from pydiffwatch.config import Config, ReviewerConfig
 
 SCHEMA = {"type": "object", "properties": {
@@ -97,6 +99,37 @@ def test_validate_verdict_rejects_missing_key():
 def test_validate_verdict_rejects_bad_enum():
     with pytest.raises(ReviewUnavailable):
         validate_verdict({"classification": "safe", "confidence": 0.9}, SCHEMA)
+
+
+def test_validate_verdict_clamps_unknown_attack_type_instead_of_rejecting():
+    # attack_type is informational; an out-of-enum value must NOT sink the verdict (it is clamped to
+    # "none" at Verdict construction). classification stays a hard failure — it is the decision field.
+    schema = {"type": "object",
+              "properties": {"classification": {"type": "string", "enum": ["malicious", "benign"]},
+                             "attack_type": {"type": "string", "enum": ["typosquat", "none"]}},
+              "required": ["classification", "attack_type"]}
+    validate_verdict({"classification": "benign", "attack_type": "data-theft"}, schema)   # no raise
+    with pytest.raises(ReviewUnavailable):
+        validate_verdict({"classification": "safe", "attack_type": "none"}, schema)
+
+
+def test_default_post_sets_user_agent_header(monkeypatch):
+    # Some API gateways (Cloudflare/WAF) 403 the stdlib default "Python-urllib/3.x" UA. Send an explicit
+    # one matching fetcher.py's egress identity.
+    from pydiffwatch import backends
+    captured = {}
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b'{"ok": true}'
+
+    def fake_urlopen(req, timeout=None):
+        captured["req"] = req
+        return _Resp()
+    monkeypatch.setattr(backends.urllib.request, "urlopen", fake_urlopen)
+    _real_urllib_post_json("http://x/v1/chat/completions", {"a": 1}, 5.0)
+    assert captured["req"].get_header("User-agent") == "diffwatch/0.1"
 
 
 def test_make_backend_openai_from_config():

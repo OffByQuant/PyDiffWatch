@@ -170,6 +170,17 @@ def test_review_schema_is_forced_structured_contract():
     assert set(s["required"]) == set(props.keys())
 
 
+def test_review_schema_emits_decision_fields_before_prose():
+    # Reasoning models that count thinking inside the output budget can truncate the JSON tail. Order
+    # the schema so the decision fields land first and only the verbose prose is at risk if truncated.
+    from pydiffwatch import reviewer
+    keys = list(reviewer.REVIEW_SCHEMA["properties"].keys())
+    assert keys[0] == "classification"
+    for decision in ("urgent", "recommended_action", "attack_type"):
+        assert keys.index(decision) < keys.index("reasoning")
+        assert keys.index(decision) < keys.index("cited_hunk")
+
+
 import pytest
 from pydiffwatch.config import Config, ReviewerConfig
 
@@ -215,6 +226,17 @@ def test_review_parses_structured_verdict():
 def test_review_clamps_out_of_range_confidence():
     r = reviewer.Reviewer(Config(), backend=_FakeBackend([_verdict_json(confidence=1.7)]))
     assert r.review(_diff(), _triage()).confidence == 1.0
+
+
+def test_unknown_attack_type_clamped_to_none():
+    # A loose/prompt-only endpoint can emit an attack_type synonym outside our enum; it must not sink
+    # the verdict — clamp the informational field to "none" while preserving the classification.
+    import json
+    bad = json.dumps({"classification": "malicious", "confidence": 0.9, "urgent": True,
+                      "recommended_action": "report-to-pypi", "attack_type": "data-theft",
+                      "cited_hunk": "setup.py:1-3", "reasoning": "r"})
+    v = reviewer.Reviewer(Config(), backend=_FakeBackend([bad])).review(_diff(), _triage())
+    assert v.attack_type == "none" and v.classification == "malicious"
 
 
 def test_low_confidence_escalates_when_backend_has_escalation_model():
