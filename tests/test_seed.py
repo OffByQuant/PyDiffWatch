@@ -1,11 +1,23 @@
 """Cursor seeding (§3.3): by default a fresh cursor starts monitoring from NOW (PyPI's current
 serial), not from genesis. `seed-now` does it explicitly; `--backfill` (seed_if_fresh=False) opts out
 to process from the cursor as-is. All hermetic — ingest is mocked, no live PyPI call."""
-from pydiffwatch import ingest, orchestrator, store
+import logging
+from pydiffwatch import egress, ingest, orchestrator, store
 
 
 def _throw(*a, **k):
     raise AssertionError("must not be called")
+
+
+def test_run_once_warns_when_egress_guard_not_installed(tmp_cfg, monkeypatch, caplog):
+    # Library callers reach run_once without the CLI entry point's install_guard(); surface that the
+    # in-process egress guard is absent rather than failing silently. The CLI path never trips this.
+    monkeypatch.setattr(ingest, "current_serial", lambda cfg: 5000)
+    monkeypatch.setattr(ingest, "changes_since", _throw)
+    assert not egress.is_installed()
+    with caplog.at_level(logging.WARNING, logger="pydiffwatch.orchestrator"):
+        orchestrator.run_once(tmp_cfg)
+    assert any("egress guard" in r.message.lower() for r in caplog.records)
 
 
 def test_fresh_cursor_seeds_to_now_and_processes_nothing(tmp_cfg, monkeypatch):

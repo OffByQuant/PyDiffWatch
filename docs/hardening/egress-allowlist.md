@@ -6,6 +6,13 @@ and undo it. The **authoritative** default-deny boundary is at the OS, outside t
 Run PyDiffWatch behind one of the two configurations below; treat the in-code guard as defense-in-depth
 and a confused-deputy catch, not as the boundary.
 
+The in-code guard is installed by the **CLI entry point only** (`__main__.main`); it is *not* auto-installed
+for library embedders who import the orchestrator, because a library should not monkey-patch the whole
+process's socket resolution on its caller's behalf. For any non-CLI use, the OS-level boundary below is the
+control that matters — and `run_once()` logs a warning when no in-process guard is installed, so the gap is
+visible rather than silent. (A library embedder may also call `egress.install_guard(cfg)` itself, but that
+does not replace the OS-level boundary.)
+
 **Allowlist (the only hosts PyDiffWatch needs):**
 
 | Host | Why | Address shape |

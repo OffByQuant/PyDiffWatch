@@ -29,6 +29,11 @@ restricted to PyPI, your reviewer endpoint, and your webhook. The built-in defau
 (`pydiffwatch/egress.py`) enforces this in-process, but an OS-level boundary is what holds if the process
 itself is compromised. **Do not run it on a workstation or a host with credentials or data you care about.**
 
+The in-process guard is installed by the **CLI entry point only** — a library has no business monkey-patching
+the whole process's socket resolution on its caller's behalf. If you embed PyDiffWatch (importing the
+orchestrator instead of running the CLI), rely on the OS-level boundary below, or opt in explicitly with
+`egress.install_guard(cfg)`; `run_once()` logs a warning when neither is in place so the gap is never silent.
+
 See [`docs/hardening/`](docs/hardening/) for concrete recipes — an OS-level egress boundary
 ([`egress-allowlist.md`](docs/hardening/egress-allowlist.md)) and running the byte-parsing stage under a
 container/gVisor or a no-network sandboxed subprocess ([`parse-sandbox.md`](docs/hardening/parse-sandbox.md)).

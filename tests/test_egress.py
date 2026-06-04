@@ -96,6 +96,15 @@ def test_uninstall_restores_original():
     assert socket.getaddrinfo is original
 
 
+def test_is_installed_reflects_guard_state():
+    cfg = Config()
+    assert egress.is_installed() is False        # not auto-installed (library default)
+    egress.install_guard(cfg)
+    assert egress.is_installed() is True
+    egress.uninstall_guard()
+    assert egress.is_installed() is False
+
+
 def test_install_is_idempotent():
     cfg = Config()
     real = lambda host, *a, **k: "REAL"

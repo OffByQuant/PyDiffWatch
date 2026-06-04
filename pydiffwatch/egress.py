@@ -10,7 +10,13 @@ This is defense-in-depth and a confused-deputy guard (e.g. it would catch review
 egressing). It is NOT a boundary against an in-process attacker who can re-import socket and undo it —
 the authoritative control there is the OS-level allowlist in docs/hardening/egress-allowlist.md. The
 guard is installed once at the CLI entry point (__main__.main); it is deliberately NOT auto-installed in
-tests (which would mutate global socket state across the suite)."""
+tests (which would mutate global socket state across the suite).
+
+Library embedders (importing the orchestrator instead of running the CLI) do not get this guard for the
+same reason — a library has no business monkey-patching the whole process's socket resolution on its
+caller's behalf. Such embedders should rely on the OS-level boundary (docs/hardening/egress-allowlist.md),
+which is the authoritative control anyway, or opt in explicitly by calling install_guard(cfg) themselves.
+run_once() logs a warning (via is_installed()) when neither has happened, so the gap is never silent."""
 import logging
 import socket
 from urllib.parse import urlsplit
@@ -88,6 +94,12 @@ def install_guard(cfg) -> None:
 
     _original_getaddrinfo = real
     socket.getaddrinfo = _guarded
+
+
+def is_installed() -> bool:
+    """True iff the egress guard is currently wrapping socket.getaddrinfo (install_guard has run and
+    uninstall_guard has not). Lets callers (e.g. the orchestrator) detect an unprotected process."""
+    return _original_getaddrinfo is not None
 
 
 def uninstall_guard() -> None:

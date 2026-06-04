@@ -1,6 +1,6 @@
 import dataclasses, fcntl, json, logging, os
 from concurrent.futures import ThreadPoolExecutor
-from . import ingest, fetcher, differ, engine, rules, notifier, store, reviewer
+from . import ingest, fetcher, differ, engine, rules, notifier, store, reviewer, egress
 from .config import Config
 from .models import Verdict, NewRelease, FiredRule
 
@@ -125,6 +125,12 @@ def seed_now(cfg: Config):
 
 
 def run_once(cfg: Config, *, seed_if_fresh: bool = True) -> int:
+    if not egress.is_installed():
+        # The CLI installs the in-process egress guard at entry; a library caller importing run_once
+        # directly does not. Surface it (don't auto-install: a library mutating global socket state is
+        # worse than the gap). Call egress.install_guard(cfg), or rely on the OS-level boundary.
+        logger.warning("egress guard not installed; this process has no in-process host allowlist "
+                       "(see docs/hardening/egress-allowlist.md or call egress.install_guard(cfg))")
     cfg.lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock = open(cfg.lock_path, "w")
     try:
