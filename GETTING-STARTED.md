@@ -162,7 +162,7 @@ so `api_key_env` is **ignored** when `provider = "anthropic"`. Just `export ANTH
 key is missing, that run logs a notice and falls back to heuristic-only — it does not crash.
 
 > Getting the key to your *scheduler* (cron/systemd/Docker/CI), not just your login shell, is the part
-> people miss — see §6 for how each harness injects it.
+> people miss — see §7 for how each harness injects it.
 
 ---
 
@@ -226,7 +226,60 @@ pydiffwatch -c pydiffwatch.toml capture-evidence --all           # widen to ever
 
 ---
 
-## 6. Running on a harness (cron / systemd / Docker / CI)
+## 6. The dashboard & the `watch` daemon
+
+Two extras make PyDiffWatch easier to run and easier to *act on*: a built-in daemon loop and a local HTML
+dashboard of verdicts with one-click "report to PyPI" links.
+
+**The dashboard** renders every reviewed release as a card — malicious and suspicious sorted first and
+highlighted, benign muted — each with a direct PyPI link, and flagged cards carry a **"Report malware on
+PyPI"** action so going from "the tool flagged this" to "reported for takedown" is one click. It's a single
+self-contained HTML file with no JavaScript; every untrusted string (package name, the model's reasoning,
+cited code) is HTML-escaped, so a package literally named `<script>…</script>` can't attack the page.
+
+Generate it from whatever the database already holds:
+
+```bash
+pydiffwatch -c pydiffwatch.toml dashboard                 # writes .diffwatch/dashboard.html
+pydiffwatch -c pydiffwatch.toml dashboard --serve         # also serve it on http://127.0.0.1:8787
+```
+
+`--serve` binds **127.0.0.1 only** (localhost) by default and blocks until Ctrl-C. Use `--out PATH` to
+choose the file and `--port N` to change the port.
+
+To view the dashboard from another device on your LAN, bind all interfaces:
+
+```bash
+pydiffwatch -c pydiffwatch.toml dashboard --serve --host 0.0.0.0   # reachable at http://<this-host-ip>:8787
+```
+
+> **Exposing it widens your trust boundary.** The page serves your verdict data and renders strings derived
+> from untrusted PyPI packages. It's HTML-escaped against XSS and the server is read-only with no control
+> endpoints, but `--host 0.0.0.0` makes it reachable by anyone who can reach this host. Only do it on a
+> network you trust, and keep the default `127.0.0.1` otherwise. The same `--host` flag works on `watch`.
+
+**The `watch` daemon** is the built-in alternative to wiring up cron/systemd (§7): it scans on an interval,
+refreshes the dashboard after each tick, and — with `--serve` — serves it the whole time. One command gives
+you a running monitor plus a live results page:
+
+```bash
+pydiffwatch -c pydiffwatch.toml seed-now                  # first time only (start "from now")
+pydiffwatch -c pydiffwatch.toml watch --serve             # scan every 5 min + live dashboard
+# → open http://127.0.0.1:8787/dashboard.html
+```
+
+`--interval N` sets the seconds between scans (default 300); `--out`/`--port` work as above. A failed scan
+(network blip, endpoint down) is logged and the daemon keeps going; Ctrl-C stops cleanly. The dashboard's
+status strip shows whether your model endpoint is reachable and how long ago the last scan ran — start your
+model server (§2) before `watch --serve`, or reviews fall back to heuristics until it's up.
+
+It is a **foreground** process — keep the terminal open, or run it under your agent harness, which will run
+it as a background task and hand you back the dashboard URL. For unattended, machine-level scheduling,
+prefer the harness patterns in §7.
+
+---
+
+## 7. Running on a harness (cron / systemd / Docker / CI)
 
 PyDiffWatch is a plain CLI over a local SQLite DB; "running it" means invoking `run` on a schedule under
 whatever runtime you already operate. All four patterns below are equivalent — pick one. Concurrent runs
@@ -338,7 +391,7 @@ jobs:
 
 ---
 
-## 7. State, persistence & containment
+## 8. State, persistence & containment
 
 All state lives under `.diffwatch/` (paths configurable via `db_path`, `cache_dir`, `lock_path`):
 
@@ -360,7 +413,7 @@ proxy / `systemd` IP allowlist / `nftables`) and [`parse-sandbox.md`](docs/harde
 
 ---
 
-## 8. Alerts
+## 9. Alerts
 
 Set `webhook_url` (top-level, not under `[reviewer]`) to receive each new alert as a JSON POST —
 `{"text": "..."}`, Slack-incoming-webhook compatible:
@@ -373,7 +426,7 @@ Alerts are also printed to stdout and recorded (deduped) in the DB, so a webhook
 
 ---
 
-## 9. Heuristic-only mode (no LLM)
+## 10. Heuristic-only mode (no LLM)
 
 To run with no model at all — rules and weights only, no endpoint required — set:
 
@@ -386,7 +439,7 @@ GPU and no API budget, or to keep monitoring when your endpoint is down.
 
 ---
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
@@ -401,7 +454,7 @@ GPU and no API budget, or to keep monitoring when your endpoint is down.
 
 ---
 
-## 11. Detection scope on brand-new packages
+## 12. Detection scope on brand-new packages
 
 The pipeline's core signal is the **version-to-version diff**, so a package's first-ever release has no
 prior version to diff against. `new_package_policy` controls how those are handled:
