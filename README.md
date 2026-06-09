@@ -69,6 +69,12 @@ pydiffwatch -c pydiffwatch.toml run             # process new releases (repeat o
 pydiffwatch -c pydiffwatch.toml pending         # see suspicious releases awaiting your verdict
 ```
 
+Prefer one command that scans continuously **and** shows you a live results page? Use the built-in daemon:
+
+```bash
+pydiffwatch -c pydiffwatch.toml watch --serve   # scan on a loop + serve the dashboard (↓)
+```
+
 Drop `run` into a cron job, `systemd` timer, container, or CI schedule to monitor continuously. You can
 also run with **no model at all** (rules-only heuristic alerts) when you have no GPU or budget.
 
@@ -101,6 +107,26 @@ pkg-e    3.13.0        167740   none              benign
 *(Package names anonymized.)* The last row is why the LLM reviewer earns its place: a brand-new package can
 rack up a huge heuristic score yet be correctly cleared as benign on inspection — catching the false
 positive before it ever becomes an alert.
+
+---
+
+## 🖥️ See and act on the results
+
+Finding a malicious release only matters if it gets reported and pulled. PyDiffWatch turns the verdicts in
+your database into a **local dashboard** — a single web page of cards, the dangerous ones sorted to the top,
+each with a link straight to the package on PyPI and a one-click **"Report malware on PyPI"** button. The goal
+is to make the path from *"the tool flagged this"* to *"reported for takedown"* as short as possible, so more
+eyes lead to faster reporting and faster removal.
+
+```bash
+pydiffwatch -c pydiffwatch.toml dashboard         # write a one-off dashboard.html
+pydiffwatch -c pydiffwatch.toml watch --serve     # keep scanning + open a live dashboard
+# → http://127.0.0.1:8787/dashboard.html
+```
+
+The page stays on your machine (it's served to `localhost` only by default — `--host 0.0.0.0` opts into
+sharing it on your LAN) and runs no code from the packages it shows; every untrusted string is HTML-escaped.
+**→ [GETTING-STARTED.md](GETTING-STARTED.md)** for the details.
 
 ---
 

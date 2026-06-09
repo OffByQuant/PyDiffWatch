@@ -181,3 +181,20 @@ def prior_version(conn, package, version):
     row = conn.execute("""SELECT version FROM releases WHERE package=? AND version<?
         ORDER BY serial DESC LIMIT 1""", (package, version)).fetchone()
     return row[0] if row else None
+
+def get_cursor(conn):
+    row = conn.execute("SELECT last_serial, updated_at FROM cursor WHERE id=1").fetchone()
+    return dict(row) if row else None
+
+def count_releases(conn) -> int:
+    return conn.execute("SELECT COUNT(*) FROM releases").fetchone()[0]
+
+def all_verdicts(conn):
+    return conn.execute(
+        """SELECT r.id AS release_id, r.package, r.version, r.prior_version,
+                  r.is_first_release, r.triage_score,
+                  v.classification, v.confidence, v.attack_type, v.reasoning,
+                  v.cited_hunk, v.model, v.urgent, v.created_at, v.human_label
+           FROM releases r JOIN verdicts v ON v.release_id = r.id
+           ORDER BY CASE v.classification WHEN 'malicious' THEN 0
+                    WHEN 'suspicious' THEN 1 ELSE 2 END, r.id DESC""").fetchall()

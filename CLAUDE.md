@@ -38,6 +38,10 @@ notifier → store`, SQLite-backed under `.diffwatch/`. Reviewer config is neste
 `config.py` and `examples/`. OS-level hardening guidance (egress boundary, parse sandbox) lives in
 `docs/hardening/`.
 
+- `dashboard.py` — static HTML verdict dashboard (PyPI links + report-malware actions); pure render
+  functions, no DB/I/O, every untrusted string `html.escape`d. Driven by `orchestrator.export_dashboard`
+  / `watch`, exposed as the `dashboard` and `watch` CLI subcommands.
+
 ## Detection is declarative
 
 - New detection logic is **general-purpose and rule-based**: heuristics live as YAML rules in
