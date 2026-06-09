@@ -1,11 +1,28 @@
 import argparse
 from . import egress
 from .config import Config, load_config
-from .orchestrator import run_once, seed_now, list_pending, adjudicate, get_evidence, backfill_evidence
+from .orchestrator import (run_once, seed_now, list_pending, adjudicate, get_evidence,
+                           backfill_evidence, export_dashboard, watch)
 
 
 def _cfg(args):
     return load_config(args.config) if args.config else Config()
+
+
+def _reach(host):
+    """Human note about who can reach a given bind address."""
+    if host in ("127.0.0.1", "localhost"):
+        return "localhost only"
+    return "exposed to the local network — anyone who can reach this host"
+
+
+def _file_server(directory, port, host="127.0.0.1"):
+    """A read-only static file server (no control endpoints). Binds 127.0.0.1 by
+    default; pass host="0.0.0.0" to expose it to the local network."""
+    import functools
+    from http.server import SimpleHTTPRequestHandler, HTTPServer
+    handler = functools.partial(SimpleHTTPRequestHandler, directory=str(directory))
+    return HTTPServer((host, port), handler)
 
 
 def main():
@@ -35,6 +52,28 @@ def main():
     capp.add_argument("--all", action="store_true",
                       help="widen from the reportable set (malicious/suspicious verdicts + non-benign "
                            "alerts) to EVERY release with a fired rule (far more PyPI re-fetches)")
+    dshp = sub.add_parser("dashboard",
+                          help="render persisted verdicts to a self-contained HTML page with PyPI "
+                               "links and one-click 'Report malware' actions for flagged packages")
+    dshp.add_argument("--out", default=None,
+                      help="output HTML path (default: <db dir>/dashboard.html)")
+    dshp.add_argument("--serve", action="store_true",
+                      help="serve the dashboard on 127.0.0.1 (localhost only) until Ctrl-C")
+    dshp.add_argument("--port", type=int, default=8787, help="port for --serve (default: 8787)")
+    dshp.add_argument("--host", default="127.0.0.1",
+                      help="bind address for --serve (default: 127.0.0.1, localhost only; "
+                           "use 0.0.0.0 to expose it to the local network)")
+    wp = sub.add_parser("watch",
+                        help="daemon loop: scan for new releases on an interval, refresh the "
+                             "dashboard each tick, and (with --serve) serve it on localhost")
+    wp.add_argument("--interval", type=int, default=300, help="seconds between scans (default: 300)")
+    wp.add_argument("--out", default=None, help="dashboard HTML path (default: <db dir>/dashboard.html)")
+    wp.add_argument("--serve", action="store_true",
+                    help="also serve the dashboard on 127.0.0.1 (localhost only) while watching")
+    wp.add_argument("--port", type=int, default=8787, help="port for --serve (default: 8787)")
+    wp.add_argument("--host", default="127.0.0.1",
+                    help="bind address for --serve (default: 127.0.0.1, localhost only; "
+                         "use 0.0.0.0 to expose it to the local network)")
     args = p.parse_args()
     cfg = _cfg(args)
     # xmlrpc.client is defused at import in ingest.py (covers library importers too). The egress guard
@@ -80,6 +119,32 @@ def main():
         for r in res:
             status = "captured" if r["captured"] else f"FAILED ({r['error']})"
             print(f"  {r['package']}=={r['version']}: {status}")
+    elif args.cmd == "dashboard":
+        out = export_dashboard(cfg, out_path=args.out)
+        print(f"[pydiffwatch] dashboard written to {out}")
+        if args.serve:
+            httpd = _file_server(out.parent, args.port, args.host)
+            print(f"[pydiffwatch] serving on http://{args.host}:{args.port}/{out.name} "
+                  f"({_reach(args.host)}) — Ctrl-C to stop")
+            try:
+                httpd.serve_forever()
+            except KeyboardInterrupt:
+                print("\n[pydiffwatch] stopped")
+            finally:
+                httpd.server_close()
+    elif args.cmd == "watch":
+        out = export_dashboard(cfg, out_path=args.out)  # initial snapshot for the server
+        httpd = None
+        if args.serve:
+            import threading
+            httpd = _file_server(out.parent, args.port, args.host)
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+            print(f"[pydiffwatch] serving http://{args.host}:{args.port}/{out.name} ({_reach(args.host)})")
+        print(f"[pydiffwatch] watching — scanning every {args.interval}s, Ctrl-C to stop")
+        n = watch(cfg, interval=args.interval, out_path=args.out)
+        if httpd:
+            httpd.server_close()
+        print(f"\n[pydiffwatch] stopped after {n} scan(s)")
     elif args.cmd == "adjudicate":
         res = adjudicate(cfg, args.release_id, args.label, args.note)
         if res is None:

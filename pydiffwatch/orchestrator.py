@@ -1,10 +1,12 @@
 import dataclasses, datetime, fcntl, json, logging, os
 from concurrent.futures import ThreadPoolExecutor
-from . import ingest, fetcher, differ, engine, rules, notifier, store, reviewer, egress
+from . import ingest, fetcher, differ, engine, rules, notifier, store, reviewer, egress, dashboard
 from .config import Config
 from .models import Verdict, NewRelease, FiredRule
 
 logger = logging.getLogger(__name__)
+
+_FLAGGED = ("malicious", "suspicious")
 
 # Stages that represent a completed analysis or permanent decision; skipped on future ticks.
 # review_failed is NON-terminal (LLM down -> retry next tick for a real verdict).
@@ -275,6 +277,86 @@ def backfill_evidence(cfg: Config, release_id: int | None = None, all_flagged: b
     finally:
         conn.close()
     return results
+
+
+def watch(cfg: Config, interval: int = 300, out_path=None, iterations=None, sleep_fn=None):
+    """Daemon loop: scan one tick, refresh the dashboard, sleep, repeat until Ctrl-C.
+    A failed scan is logged and skipped (the daemon stays up); the dashboard is
+    refreshed every tick so 'last poll' / reachability stay current. `iterations`
+    and `sleep_fn` exist for tests; in production both default to forever / time.sleep."""
+    import time
+    sleep_fn = sleep_fn or time.sleep
+    n = 0
+    try:
+        while iterations is None or n < iterations:
+            try:
+                run_once(cfg)
+            except Exception:
+                logger.exception("watch: scan tick failed; daemon continuing")
+            export_dashboard(cfg, out_path=out_path)
+            n += 1
+            if iterations is not None and n >= iterations:
+                break
+            sleep_fn(interval)
+    except KeyboardInterrupt:
+        pass
+    return n
+
+
+def _probe_reviewer(cfg: Config):
+    """(reachable, label): a localhost TCP probe of the LLM endpoint. The egress
+    guard allowlists this host, so the connect is permitted. Returns (None, label)
+    when there is nothing local to probe (reviewer disabled or a remote provider)."""
+    import socket
+    from urllib.parse import urlsplit
+    rc = getattr(cfg, "reviewer", None)
+    if not getattr(cfg, "reviewer_enabled", True) or rc is None:
+        return None, "reviewer disabled"
+    if rc.provider != "openai":
+        return None, f"{rc.provider} (remote)"
+    parts = urlsplit(rc.base_url)
+    host, port = parts.hostname, parts.port or (443 if parts.scheme == "https" else 80)
+    label = f"{host}:{port}"
+    try:
+        with socket.create_connection((host, port), timeout=1.5):
+            return True, label
+    except OSError:
+        return False, label
+
+
+def _poll_age(updated_at):
+    if not updated_at:
+        return None, False
+    try:
+        t = datetime.datetime.fromisoformat(updated_at)
+        secs = (datetime.datetime.now(datetime.UTC) - t).total_seconds()
+    except (ValueError, TypeError):
+        return None, False
+    return dashboard.humanize_age(secs), secs > 900  # stale after 15 min idle
+
+
+def export_dashboard(cfg: Config, out_path=None, generated_at: str = ""):
+    from pathlib import Path
+    out = Path(out_path) if out_path else cfg.db_path.parent / "dashboard.html"
+    conn = store.connect(cfg); store.init_schema(conn)
+    try:
+        rows = [dict(r) for r in store.all_verdicts(conn)]
+        cur = store.get_cursor(conn)
+        releases_total = store.count_releases(conn)
+    finally:
+        conn.close()
+    reachable, reviewer_label = _probe_reviewer(cfg)
+    age, stale = _poll_age(cur["updated_at"] if cur else None)
+    status = {
+        "last_serial": cur["last_serial"] if cur else None,
+        "last_poll_age": age, "stale": stale,
+        "releases_total": releases_total, "verdicts_total": len(rows),
+        "flagged_total": sum(1 for r in rows if (r.get("classification") or "").lower() in _FLAGGED),
+        "reviewer": reviewer_label, "model_reachable": reachable,
+    }
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(dashboard.render_dashboard(rows, status=status, generated_at=generated_at))
+    return out
 
 
 def adjudicate(cfg: Config, release_id: int, label: str, note: str = ""):
