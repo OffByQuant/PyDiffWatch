@@ -109,6 +109,38 @@ def _resolve_call(node, table) -> str | None:
     return None
 
 
+_FUNC_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+
+def _importtime_call_ids(tree) -> set:
+    """ids() of Call nodes that execute at IMPORT time: those lexically outside every function/lambda
+    body (module body, class bodies, comprehensions), plus those in a module-level function invoked from
+    import-time scope (one hop — catches define-helper-then-call-at-top-level). A call reachable only via
+    an EXTERNAL caller (a method the package exposes for its runtime, e.g. aiops-ml's onTransfering) is
+    NOT import-time, so a dangerous primitive buried there must not feed the auto-exec-location rule (an
+    auto-exec location only auto-runs its top-level statements, not its method bodies)."""
+    module_funcs = {n.name: n for n in tree.body
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+    def _calls_outside_funcs(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, _FUNC_NODES):
+                continue                              # a function/lambda body runs on call, not at import
+            if isinstance(child, ast.Call):
+                yield child
+            yield from _calls_outside_funcs(child)
+
+    importtime = list(_calls_outside_funcs(tree))
+    ids = {id(c) for c in importtime}
+    for c in importtime:                              # one hop: top-level f() pulls in f's body
+        f = c.func
+        if isinstance(f, ast.Name) and f.id in module_funcs:
+            for sub in ast.walk(module_funcs[f.id]):
+                if isinstance(sub, ast.Call):
+                    ids.add(id(sub))
+    return ids
+
+
 def _blob_present(added_strs) -> bool:
     for line in added_strs:
         if _B64_RUN.search(line) or len(line) > LONG_LINE:
@@ -124,6 +156,7 @@ class FileFacts:
     lines: tuple
     location_weight: float
     bound_categories: frozenset
+    autoexec_categories: frozenset   # subset of bound_categories whose call runs at import time
     bound_names: frozenset
     imported_modules: frozenset
     blob_present: bool
@@ -145,13 +178,14 @@ def _file_facts(fd) -> FileFacts:
     lines = (fd.hunks[0].new_range[0] + 1, fd.hunks[-1].new_range[1])
     loc = classify_location(fd.path)
     if fd.new_text is None or not fd.path.endswith((".py", ".pyx", ".pyi")):
-        return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), False, False, added_strs)
+        return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, False, added_strs)
     try:
         tree = ast.parse(fd.new_text)
     except SyntaxError:
-        return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), False, True, added_strs)
+        return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, True, added_strs)
     table = _build_import_table(tree)
-    cats, names = set(), set()
+    importtime_ids = _importtime_call_ids(tree)
+    cats, autoexec_cats, names = set(), set(), set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -164,9 +198,11 @@ def _file_facts(fd) -> FileFacts:
         cat = _resolve_call(node, table)
         if cat:
             cats.add(cat)
+            if id(node) in importtime_ids:
+                autoexec_cats.add(cat)
             f = node.func
             names.add(f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", ""))
-    return FileFacts(fd.path, lines, loc, frozenset(cats), frozenset(names),
+    return FileFacts(fd.path, lines, loc, frozenset(cats), frozenset(autoexec_cats), frozenset(names),
                      frozenset(table.values()), _blob_present(added_strs), False, added_strs)
 
 

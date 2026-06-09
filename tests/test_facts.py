@@ -7,6 +7,12 @@ def _codediff(path, added):
         [Hunk((0, 0), (0, len(added)), added, [])], "\n".join(added))], [])
 
 
+def _wholefile(path, full):
+    added = full.splitlines()
+    return Diff("p", "1.1", False, [FileDiff(path, "modified",
+        [Hunk((0, 0), (0, len(added)), added, [])], full)], [])
+
+
 def test_import_binding_categorizes_bound_calls():
     f = build_facts(_codediff("m/__init__.py", ["import base64", "exec(base64.b64decode(B))"])).files[0]
     assert "exec" in f.bound_categories and "decode" in f.bound_categories
@@ -20,6 +26,33 @@ def test_name_only_collisions_not_bound():
 def test_location_weight_autoexec_and_tests():
     assert build_facts(_codediff("setup.py", ["x=1"])).files[0].location_weight == 3.0
     assert build_facts(_codediff("tests/t.py", ["x=1"])).files[0].location_weight == 0.2
+
+
+def test_autoexec_categories_excludes_method_body():
+    # aiops-ml shape: exec inside a method only runs when the package's runtime calls it -> NOT import
+    # time. It still counts as a bound category (corroboration/combos), but NOT as an autoexec category.
+    full = ("import base64\n"
+            "class Algo:\n"
+            "    def on_transfer(self, p_code):\n"
+            "        s = base64.b64decode(p_code)\n"
+            "        exec(s)\n")
+    f = build_facts(_wholefile("pkg/__init__.py", full)).files[0]
+    assert "exec" in f.bound_categories and "decode" in f.bound_categories
+    assert "exec" not in f.autoexec_categories and "decode" not in f.autoexec_categories
+
+
+def test_autoexec_categories_includes_module_top_level():
+    f = build_facts(_codediff("pkg/__init__.py", ["import os", "os.system('id')"])).files[0]
+    assert "process" in f.autoexec_categories
+
+
+def test_autoexec_categories_one_hop_into_called_helper():
+    full = ("import os\n\n"
+            "def _boot():\n"
+            "    os.system('id')\n\n"
+            "_boot()\n")
+    f = build_facts(_wholefile("pkg/__init__.py", full)).files[0]
+    assert "process" in f.autoexec_categories
 
 
 def test_blob_present_on_long_b64():
