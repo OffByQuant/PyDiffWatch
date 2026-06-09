@@ -22,8 +22,10 @@
 
 - id: autoexec-location
   description: >
-    A dangerous primitive (process/exec/network) in an auto-exec location (setup.py, pyproject.toml,
-    __init__.py, .pth) — where install/import-time supply-chain malware must live.
+    A dangerous primitive (process/exec/network) that RUNS AT IMPORT TIME in an auto-exec location
+    (setup.py, pyproject.toml, __init__.py, .pth) — where install/import-time supply-chain malware must
+    live. autoexec_call (not bound_call) excludes primitives buried in method bodies that only run when
+    the package's own runtime calls them (a runtime feature, not an install hook).
   applies_to: code
   weight: 45
   attack_type: install-hook
@@ -31,6 +33,6 @@
     all:
       - location_at_least: 3.0
       - any:
-          - bound_call: {category: process}
-          - bound_call: {category: exec}
-          - bound_call: {category: network}
+          - autoexec_call: {category: process}
+          - autoexec_call: {category: exec}
+          - autoexec_call: {category: network}

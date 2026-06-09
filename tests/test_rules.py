@@ -3,9 +3,22 @@ from pydiffwatch.rules import load_rules, evaluate, validate_rule
 from pydiffwatch.facts import FileFacts
 
 
-def _code(cats=(), names=(), mods=(), blob=False, syn=False, loc=1.0, added=()):
-    return FileFacts("m.py", (1, 1), loc, frozenset(cats), frozenset(names),
+def _code(cats=(), names=(), mods=(), blob=False, syn=False, loc=1.0, added=(), autoexec=()):
+    return FileFacts("m.py", (1, 1), loc, frozenset(cats), frozenset(autoexec), frozenset(names),
                      frozenset(mods), blob, syn, tuple(added))
+
+
+def test_autoexec_call_matches_only_importtime_categories():
+    m = {"autoexec_call": {"category": "exec"}}
+    # exec is a bound category but NOT import-time here -> must not match
+    assert evaluate(m, _code(cats=("exec",), autoexec=())) is False
+    assert evaluate(m, _code(cats=("exec",), autoexec=("exec",))) is True
+
+
+def test_autoexec_call_rejects_name_arg():
+    # autoexec_call is category-only; a name arg (or no category) is invalid and dropped fail-closed
+    assert validate_rule({"id": "x", "applies_to": "code", "weight": 1,
+                          "match": {"autoexec_call": {"name": "system"}}}) is None
 
 
 def test_valid_combo_rule_parses():

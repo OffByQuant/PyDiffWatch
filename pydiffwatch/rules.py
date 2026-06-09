@@ -22,7 +22,7 @@ _BOOL = {"all", "any", "not"}
 MAX_REGEX_LEN = 1000   # bound a community-supplied regex (memory at load + ReDoS surface at match time)
 # predicate name -> set of scopes it is valid in
 _PRED_SCOPE = {
-    "bound_call": {"code"}, "import_present": {"code"}, "regex": {"code"},
+    "bound_call": {"code"}, "autoexec_call": {"code"}, "import_present": {"code"}, "regex": {"code"},
     "blob_present": {"code"}, "syntax_error": {"code"}, "location_at_least": {"code"},
     "binary_reason": {"binary"}, "dep_reason": {"dep"}, "maintainer_changed": {"maintainer"},
 }
@@ -53,6 +53,14 @@ def _valid_pred_args(name, args, scope) -> bool:
         if "name" in args and not isinstance(args["name"], str):
             return False
         return True
+    if name == "autoexec_call":
+        # like bound_call but category-only: the auto-exec escalation is about dangerous primitive
+        # categories that run at import time, not specific call names.
+        if not isinstance(args, dict) or set(args) != {"category"}:
+            return False
+        cats = args["category"]
+        cats = cats if isinstance(cats, list) else [cats]
+        return bool(cats) and all(c in CATEGORIES for c in cats)
     if name == "import_present":
         return isinstance(args, dict) and isinstance(args.get("module"), str)
     if name == "regex":
@@ -150,6 +158,10 @@ def _pred(name, args, ctx) -> bool:
         if "name" in args and args["name"] in ctx.bound_names:
             return True
         return False
+    if name == "autoexec_call":
+        cats = args["category"]
+        cats = cats if isinstance(cats, list) else [cats]
+        return any(c in ctx.autoexec_categories for c in cats)
     if name == "import_present":
         return args["module"] in ctx.imported_modules
     if name == "regex":

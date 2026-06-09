@@ -41,6 +41,22 @@ def test_decode_exec_combo_escalates():
     assert r.escalate and any(fr.rule == "combo-decode-exec" for fr in r.fired_rules)
 
 
+def test_method_body_exec_not_autoexec_location():
+    # aiops-ml shape: exec inside a method (only runs when called) must NOT fire autoexec-location even
+    # in __init__.py. combo-decode-exec still fires (the co-occurrence is still worth review), so it
+    # still escalates — only the false install-hook framing is dropped.
+    full = ("import base64\n"
+            "class Algo:\n"
+            "    def on_transfer(self, p_code):\n"
+            "        s = base64.b64decode(p_code)\n"
+            "        exec(s)\n")
+    d = Diff("p", "1.1", False, [FileDiff("pkg/__init__.py", "modified",
+        [Hunk((0, 0), (0, len(full.splitlines())), full.splitlines(), [])], full)], [])
+    r = triage(d, Config(), RULES)
+    assert not any(fr.rule == "autoexec-location" for fr in r.fired_rules)
+    assert any(fr.rule == "combo-decode-exec" for fr in r.fired_rules)
+
+
 def test_dep_typosquat_escalates():
     d = Diff("p", "1.1", False, [], [], added_dep_findings=[{"name": "reqursts", "reason": "typosquat"}])
     assert triage(d, Config(), RULES).escalate
