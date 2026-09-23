@@ -139,12 +139,15 @@ def _status_strip(status: dict) -> str:
         age += " (stale)"
     serial = status.get("last_serial")
     serial_txt = str(serial) if serial is not None else "—"
+    pending = status.get("pending_review") or {}
+    pending_txt = (f"{sum(pending.values())} pending LLM review ("
+                   + ", ".join(f"{k}: {v}" for k, v in sorted(pending.items())) + ")") if pending else ""
     return f"""<div class="status">
   <span class="stat"><span class="dot {dot}"></span>{e(model_txt)} <code>{e(status.get('reviewer') or '?')}</code></span>
   <span class="stat">last poll: {e(age)}</span>
   <span class="stat">cursor: {e(serial_txt)}</span>
   <span class="stat">{int(status.get('releases_total') or 0)} releases · {int(status.get('verdicts_total') or 0)} reviewed · {int(status.get('flagged_total') or 0)} flagged</span>
-</div>"""
+{f'  <span class="stat">{e(pending_txt)}</span>' + chr(10) if pending_txt else ''}</div>"""
 
 
 def render_dashboard(rows, status: dict = None, generated_at: str = "") -> str:

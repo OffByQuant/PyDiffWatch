@@ -440,6 +440,7 @@ def export_dashboard(cfg: Config, out_path=None, generated_at: str = ""):
         rows = [dict(r) for r in store.all_verdicts(conn)]
         cur = store.get_cursor(conn)
         releases_total = store.count_releases(conn)
+        pending_review = store.pending_review_counts(conn)
     finally:
         conn.close()
     reachable, reviewer_label = _probe_reviewer(cfg)
@@ -449,7 +450,7 @@ def export_dashboard(cfg: Config, out_path=None, generated_at: str = ""):
         "last_poll_age": age, "stale": stale,
         "releases_total": releases_total, "verdicts_total": len(rows),
         "flagged_total": sum(1 for r in rows if (r.get("classification") or "").lower() in _FLAGGED),
-        "reviewer": reviewer_label, "model_reachable": reachable,
+        "reviewer": reviewer_label, "model_reachable": reachable, "pending_review": pending_review,
     }
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(dashboard.render_dashboard(rows, status=status, generated_at=generated_at))

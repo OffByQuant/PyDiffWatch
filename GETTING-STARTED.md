@@ -243,7 +243,8 @@ pydiffwatch -c frontier.toml review-pending --reason too_large --limit 10
 ```
 
 `frontier.toml` is any reviewer config (e.g. `examples/anthropic.toml`) with the same `db_path` and a
-larger `max_input_chars`. `pending` shows the queue counts. A release with **no** reviewable text at all
+larger `max_input_chars`. `pending` shows the queue counts; the dashboard shows them in its status
+strip. A release with **no** reviewable text at all
 (only binary / oversized-member / maintainer signals) is not queued: no model can review it, so it goes
 straight to `pending` for a human.
 
