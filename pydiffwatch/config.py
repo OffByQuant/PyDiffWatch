@@ -18,7 +18,9 @@ class ReviewerConfig:
     # The client always validates the parsed verdict against REVIEW_SCHEMA regardless of mode.
     structured_output: str = "json_schema"
     escalation_model: str | None = None
-    timeout: float = 120.0
+    timeout: float = 300.0             # per-attempt: retry n waits timeout x n (300s, 600s, 900s)
+    max_review_attempts: int = 3
+    max_pending_per_tick: int = 20     # queued reviews retried at the start of each tick
     max_input_chars: int = 200_000
     # Reasoning models (e.g. DeepSeek) count thinking tokens inside the output budget; a small cap
     # truncates the JSON before all fields emit. Sized to leave room for reasoning + the full verdict.

@@ -119,7 +119,7 @@ class OpenAICompatibleBackend:
         key = os.environ.get(self.api_key_env)
         return {"Authorization": f"Bearer {key}"} if key else {}
 
-    def complete(self, *, model, system, user_text, schema, max_tokens) -> str:
+    def complete(self, *, model, system, user_text, schema, max_tokens, timeout=None) -> str:
         # extra_body first so the reserved core fields below (and response_format) always win — a stray
         # operator key can never override the model, the injection-delimited messages, or the token cap.
         payload = {
@@ -137,7 +137,8 @@ class OpenAICompatibleBackend:
             payload["response_format"] = {"type": "json_object"}
         # "none": prompt-only; no response_format (the system prompt already demands JSON).
         try:
-            data = self._post(f"{self.endpoint}/chat/completions", payload, self._timeout, self._auth_headers())
+            data = self._post(f"{self.endpoint}/chat/completions", payload, timeout or self._timeout,
+                              self._auth_headers())
         except Exception as e:                    # connection/timeout/HTTP/JSON -> fallback (with a fix hint)
             raise ReviewUnavailable(_egress_hint(e)) from e
         try:
@@ -167,10 +168,11 @@ class AnthropicBackend:
             client = anthropic.Anthropic()         # reads ANTHROPIC_API_KEY from host env
         self.client = client
 
-    def complete(self, *, model, system, user_text, schema, max_tokens) -> str:
+    def complete(self, *, model, system, user_text, schema, max_tokens, timeout=None) -> str:
         import anthropic
         try:
             resp = self.client.messages.create(
+                **({"timeout": timeout} if timeout else {}),
                 model=model,
                 max_tokens=max_tokens,
                 thinking={"type": "adaptive"},

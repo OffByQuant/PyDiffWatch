@@ -123,6 +123,17 @@ def _render_file(fd) -> str:
     return "\n".join(lines)
 
 
+def _rank_files(diff, triage):
+    weights = _file_weights(triage)
+    by_path = {fd.path: fd for fd in diff.changed}
+    if diff.is_first_release:
+        ranked_paths = sorted(by_path, key=lambda p: -weights.get(p, 0.0))[:_FIRST_RELEASE_TOP_FILES]
+    else:
+        flagged = [p for p in by_path if weights.get(p, 0.0) > 0.0]
+        ranked_paths = sorted(flagged, key=lambda p: -weights[p]) or sorted(by_path)  # fallback: all
+    return ranked_paths, by_path
+
+
 def build_review_input(diff, triage, *, max_chars: int) -> str:
     """Assemble the user-message text for the reviewer. Pure and deterministic.
 
@@ -132,14 +143,7 @@ def build_review_input(diff, triage, *, max_chars: int) -> str:
     surfaced as metadata. Over max_chars -> drop lowest-ranked files and append TRUNCATION_NOTE.
     """
     marker = _new_marker()
-    weights = _file_weights(triage)
-    by_path = {fd.path: fd for fd in diff.changed}
-
-    if diff.is_first_release:
-        ranked_paths = sorted(by_path, key=lambda p: -weights.get(p, 0.0))[:_FIRST_RELEASE_TOP_FILES]
-    else:
-        flagged = [p for p in by_path if weights.get(p, 0.0) > 0.0]
-        ranked_paths = sorted(flagged, key=lambda p: -weights[p]) or sorted(by_path)  # fallback: all
+    ranked_paths, by_path = _rank_files(diff, triage)
     ranked_set = set(ranked_paths)
 
     # Surface WHERE triage drew attention (file:line, for files we actually send) but NOT the rule
@@ -213,6 +217,28 @@ def build_evidence(diff, triage, *, max_chars: int) -> str:
     return text
 
 
+class InputTooLarge(Exception):
+    """The highest-risk file alone exceeds reviewer.max_input_chars. `text` is the review input built
+    with a cap of `needed`, so a larger-context model can review it later without re-fetching."""
+    def __init__(self, needed: int, cap: int, text: str):
+        super().__init__(f"needs {needed} chars, cap {cap}")
+        self.needed, self.cap, self.text = needed, cap, text
+
+
+def _marker_of(review_input: str) -> str:
+    return review_input.split("untrusted_content_marker: ", 1)[1].split("\n", 1)[0]
+
+
+def refresh_marker(review_input: str) -> str:
+    """A stored review input gets a fresh CSPRNG marker before it is sent again."""
+    return review_input.replace(_marker_of(review_input), _new_marker())
+
+
+def _has_reviewable_content(review_input: str) -> bool:
+    """True if any file content was rendered between the injection markers."""
+    return bool(review_input.split(_marker_of(review_input), 3)[2].strip())
+
+
 def _clamp01(x) -> float:
     try:
         return max(0.0, min(1.0, float(x)))
@@ -226,24 +252,53 @@ class Reviewer:
         # Default backend from cfg (local Qwen unless cfg.reviewer_backend=="claude"). Injectable for tests.
         self.backend = backend if backend is not None else make_backend(cfg)
 
-    def review(self, diff, triage) -> Verdict:
-        user_text = build_review_input(diff, triage, max_chars=self.cfg.reviewer.max_input_chars)
-        v = self._call(self.backend.primary_model, diff, triage, user_text)
+    def prepare(self, diff, triage) -> str:
+        """Build the review input, or raise InputTooLarge if the highest-risk file can't fit."""
+        cap = self.cfg.reviewer.max_input_chars
+        text = build_review_input(diff, triage, max_chars=cap)
+        ranked_paths, by_path = _rank_files(diff, triage)
+        if not _has_reviewable_content(text) and ranked_paths:
+            top = len(_render_file(by_path[ranked_paths[0]]))
+            if top:
+                needed = len(text) + len(TRUNCATION_NOTE) + top + 1
+                raise InputTooLarge(needed, cap, build_review_input(diff, triage, max_chars=needed))
+        return text
+
+    def review(self, diff, triage, *, attempt: int = 1) -> Verdict:
+        return self.review_text(diff.package, diff.version, triage.score, triage.fired_rules,
+                                self.prepare(diff, triage), attempt=attempt)
+
+    def review_text(self, package, version, score, fired_rules, user_text, *, attempt: int = 1) -> Verdict:
+        if not _has_reviewable_content(user_text):
+            # Triage fired only on signals with no text to show (binary members, maintainers). A model
+            # asked to judge nothing answers "benign"; that is a pass on a package nobody looked at.
+            # Skip the LLM and queue it for a human.
+            rules = ", ".join(sorted({r.rule for r in fired_rules}))
+            logger.info("reviewer has no content for %s==%s; queued for human", package, version)
+            return Verdict(
+                package=package, version=version, classification="suspicious",
+                score=score, fired_rules=fired_rules, urgent=False, confidence=0.0,
+                attack_type="none", cited_hunk="", recommended_action="monitor", model="none",
+                reasoning=f"UNREVIEWED: triage fired ({rules}) but none of the flagged content could be "
+                          f"shown to the reviewer. Needs a human.")
+        timeout = self.cfg.reviewer.timeout * attempt
+        args = (package, version, score, fired_rules, user_text, timeout)
+        v = self._call(self.backend.primary_model, *args)
         # §7 escalation (Claude only): low-confidence verdict -> re-run with the backend's bigger model.
         # The local backend exposes escalation_model=None, so a single model is used. (vet-mcp
         # popularity/blast-radius enrichment was CUT — vet is a peer scanner; depending on it for
         # detection intel makes DiffWatch downstream/too-late. Reputation is computed natively instead.)
         esc = self.backend.escalation_model
         if esc and v.confidence is not None and v.confidence < self.cfg.reviewer.opus_escalation_confidence:
-            logger.info("reviewer escalating %s==%s to %s (conf=%.2f)",
-                        diff.package, diff.version, esc, v.confidence)
-            v = self._call(esc, diff, triage, user_text)
+            logger.info("reviewer escalating %s==%s to %s (conf=%.2f)", package, version, esc, v.confidence)
+            v = self._call(esc, *args)
         return v
 
-    def _call(self, model, diff, triage, user_text) -> Verdict:
+    def _call(self, model, package, version, score, fired_rules, user_text, timeout) -> Verdict:
         # backend.complete enforces the schema and maps availability failures to ReviewUnavailable (§8).
         text = self.backend.complete(model=model, system=SYSTEM_PROMPT, user_text=user_text,
-                                     schema=REVIEW_SCHEMA, max_tokens=self.cfg.reviewer.max_output_tokens)
+                                     schema=REVIEW_SCHEMA, max_tokens=self.cfg.reviewer.max_output_tokens,
+                                     timeout=timeout)
         d = json.loads(text)                                  # schema-constrained output -> valid JSON
         attack_type = d["attack_type"] if d["attack_type"] in _ATTACK_TYPES else "none"
         # Clamp an out-of-enum action toward caution: a malicious verdict escalates to report, anything
@@ -252,9 +307,9 @@ class Reviewer:
         if action not in _RECOMMENDED_ACTIONS:
             action = "report-to-pypi" if d["classification"] == "malicious" else "monitor"
         return Verdict(
-            package=diff.package, version=diff.version,
-            classification=d["classification"], score=triage.score,
-            fired_rules=triage.fired_rules, urgent=bool(d["urgent"]),
+            package=package, version=version,
+            classification=d["classification"], score=score,
+            fired_rules=fired_rules, urgent=bool(d["urgent"]),
             confidence=_clamp01(d["confidence"]), attack_type=attack_type,
             reasoning=d["reasoning"], cited_hunk=d["cited_hunk"],
             recommended_action=action, model=model)
