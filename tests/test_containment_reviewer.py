@@ -188,3 +188,15 @@ def test_facts_ban_detects_violations():
     assert _violations("import urllib.request\n", _FACTS_FORBIDDEN)
     assert _violations("compile(src, 'x', 'exec')\n", _FACTS_FORBIDDEN)
     assert not _violations("import ast\nast.parse(src)\n", _FACTS_FORBIDDEN)
+
+
+# execctx.py reads author-written build metadata (pyproject.toml, setup.cfg, setup.py, entry_points.txt, .pth)
+# with tomllib / configparser / ast / email.parser only: pure, no exec, no import machinery, no network, no disk.
+_EXECCTX_FORBIDDEN = _FACTS_FORBIDDEN
+
+
+def test_execctx_only_parses_never_executes_imports_or_fetches():
+    src = (_DIFFWATCH / "execctx.py").read_text()
+    bad = _violations(src, _EXECCTX_FORBIDDEN) + _disk_violations(src)
+    assert not bad, f"execctx.py must only statically parse build metadata, never run it (§6); found: {bad}"
+    assert "open(" not in src, "execctx.py is pure: it gets bytes, it never opens files"
