@@ -324,9 +324,11 @@ def wait_for_sdist(conn, release_id, recheck_at):
 def recheck_at(conn, release_id):
     return conn.execute("SELECT recheck_at FROM releases WHERE id=?", (release_id,)).fetchone()[0]
 
-# Stages a release reaches only after its sdist was downloaded: the store's own evidence that a package shipped one.
+# Stages a release reaches only after its sdist was downloaded, or refused for its size: the store's own evidence
+# that a package shipped one. refused_to_fetch also covers a quarantine refusal and an over-size package JSON,
+# which prove no sdist; counting them errs toward a switch warning, never toward silence.
 SDIST_STAGES = ("triaged", "alerted", "reviewed", "needs_adjudication", "pending_review", "new_package_skipped",
-                "refused_to_extract")
+                "refused_to_extract", "refused_to_fetch")
 
 def previous_sdist_release(conn, package, version):
     """The package's most recent release recorded before this (recorded) one, if it reached an sdist-scanned

@@ -361,3 +361,12 @@ def test_a_steady_inflow_of_new_failures_does_not_starve_older_retries(tmp_cfg, 
             for r in old]
     assert olds == [("gave_up", store.METADATA_ATTEMPTS)] * 4
     assert conn.execute("SELECT COUNT(*) FROM releases WHERE stage='gave_up'").fetchone()[0] > 4
+
+
+def test_a_previous_release_refused_for_its_download_size_counts_as_one_that_shipped_an_sdist(tmp_cfg):
+    # A download refused for size proves there was an sdist to download: a wheel-only next release is a switch.
+    conn = store.connect(tmp_cfg); store.init_schema(conn)
+    rid = store.record_release(conn, "huge", "1.0", 5, False, None, "sdist")
+    store.update_stage(conn, rid, "refused_to_fetch")
+    store.record_release(conn, "huge", "1.1", 6, False, None, "sdist")
+    assert store.previous_sdist_release(conn, "huge", "1.1") == "1.0"
