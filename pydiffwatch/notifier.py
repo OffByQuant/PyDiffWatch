@@ -13,6 +13,22 @@ def _render(v: Verdict) -> str:
                  f"\n  cited_hunk={v.cited_hunk}\n  reason: {v.reasoning}")
     return line
 
+def post_webhook(cfg, text) -> bool:
+    """POST {"text": text} to cfg.webhook_url. False when none is set or delivery failed; never raises,
+    because an alert must not break a scan."""
+    if not cfg.webhook_url:
+        return False
+    try:
+        egress.assert_web_scheme(cfg.webhook_url)
+        body = json.dumps({"text": text}).encode()
+        req = urllib.request.Request(cfg.webhook_url, data=body, headers={"Content-Type": "application/json"})
+        # webhook_url is operator config (scheme-guarded above), never package data.
+        urllib.request.urlopen(req, timeout=cfg.fetch_timeout_s)  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
+        return True
+    except Exception:
+        return False
+
+
 def emit(cfg, conn, verdict: Verdict, release_id: int):
     dedupe_key = f"{verdict.package}|{verdict.version}|{verdict.classification}"
     rules_json = json.dumps([r.__dict__ for r in verdict.fired_rules])
@@ -21,14 +37,5 @@ def emit(cfg, conn, verdict: Verdict, release_id: int):
     if not is_new:
         return False                       # deduped — already alerted
     print(_render(verdict))
-    if cfg.webhook_url:
-        try:
-            egress.assert_web_scheme(cfg.webhook_url)
-            body = json.dumps({"text": _render(verdict)}).encode()
-            req = urllib.request.Request(cfg.webhook_url, data=body,
-                                         headers={"Content-Type": "application/json"})
-            # webhook_url is operator config (scheme-guarded above), never package data.
-            urllib.request.urlopen(req, timeout=cfg.fetch_timeout_s)  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
-        except Exception:
-            pass                           # alert already recorded; retry next run
+    post_webhook(cfg, _render(verdict))    # alert already recorded; a failed delivery never breaks a scan
     return True

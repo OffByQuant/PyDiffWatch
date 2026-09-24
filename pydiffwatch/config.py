@@ -26,6 +26,12 @@ class ReviewerConfig:
     # truncates the JSON before all fields emit. Sized to leave room for reasoning + the full verdict.
     max_output_tokens: int = 32000
     opus_escalation_confidence: float = 0.6
+    budget_safety: float = 0.6         # a review may be predicted to use at most this share of `timeout`
+    probe_timeout: float = 180.0       # health probe / calibration (covers llama-swap loading a model)
+    slowdown_ratio: float = 0.3        # a review below this share of measured speed counts as slow
+    degraded_pause_s: float = 900.0    # after two slow reviews in a row, pause this long before probing
+    host_memory_guard: str | bool = "auto"   # "auto": on when the endpoint is on this machine (loopback)
+    max_swap_used_pct: float = 75.0          # pause reviews at or above this swap use
     # Provider-specific request knobs merged verbatim into the chat-completions payload (openai
     # provider only) — e.g. DeepSeek's reasoning toggle: [reviewer.extra_body] reasoning = {enabled=false}.
     # Reserved core fields (model/messages/max_tokens/response_format) always win; see backends.py.

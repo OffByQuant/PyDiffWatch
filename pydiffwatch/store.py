@@ -16,6 +16,9 @@ CREATE TABLE IF NOT EXISTS verdicts(id INTEGER PRIMARY KEY,
   release_id INTEGER UNIQUE, classification TEXT, confidence REAL,
   attack_type TEXT, reasoning TEXT, cited_hunk TEXT, model TEXT, urgent INTEGER,
   created_at TEXT, human_label TEXT, human_note TEXT, adjudicated_at TEXT);
+CREATE TABLE IF NOT EXISTS reviewer_stats(endpoint TEXT, model TEXT, tok_s REAL, chars_per_token REAL,
+  samples INTEGER, state TEXT, detail TEXT, paused_until REAL, slow_streak INTEGER, updated_at TEXT,
+  PRIMARY KEY(endpoint, model));
 """
 
 def _now(): return datetime.datetime.now(datetime.UTC).isoformat()
@@ -46,6 +49,15 @@ def migrate_schema(conn):
             conn.execute(f"SELECT {col} FROM releases LIMIT 1")
         except sqlite3.OperationalError:
             conn.execute(f"ALTER TABLE releases ADD COLUMN {col} {typ}"); conn.commit()
+    try:
+        conn.execute("SELECT review_input_chars FROM releases LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE releases ADD COLUMN review_input_chars INTEGER")
+        for rid, blob in conn.execute("SELECT id, review_input FROM releases "
+                                      "WHERE review_input IS NOT NULL").fetchall():
+            conn.execute("UPDATE releases SET review_input_chars=? WHERE id=?",
+                         (len(zlib.decompress(blob).decode()), rid))
+        conn.commit()
 
 def get_last_serial(conn) -> int:
     return conn.execute("SELECT last_serial FROM cursor WHERE id=1").fetchone()[0]
@@ -133,26 +145,47 @@ def park_for_review(conn, release_id, reason, detail, review_input):
     """Queue a flagged release for a later LLM review. The review input is kept (compressed) so the
     review doesn't depend on PyPI still hosting the sdist; it is dropped once a verdict lands."""
     conn.execute("UPDATE releases SET stage='pending_review', pending_reason=?, pending_detail=?, "
-                 "review_input=? WHERE id=?",
-                 (reason, detail, zlib.compress(review_input.encode()), release_id))
+                 "review_input=?, review_input_chars=? WHERE id=?",
+                 (reason, detail, zlib.compress(review_input.encode()), len(review_input), release_id))
     conn.commit()
 
 def clear_pending(conn, release_id):
-    conn.execute("UPDATE releases SET pending_reason=NULL, pending_detail=NULL, review_input=NULL WHERE id=?",
+    conn.execute("UPDATE releases SET pending_reason=NULL, pending_detail=NULL, review_input=NULL, "
+                 "review_input_chars=NULL WHERE id=?",
                  (release_id,))
     conn.commit()
 
-def pending_reviews(conn, reasons=None):
+def pending_reviews(conn, reasons=None, max_chars=None):
     sql = ("SELECT id AS release_id, package, version, triage_score, triage_rules, pending_reason, "
            "pending_detail, COALESCE(review_attempts,0) AS review_attempts, review_input "
            "FROM releases WHERE stage='pending_review'")
     params = list(reasons or [])
     if params:
         sql += f" AND pending_reason IN ({','.join('?' * len(params))})"
+    if max_chars is not None:
+        sql += " AND review_input_chars <= ?"
+        params.append(max_chars)
     return conn.execute(sql + " ORDER BY id", params).fetchall()
 
 def review_input(row) -> str:
     return zlib.decompress(row["review_input"]).decode()
+
+def get_reviewer_stats(conn, endpoint, model):
+    row = conn.execute("SELECT tok_s, chars_per_token, samples, state, detail, paused_until, slow_streak "
+                       "FROM reviewer_stats WHERE endpoint=? AND model=?", (endpoint, model)).fetchone()
+    return dict(row) if row else None
+
+def save_reviewer_stats(conn, endpoint, model, *, tok_s, chars_per_token, samples, state, detail,
+                        paused_until, slow_streak):
+    conn.execute("""INSERT INTO reviewer_stats(endpoint, model, tok_s, chars_per_token, samples, state, detail,
+                        paused_until, slow_streak, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(endpoint, model) DO UPDATE SET tok_s=excluded.tok_s,
+                        chars_per_token=excluded.chars_per_token, samples=excluded.samples,
+                        state=excluded.state, detail=excluded.detail, paused_until=excluded.paused_until,
+                        slow_streak=excluded.slow_streak, updated_at=excluded.updated_at""",
+                 (endpoint, model, tok_s, chars_per_token, samples, state, detail, paused_until,
+                  slow_streak, _now()))
+    conn.commit()
 
 def pending_review_counts(conn) -> dict:
     return dict(conn.execute("SELECT pending_reason, count(*) FROM releases WHERE stage='pending_review' "

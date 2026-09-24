@@ -23,7 +23,8 @@ _OK = ('{"classification":"benign","confidence":0.9,"urgent":false,"recommended_
 def _cfg(tmp_path, **rv):
     c = dataclasses.replace(Config(), db_path=tmp_path / "db.sqlite", lock_path=tmp_path / "l",
                             cache_dir=tmp_path / "c", rules_dir=Path("rules/community"))
-    return dataclasses.replace(c, reviewer=dataclasses.replace(c.reviewer, **rv)) if rv else c
+    # The host memory guard reads this machine's real memory; keep these tests independent of it.
+    return dataclasses.replace(c, reviewer=dataclasses.replace(c.reviewer, host_memory_guard=False, **rv))
 
 
 class _Backend:
@@ -37,6 +38,12 @@ class _Backend:
         if self.fail is not None:
             raise reviewer.ReviewUnavailable("boom") from self.fail
         return _OK
+
+    def ping(self, text, *, timeout):     # the reviewer guard's probe / calibration: a fast endpoint
+        return {"prompt_tokens": 5000, "completion_tokens": 1, "prompt_per_second": 100_000.0}
+
+    def context_length(self):
+        return None
 
 
 def _setup(tmp_path, backend, **rv):

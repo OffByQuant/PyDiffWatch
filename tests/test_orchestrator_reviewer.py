@@ -28,7 +28,7 @@ def test_escalate_success_persists_verdict_and_marks_reviewed(tmp_path):
     rid = store.record_release(conn, "p", "1.0", 1, False, "0.9", "sdist")
 
     class _R:
-        def prepare(self, diff, triage): return ""
+        def prepare(self, diff, triage, cap=None): return ""
         def review_text(self, *a, **kw): return _malicious_verdict()
     orchestrator._review_escalated(cfg, conn, _R(), _diff_obj(), _triage_obj(), rid)
 
@@ -96,7 +96,7 @@ def test_llm_down_falls_back_to_heuristic_and_parks_for_review(tmp_path):
     rid = store.record_release(conn, "p", "1.0", 1, False, "0.9", "sdist")
 
     class _R:
-        def prepare(self, diff, triage): return ""
+        def prepare(self, diff, triage, cap=None): return ""
         def review_text(self, *a, **kw): raise reviewer.ReviewUnavailable("down")
     orchestrator._review_escalated(cfg, conn, _R(), _diff_obj(), _triage_obj(), rid)
 

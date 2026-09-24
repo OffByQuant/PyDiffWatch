@@ -39,6 +39,29 @@ def _urllib_post_json(url: str, payload: dict, timeout: float, headers: dict | N
         return json.loads(r.read())
 
 
+def _urllib_get_json(url: str, timeout: float, headers: dict | None = None) -> dict:
+    egress.assert_web_scheme(url)
+    req = urllib.request.Request(url, headers={"User-Agent": "diffwatch/0.1", **(headers or {})})
+    with urllib.request.urlopen(req, timeout=timeout) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
+        return json.loads(r.read())
+
+
+def _usage_of(data) -> dict | None:
+    """Token counts the server reported for a request, or None. llama.cpp also reports its measured
+    prompt-reading speed (timings.prompt_per_second), which is more precise than tokens / wall time."""
+    u = data.get("usage") if isinstance(data, dict) else None
+    if not isinstance(u, dict) or not isinstance(u.get("prompt_tokens"), int):
+        return None
+    out = {"prompt_tokens": u["prompt_tokens"], "completion_tokens": u.get("completion_tokens") or 0}
+    timings = data.get("timings") or {}
+    pps = timings.get("prompt_per_second")
+    if isinstance(pps, (int, float)) and pps > 0:
+        out["prompt_per_second"] = float(pps)
+        if isinstance(timings.get("prompt_n"), int):
+            out["prompt_n"] = timings["prompt_n"]     # tokens actually read; the rest came from the prompt cache
+    return out
+
+
 # Enum fields that must NOT hard-fail on an out-of-enum value: a loose/prompt-only endpoint may emit a
 # synonym, and discarding the whole verdict over it would throw away the decision signal. These are
 # clamped toward caution at Verdict construction (reviewer.py): attack_type -> "none", and
@@ -101,14 +124,16 @@ class OpenAICompatibleBackend:
     The verdict is always validated client-side against the schema regardless of mode."""
 
     def __init__(self, base_url, model, *, api_key_env=None, structured_output="json_schema",
-                 escalation_model=None, post=None, timeout: float = 120.0, extra_body=None):
+                 escalation_model=None, post=None, get=None, timeout: float = 120.0, extra_body=None):
         self.endpoint = base_url.rstrip("/")
         self.primary_model = model
         self.escalation_model = escalation_model
         self.api_key_env = api_key_env
         self.structured_output = structured_output
         self._post = post if post is not None else _urllib_post_json
+        self._get = get if get is not None else _urllib_get_json
         self._timeout = timeout
+        self.last_usage = None
         # Provider-specific knobs (e.g. DeepSeek reasoning toggle) merged verbatim; core fields override.
         self.extra_body = extra_body or {}
 
@@ -136,11 +161,13 @@ class OpenAICompatibleBackend:
         elif self.structured_output == "json_object":
             payload["response_format"] = {"type": "json_object"}
         # "none": prompt-only; no response_format (the system prompt already demands JSON).
+        self.last_usage = None
         try:
             data = self._post(f"{self.endpoint}/chat/completions", payload, timeout or self._timeout,
                               self._auth_headers())
         except Exception as e:                    # connection/timeout/HTTP/JSON -> fallback (with a fix hint)
             raise ReviewUnavailable(_egress_hint(e)) from e
+        self.last_usage = _usage_of(data)
         try:
             content = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as e:
@@ -156,6 +183,35 @@ class OpenAICompatibleBackend:
         validate_verdict(parsed, schema)
         return content
 
+    def ping(self, user_text, *, timeout) -> dict | None:
+        """A minimal request (1 output token, no schema) for health probes and speed calibration.
+        Raises ReviewUnavailable like complete(). Returns the reported usage, or None."""
+        payload = {"model": self.primary_model, "messages": [{"role": "user", "content": user_text}],
+                   "max_tokens": 1, "temperature": 0}
+        if self.extra_body:
+            payload.update(self.extra_body)
+        try:
+            data = self._post(f"{self.endpoint}/chat/completions", payload, timeout, self._auth_headers())
+        except Exception as e:
+            raise ReviewUnavailable(_egress_hint(e)) from e
+        self.last_usage = _usage_of(data)
+        return self.last_usage
+
+    def context_length(self) -> int | None:
+        """Best effort: the context window the server advertises for this model, else None."""
+        try:
+            for m in self._get(f"{self.endpoint}/models", 5.0, self._auth_headers()).get("data", []):
+                if m.get("id") == self.primary_model:
+                    for k in ("context_length", "max_model_len", "max_context_length"):
+                        if isinstance(m.get(k), int) and m[k] > 0:
+                            return m[k]
+            root = self.endpoint[:-3] if self.endpoint.endswith("/v1") else self.endpoint
+            props = self._get(f"{root}/props", 5.0, self._auth_headers())
+            n_ctx = (props.get("default_generation_settings") or {}).get("n_ctx") or props.get("n_ctx")
+            return n_ctx if isinstance(n_ctx, int) and n_ctx > 0 else None
+        except Exception:
+            return None
+
 
 class AnthropicBackend:
     """Anthropic SDK backend. Sonnet baseline with optional Opus escalation on low confidence."""
@@ -167,9 +223,11 @@ class AnthropicBackend:
             import anthropic                       # lazy: optional dep, only when this backend is used
             client = anthropic.Anthropic()         # reads ANTHROPIC_API_KEY from host env
         self.client = client
+        self.last_usage = None
 
     def complete(self, *, model, system, user_text, schema, max_tokens, timeout=None) -> str:
         import anthropic
+        self.last_usage = None
         try:
             resp = self.client.messages.create(
                 **({"timeout": timeout} if timeout else {}),
@@ -182,6 +240,7 @@ class AnthropicBackend:
             )
         except anthropic.APIError as e:            # 4xx/5xx/timeout/connection after SDK retries
             raise ReviewUnavailable(str(e)) from e
+        self.last_usage = _anthropic_usage(resp)
         text = next((b.text for b in resp.content if getattr(b, "type", None) == "text"), None)
         if text is None:
             raise ReviewUnavailable("no text block in response")
@@ -191,6 +250,25 @@ class AnthropicBackend:
             raise ReviewUnavailable(f"non-JSON content: {e}") from e
         validate_verdict(parsed, schema)
         return text
+
+    def ping(self, user_text, *, timeout) -> dict | None:
+        import anthropic
+        try:
+            resp = self.client.messages.create(model=self.primary_model, max_tokens=1, timeout=timeout,
+                                               messages=[{"role": "user", "content": user_text}])
+        except anthropic.APIError as e:
+            raise ReviewUnavailable(str(e)) from e
+        self.last_usage = _anthropic_usage(resp)
+        return self.last_usage
+
+    def context_length(self) -> int | None:
+        return None
+
+
+def _anthropic_usage(resp) -> dict | None:
+    u = getattr(resp, "usage", None)
+    return ({"prompt_tokens": u.input_tokens, "completion_tokens": u.output_tokens}
+            if u is not None and isinstance(getattr(u, "input_tokens", None), int) else None)
 
 
 def make_backend(cfg, client=None):

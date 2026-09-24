@@ -252,9 +252,10 @@ class Reviewer:
         # Default backend from cfg (local Qwen unless cfg.reviewer_backend=="claude"). Injectable for tests.
         self.backend = backend if backend is not None else make_backend(cfg)
 
-    def prepare(self, diff, triage) -> str:
-        """Build the review input, or raise InputTooLarge if the highest-risk file can't fit."""
-        cap = self.cfg.reviewer.max_input_chars
+    def prepare(self, diff, triage, cap=None) -> str:
+        """Build the review input, or raise InputTooLarge if the highest-risk file can't fit in `cap`
+        (default: max_input_chars; the guard passes the endpoint's measured cap)."""
+        cap = cap or self.cfg.reviewer.max_input_chars
         text = build_review_input(diff, triage, max_chars=cap)
         ranked_paths, by_path = _rank_files(diff, triage)
         if not _has_reviewable_content(text) and ranked_paths:

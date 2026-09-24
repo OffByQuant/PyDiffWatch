@@ -1,6 +1,7 @@
-import dataclasses, datetime, fcntl, json, logging, os
+import dataclasses, datetime, fcntl, json, logging, os, time
 from concurrent.futures import ThreadPoolExecutor
 from . import ingest, fetcher, differ, engine, rules, notifier, store, reviewer, egress, dashboard
+from . import guard as guard_mod
 from .config import Config
 from .models import Verdict, NewRelease, FiredRule
 
@@ -35,6 +36,27 @@ def _endpoint_down(e) -> bool:
     return isinstance(getattr(cause, "reason", cause), ConnectionRefusedError)
 
 
+def _is_timeout(e) -> bool:
+    cause = e.__cause__
+    reason = getattr(cause, "reason", cause)
+    return isinstance(reason, TimeoutError) or type(cause).__name__ == "APITimeoutError"
+
+
+def review_lock_path(cfg):
+    return cfg.lock_path.with_name(cfg.lock_path.name + ".review")
+
+
+def _review_slot(cfg):
+    """Blocking lock held while a review is at the model, so `review-pending` and the watch loop (separate
+    processes) never have requests at one endpoint at the same time. Freed when the file is closed."""
+    path = review_lock_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, "a+")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    return f
+
+
+
 def _record(cfg, conn, rid, verdict, score):
     store.clear_pending(conn, rid)
     store.record_verdict(conn, rid, verdict)
@@ -49,12 +71,20 @@ def _record(cfg, conn, rid, verdict, score):
         store.update_stage(conn, rid, "reviewed", score, None)
 
 
-def _attempt_review(cfg, conn, rvw, rid, package, version, score, fired_rules, text) -> bool:
-    """One review attempt; on failure the release is (re)parked with the reason. Returns False when the
-    endpoint is unreachable, so a drain can stop instead of hammering a dead server."""
+def _attempt_review(cfg, conn, rvw, rid, package, version, score, fired_rules, text, guard=None) -> bool:
+    """One review attempt; on failure the release is (re)parked with the reason. Returns False when no more
+    reviews should be sent now (endpoint unreachable, guard deferring, or the guard's breaker just opened),
+    so a drain stops instead of hammering the server."""
+    if guard is not None:
+        why = guard.admit()
+        if why:
+            store.park_for_review(conn, rid, "model_busy", why, text)
+            return False
     attempt = store.review_attempts(conn, rid) + 1
+    t0 = time.monotonic()
     try:
-        verdict = rvw.review_text(package, version, score, fired_rules, text, attempt=attempt)
+        with _review_slot(cfg):
+            verdict = rvw.review_text(package, version, score, fired_rules, text, attempt=attempt)
     except reviewer.ReviewUnavailable as e:
         logger.warning("LLM review failed for %s==%s (attempt %d): %s", package, version, attempt, e)
         if _endpoint_down(e):     # an outage, not this release's fault: don't spend an attempt
@@ -62,62 +92,78 @@ def _attempt_review(cfg, conn, rvw, rid, package, version, score, fired_rules, t
             return False
         n = store.bump_review_attempts(conn, rid)
         store.park_for_review(conn, rid, "review_failed", f"{n} failed attempt(s): {e}", text)
+        if guard is not None and _is_timeout(e):
+            guard.record_timeout()
+            return False
         return True
+    if guard is not None and verdict.model == rvw.backend.primary_model:
+        # Only a single primary-model call is a speed sample: an escalation spans two models (and a swap).
+        # prompt_tokens cover the system prompt as well as the package content, so the chars must too.
+        guard.record_success(getattr(rvw.backend, "last_usage", None), time.monotonic() - t0,
+                             len(reviewer.SYSTEM_PROMPT) + len(text))
     _record(cfg, conn, rid, verdict, score)
     return True
 
 
-def _review_escalated(cfg, conn, rvw, d, tr, rid, *, offline=False):
-    """Triage flagged this release. Get an LLM verdict; if the reviewer can't give one now, park the
-    release in the LLM-review queue (with a heuristic alert, so the signal isn't dropped)."""
-    if rvw is None:                                   # reviewer disabled / no API key -> heuristic
+def _review_escalated(cfg, conn, rvw, d, tr, rid, *, offline=False, guard=None):
+    if rvw is None:
         notifier.emit(cfg, conn, Verdict(d.package, d.version, "suspicious-heuristic",
                                          tr.score, tr.fired_rules, False), rid)
         store.update_stage(conn, rid, "alerted", tr.score, None)
         return
     try:
-        text = rvw.prepare(d, tr)
+        text = rvw.prepare(d, tr, cap=guard.input_cap_chars() if guard is not None else None)
     except reviewer.InputTooLarge as e:
-        store.park_for_review(conn, rid, "too_large", str(e), e.text)
+        detail = f"{e}; {guard.cap_explain()}" if guard is not None else str(e)
+        store.park_for_review(conn, rid, "too_large", detail, e.text)
     else:
         if offline:
             store.park_for_review(conn, rid, "endpoint_unreachable", "reviewer endpoint unreachable", text)
         else:
-            _attempt_review(cfg, conn, rvw, rid, d.package, d.version, tr.score, tr.fired_rules, text)
+            _attempt_review(cfg, conn, rvw, rid, d.package, d.version, tr.score, tr.fired_rules, text, guard)
     if store.get_stage(conn, d.package, d.version) == "pending_review":
         # Not reviewed yet: alert on the heuristic now rather than wait for the queue to drain.
         notifier.emit(cfg, conn, Verdict(d.package, d.version, "suspicious-heuristic",
                                          tr.score, tr.fired_rules, False), rid)
 
 
-def drain_pending(cfg, conn, rvw, *, auto: bool, reasons=None, limit=None) -> int:
-    """Review parked releases. auto (each tick): unreachable-endpoint parks, and failed reviews with
-    attempts left. Manual (`review-pending`): by default oversized releases and exhausted retries — run
-    it with a larger-context model config. Oversized inputs are skipped while they still exceed this
-    config's max_input_chars. `limit` caps attempts, not successes, so a run of timeouts can't stretch
-    a tick without bound. Returns the number reviewed."""
+def drain_pending(cfg, conn, rvw, *, auto: bool, reasons=None, limit=None, guard=None) -> int:
+    """Review parked releases. auto (each tick): model_busy first, then unreachable-endpoint parks, failed
+    reviews with attempts left, and too_large rows that now fit. Manual (`review-pending`): by default oversized
+    releases and exhausted retries — run it with a larger-context model config. Inputs over this endpoint's cap are skipped
+    (auto: re-parked as too_large). `limit` caps attempts, not successes. Returns the number reviewed."""
     if auto:
-        reasons = ("endpoint_unreachable", "review_failed")
+        reasons = ("model_busy", "endpoint_unreachable", "review_failed")
     elif not reasons:
         reasons = ("too_large", "review_failed")
+    cap = guard.input_cap_chars() if guard is not None else cfg.reviewer.max_input_chars
+    rows = store.pending_reviews(conn, reasons)
+    if auto:      # oversized for an earlier cap (cold start, a smaller max_input_chars) but fits this one
+        rows += store.pending_reviews(conn, ("too_large",), max_chars=cap)
+    rows = sorted(rows,
+                  key=lambda r: (r["pending_reason"] != "model_busy", r["release_id"]))
     done = tried = 0
-    for row in store.pending_reviews(conn, reasons):
+    for row in rows:
         if limit is not None and tried >= limit:
             break
         if auto and row["pending_reason"] == "review_failed" and \
                 row["review_attempts"] >= cfg.reviewer.max_review_attempts:
             continue
         text = store.review_input(row)
-        if len(text) > cfg.reviewer.max_input_chars:
-            continue
         rid = row["release_id"]
+        if len(text) > cap:
+            if auto:
+                explain = guard.cap_explain() if guard is not None else f"cap {cap}"
+                store.park_for_review(conn, rid, "too_large", f"needs {len(text)} chars; {explain}", text)
+            continue
         tried += 1
         if not _attempt_review(cfg, conn, rvw, rid, row["package"], row["version"], row["triage_score"],
-                               _rules_from_json(row["triage_rules"]), reviewer.refresh_marker(text)):
+                               _rules_from_json(row["triage_rules"]), reviewer.refresh_marker(text), guard):
             break
         if store.get_stage(conn, row["package"], row["version"]) != "pending_review":
             done += 1
     return done
+
 
 
 def _fetch_one(cfg, rel):
@@ -130,7 +176,7 @@ def _fetch_one(cfg, rel):
         return e
 
 
-def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False) -> bool:
+def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=None) -> bool:
     """Main-thread half: record the release, map a completed fetch `result` (ArtifactSet | None |
     Exception) to a stage, diff/triage/review, emit alerts. ALL sqlite + notifier work happens here.
     Returns True iff the release reached a terminal stage."""
@@ -170,7 +216,7 @@ def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False) -> boo
         if ev:
             store.update_evidence(conn, rid, ev)
         if tr.escalate:
-            _review_escalated(cfg, conn, rvw, d, tr, rid, offline=offline)
+            _review_escalated(cfg, conn, rvw, d, tr, rid, offline=offline, guard=guard)
         return True   # terminal: an unfinished LLM review is parked in the pending-review queue
     except Exception:
         logger.exception("processing failed for %s==%s; will retry next tick", rel.package, rel.version)
@@ -237,6 +283,7 @@ def run_once(cfg: Config, *, seed_if_fresh: bool = True) -> int:
         rvw = _build_reviewer(cfg)
         ruleset = _load_ruleset(cfg)
         offline = False
+        guard = None
         if rvw is not None:
             reachable, label = _probe_reviewer(cfg)
             offline = reachable is False
@@ -248,7 +295,9 @@ def run_once(cfg: Config, *, seed_if_fresh: bool = True) -> int:
                 print(msg, flush=True)
                 logger.warning(msg)
             else:
-                drain_pending(cfg, conn, rvw, auto=True, limit=cfg.reviewer.max_pending_per_tick)
+                guard = guard_mod.ReviewerGuard(cfg, rvw.backend, conn)
+                guard.begin_batch()
+                drain_pending(cfg, conn, rvw, auto=True, limit=cfg.reviewer.max_pending_per_tick, guard=guard)
         releases = ingest.changes_since(cfg, last)[:cfg.max_releases_per_run]
         prepared = [(rel, store.get_stage(conn, rel.package, rel.version)) for rel in releases]
 
@@ -267,7 +316,7 @@ def run_once(cfg: Config, *, seed_if_fresh: bool = True) -> int:
                     if stg in TERMINAL:
                         terminal = True                      # already-terminal: nothing to fetch
                     else:
-                        terminal = _process_fetched(cfg, conn, rvw, ruleset, rel, futs[i].result(), offline)
+                        terminal = _process_fetched(cfg, conn, rvw, ruleset, rel, futs[i].result(), offline, guard)
                     if terminal and not blocked:
                         advance_to = rel.serial
                     else:
@@ -290,7 +339,9 @@ def review_pending(cfg: Config, reasons=None, limit=None):
         rvw = _build_reviewer(cfg)
         if rvw is None:
             return 0, store.pending_review_counts(conn)
-        n = drain_pending(cfg, conn, rvw, auto=False, reasons=reasons, limit=limit)
+        gd = guard_mod.ReviewerGuard(cfg, rvw.backend, conn)
+        gd.begin_batch()
+        n = drain_pending(cfg, conn, rvw, auto=False, reasons=reasons, limit=limit, guard=gd)
         return n, store.pending_review_counts(conn)
     finally:
         conn.close()
@@ -432,6 +483,18 @@ def _poll_age(updated_at):
     return dashboard.humanize_age(secs), secs > 900  # stale after 15 min idle
 
 
+def guard_status(cfg: Config):
+    """The reviewer guard's view of the endpoint (breaker, measured speed, input cap) from stored stats;
+    sends nothing to the endpoint. None when the reviewer is disabled."""
+    if not cfg.reviewer_enabled:
+        return None
+    conn = store.connect(cfg); store.init_schema(conn)
+    try:
+        return guard_mod.ReviewerGuard(cfg, None, conn).status()
+    finally:
+        conn.close()
+
+
 def export_dashboard(cfg: Config, out_path=None, generated_at: str = ""):
     from pathlib import Path
     out = Path(out_path) if out_path else cfg.db_path.parent / "dashboard.html"
@@ -451,6 +514,7 @@ def export_dashboard(cfg: Config, out_path=None, generated_at: str = ""):
         "releases_total": releases_total, "verdicts_total": len(rows),
         "flagged_total": sum(1 for r in rows if (r.get("classification") or "").lower() in _FLAGGED),
         "reviewer": reviewer_label, "model_reachable": reachable, "pending_review": pending_review,
+        "guard": guard_status(cfg),
     }
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(dashboard.render_dashboard(rows, status=status, generated_at=generated_at))

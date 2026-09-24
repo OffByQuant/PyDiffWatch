@@ -43,7 +43,7 @@ def main():
                          help="review releases queued for LLM review (by default: too_large and exhausted "
                               "retries) — e.g. with -c pointing at a larger-context model")
     rpp.add_argument("--reason", action="append",
-                     choices=["too_large", "review_failed", "endpoint_unreachable"],
+                     choices=["too_large", "review_failed", "endpoint_unreachable", "model_busy"],
                      help="only this queue reason (repeatable)")
     rpp.add_argument("--limit", type=int, default=None, help="review at most N releases")
     adjp = sub.add_parser("adjudicate", help="record your verdict on a queued suspicious release")
@@ -99,6 +99,11 @@ def main():
         left = ", ".join(f"{k}: {v}" for k, v in sorted(remaining.items())) or "none"
         print(f"[pydiffwatch] reviewed {n} queued release(s); still queued: {left}")
     elif args.cmd == "pending":
+        from .guard import describe
+        from .orchestrator import guard_status
+        gs = guard_status(cfg)
+        if gs:
+            print(f"[pydiffwatch] reviewer: {describe(gs)}")
         queued = pending_review_counts(cfg)
         if queued:
             print(f"[pydiffwatch] {sum(queued.values())} release(s) queued for LLM review ("

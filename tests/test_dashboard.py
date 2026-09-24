@@ -96,3 +96,11 @@ def test_render_shows_pending_llm_review_by_reason():
     html = dashboard.render_dashboard([], status=status)
     assert "7 pending LLM review" in html
     assert "too_large: 2" in html and "endpoint_unreachable: 5" in html
+
+
+def test_render_shows_reviewer_guard_state():
+    html = dashboard.render_dashboard([], status={"guard": {
+        "state": "open", "detail": "breaker open after timeout", "tok_s": 85.0, "cap_chars": 52020,
+        "host_memory": "swap 83% used"}})
+    assert "reviews paused (timeout)" in html and "85 tok/s" in html and "52,020" in html
+    assert "swap 83% used" in html
