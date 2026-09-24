@@ -230,7 +230,7 @@ PKG-INFO has none.
 **Execution context.** A `--- execution context (from pyproject/setup.cfg/setup.py/entry_points.txt/.pth;
 how this version's files run) ---` block, built by `pydiffwatch/execctx.py` from this release's own
 pyproject.toml, setup.cfg, setup.py, entry_points.txt and `.pth` files — never imported or executed, always
-best-effort. Five lines:
+best-effort. Six lines:
 
 ```
 build (runs when pip builds or installs from this sdist): backend=...; backend-path=...; setup.py=...; cmdclass=...; setup_requires=...
@@ -238,13 +238,16 @@ startup (.pth files; an `import` line runs at every interpreter start if the fil
 import (runs when a program imports the package): packages=...; py-modules=...; top_level.txt=...
 commands (console_scripts/gui_scripts; run only when the user types them): ...
 plugins (entry points loaded automatically by another tool, e.g. pytest11 runs on every pytest run): ...
+other: files under tests/ docs/ examples/ are not imported by the package unless listed above
 ```
 
 The import line is best-effort and may be incomplete: a build backend can discover or generate modules it
-doesn't list, so a module missing from it is not evidence that the module isn't shipped. A file that fails
-to parse never raises and is never silently dropped: its name is added to an `unparseable: a, b, …` line,
-and every field it would have declared reads `unknown (<file> unparseable)` instead of a bare "none" (while
-setup.py exists at all, "none" means "none declared *literally* in setup.py" — setup.py is arbitrary code).
+doesn't list, so a module missing from it is not evidence that the module isn't shipped. A build file
+(`setup.py`, `pyproject.toml`, `setup.cfg`) recorded as too large to scan gets its own `<file>: unknown (too
+large to scan)` line instead of being folded into the other lines' fields. A file that fails to parse never
+raises and is never silently dropped: its name is added to an `unparseable: a, b, …` line, and every field
+it would have declared reads `unknown (<file> unparseable)` instead of a bare "none" (while setup.py exists
+at all, "none" means "none declared *literally* in setup.py" — setup.py is arbitrary code).
 
 **Signals.** A `--- dependency / binary / ownership signals (PyPI metadata and the sdist's file list;
 context, not code) ---` block lists Requires-Dist changes and each dependency finding (typosquat /
@@ -254,9 +257,11 @@ longer dumps every changed file, only the build files and any code lines that na
 
 **Hunks.** Each selected file's diff follows, one `@@ new L<start>-<end>` line per hunk giving the new-file
 line range its added/removed lines occupy — the same `file:line-range` shape the model is asked to answer
-in `cited_hunk`. A modified `setup.py` or `__init__.py` under about 4,000 rendered characters is shown whole
-instead (`@@ whole file, new L1-<n>`), so the model has full context for build- and import-time files
-without hunting across hunks.
+in `cited_hunk`. A hunk that only removes lines has no new-file range to give instead: `@@ new (none;
+removed after L<n>)`, or `@@ new (none; removed before L1)` when the removal is at the very start of the
+file. A modified `setup.py` or `__init__.py` under about 4,000 rendered characters is shown whole instead
+(`@@ whole file, new L1-<n> (unchanged lines start with two spaces)`), so the model has full context for
+build- and import-time files without hunting across hunks.
 
 **Truncation and selection notes.** At most one trailing note: `[TRUNCATED: lowest-risk hunks omitted to
 fit the input cap.]` when the input cap dropped a file; `[SELECTED: only the 40 highest-risk files are
