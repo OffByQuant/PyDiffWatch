@@ -220,3 +220,23 @@ def test_pth_deep_import_line_does_not_crash():
     d = _codediff("evil.pth", [f"import os;os.system('id' + str({pad}))"])
     f = build_facts(d).files[0]   # must not raise (RecursionError guarded)
     assert "process" in f.autoexec_categories
+
+
+def test_pth_bom_prefixed_import_line_yields_process_autoexec():
+    from pydiffwatch.models import Diff, FileDiff, Hunk
+    added = ["import os;os.system('id')"]
+    new_text = "﻿" + "\n".join(added)
+    d = Diff("p", "1.1", False, [FileDiff("evil.pth", "added",
+        [Hunk((0, 0), (0, 1), added, [])], new_text)], [])
+    f = build_facts(d).files[0]
+    assert "process" in f.autoexec_categories
+
+
+def test_pth_invalid_utf8_later_on_import_line_does_not_crash():
+    from pydiffwatch.models import Diff, FileDiff, Hunk
+    new_text = "import os;os.system('id�')"   # replacement char, as errors=\"replace\" decode would yield
+    added = [new_text]
+    d = Diff("p", "1.1", False, [FileDiff("evil.pth", "added",
+        [Hunk((0, 0), (0, 1), added, [])], new_text)], [])
+    f = build_facts(d).files[0]   # must not raise
+    assert "process" in f.autoexec_categories

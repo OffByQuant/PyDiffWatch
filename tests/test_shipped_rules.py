@@ -103,6 +103,17 @@ def test_pth_import_line_fires_autoexec_location():
     assert any(fr.rule == "autoexec-location" for fr in r.fired_rules)
 
 
+def test_pth_bom_prefixed_import_line_fires_autoexec_location():
+    # site.addpackage decodes .pth as utf-8-sig (strips a leading BOM); the scanner must too, or a
+    # BOM-prefixed import line evades detection (fails startswith("import ")).
+    added = ["import os;os.system('id')"]
+    new_text = "﻿" + "\n".join(added)
+    d = Diff("p", "1.1", False, [FileDiff("evil.pth", "added",
+        [Hunk((0, 0), (0, 1), added, [])], new_text)], [])
+    r = triage(d, Config(), RULES)
+    assert any(fr.rule == "autoexec-location" for fr in r.fired_rules)
+
+
 def test_deep_pad_does_not_mask_a_real_decode_exec_loader():
     # CRITICAL fix: previously the depth guard short-circuited extraction entirely, so padding a real
     # decode->exec loader with a deep expression dropped combo-decode-exec and the release stopped

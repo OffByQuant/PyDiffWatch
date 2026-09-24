@@ -197,10 +197,15 @@ def _pth_facts(fd, lines, loc, added_lines, added_strs) -> FileFacts:
     space or tab; every other line is a path and never runs. Parse each such line ON ITS OWN (never the
     whole file as Python) and feed it through the same call-resolution machinery as a .py file, so
     autoexec_categories/bound_categories/combos see it. A parse failure or excessive depth on one line
-    is caught and skipped (never crashes), same guards as _file_facts."""
+    is caught and skipped (never crashes), same guards as _file_facts.
+
+    site.addpackage decodes .pth bytes as "utf-8-sig", which strips a leading BOM; the shared differ
+    decoder does not, so a BOM survives into new_text as a leading U+FEFF on line 1. Strip it here (only
+    for .pth line selection) so a BOM-prefixed `import` line is still recognized, matching site."""
     cats, autoexec_cats, names, modules = set(), set(), set(), set()
     had_error = False
-    for i, raw in enumerate(fd.new_text.splitlines(), start=1):
+    text = fd.new_text[1:] if fd.new_text.startswith("﻿") else fd.new_text
+    for i, raw in enumerate(text.splitlines(), start=1):
         if i not in added_lines:
             continue
         line = raw.rstrip()
