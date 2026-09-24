@@ -54,7 +54,10 @@ class Config:
     dep_brandnew_days: int = 30
     max_dep_lookups: int = 10
     max_decompressed_bytes: int = 120 * 1024 * 1024
-    fetch_timeout_s: float = 30.0
+    fetch_timeout_s: float = 30.0          # per socket read (and XML-RPC call)
+    fetch_deadline_s: float = 120.0        # per download, total
+    packument_deadline_s: float = 300.0    # PyPI JSON metadata, total (big projects list every release)
+    max_metadata_bytes: int = 64_000_000   # PyPI JSON metadata size cap
     max_releases_per_run: int = 2000
     fetch_concurrency: int = 4
     new_package_policy: str = "surface"   # "surface" | "skip" | "full"

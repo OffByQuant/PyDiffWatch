@@ -1,4 +1,4 @@
-import io, gzip, tarfile, hashlib, json, urllib.request, urllib.error, posixpath
+import io, gzip, tarfile, hashlib, json, time, urllib.request, urllib.error, posixpath
 from datetime import datetime, timezone
 from .config import Config
 from .models import NewRelease, ArtifactSet
@@ -80,15 +80,31 @@ def extract_sdist(blob: bytes, cfg: Config):
                 foreign += 1
     return files, binaries
 
+def read_body(r, cfg: Config, limit: int | None = None, deadline: float | None = None) -> bytes:
+    """A response body within a total deadline (seconds; default fetch_deadline_s) and an optional size cap.
+    urlopen's timeout bounds each socket read only, so a connection that trickles bytes would otherwise
+    hold a scan tick forever."""
+    budget = deadline or cfg.fetch_deadline_s
+    end = time.monotonic() + budget
+    buf = bytearray()                             # amortized O(1) append; bytes += is O(n^2)
+    while chunk := r.read1(65536):
+        buf += chunk
+        if limit is not None and len(buf) > limit:
+            raise RefusedToFetch("download-size")
+        if time.monotonic() > end:
+            raise TimeoutError(f"download took longer than {budget:.0f}s")
+    return bytes(buf)
+
+
+def _read_json(r, cfg: Config):
+    return json.loads(read_body(r, cfg, cfg.max_metadata_bytes, cfg.packument_deadline_s))
+
+
 def _download(url: str, cfg: Config) -> bytes:
     egress.assert_web_scheme(url)   # url is from PyPI's JSON — reject file:// before urllib reads a local path
     req = urllib.request.Request(url, headers={"User-Agent": "diffwatch/0.1"})
     with urllib.request.urlopen(req, timeout=cfg.fetch_timeout_s) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
-        buf = bytearray()                             # amortized O(1) append; bytes += is O(n^2)
-        while chunk := r.read(65536):
-            buf += chunk
-            if len(buf) > cfg.max_download_bytes: raise RefusedToFetch("download-size")
-        return bytes(buf)
+        return read_body(r, cfg, cfg.max_download_bytes)
 
 # Files PyPI runs at install or import time — where supply-chain malware must live to execute.
 # Mirrors triage.classify_location's 3x-weighted set; a genuinely new package is scanned ONLY here.
@@ -101,7 +117,7 @@ def _package_json(package: str, cfg: Config) -> dict:
     url = f"{cfg.pypi_base}/pypi/{package}/json"
     egress.assert_web_scheme(url)
     with urllib.request.urlopen(url, timeout=cfg.fetch_timeout_s) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
-        return json.load(r)
+        return _read_json(r, cfg)
 
 def _sdist(files) -> dict | None:
     return next((f for f in (files or []) if f.get("packagetype") == "sdist"), None)
@@ -119,7 +135,7 @@ def _requires_dist(package: str, version: str, cfg: Config) -> list:
         url = f"{cfg.pypi_base}/pypi/{package}/{version}/json"
         egress.assert_web_scheme(url)
         with urllib.request.urlopen(url, timeout=cfg.fetch_timeout_s) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
-            return (json.load(r).get("info") or {}).get("requires_dist") or []
+            return (_read_json(r, cfg).get("info") or {}).get("requires_dist") or []
     except Exception:
         return []   # can't resolve predecessor deps -> screen nothing rather than false-flag
 
@@ -129,7 +145,7 @@ def _dep_json(name: str, cfg: Config):
         url = f"{cfg.pypi_base}/pypi/{name}/json"
         egress.assert_web_scheme(url)
         with urllib.request.urlopen(url, timeout=cfg.fetch_timeout_s) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
-            return json.load(r)
+            return _read_json(r, cfg)
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None

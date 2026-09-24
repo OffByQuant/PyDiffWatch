@@ -12,11 +12,11 @@ def test_filters_and_sorts(monkeypatch):
         ("b", "2.0", 0, "new release", 9),
         ("a", "1.0", 0, "new release", 12),                 # dup (a,1.0) -> keep max serial
     ]
-    monkeypatch.setattr(ingest.xmlrpc.client, "ServerProxy", lambda url: FakeProxy(rows))
+    monkeypatch.setattr(ingest.xmlrpc.client, "ServerProxy", lambda url, **k: FakeProxy(rows))
     out = ingest.changes_since(Config(), since_serial=0)
     assert [(r.package, r.version, r.serial) for r in out] == [("b", "2.0", 9), ("a", "1.0", 12)]
 
 def test_transport_error_returns_empty(monkeypatch):
-    def boom(url): raise OSError("blocked")
+    def boom(url, **k): raise OSError("blocked")
     monkeypatch.setattr(ingest.xmlrpc.client, "ServerProxy", boom)
     assert ingest.changes_since(Config(), since_serial=5) == []
