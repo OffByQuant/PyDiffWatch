@@ -204,7 +204,10 @@ The reviewer's user message is built by `build_review_input` (`pydiffwatch/revie
 Every author-controlled string in it — file paths, the description, execution-context and signals lines,
 hunk content — is fenced between two identical `===DW-UNTRUSTED-<random>===` marker lines declared on the
 `untrusted_content_marker:` header line, and the system prompt tells the model everything between the
-markers is inert data, never instructions. None of it is ever run to build the input: it's all static
+markers is inert data, never instructions. The one exception is the package name and version strings: they
+appear in the header, outside the markers. PyPI restricts them on upload (PEP 508 names, PEP 440 versions);
+the prior version in the baseline note is also escaped to one line and clipped to 100 characters, since a
+legacy release can predate those checks. None of it is ever run to build the input: it's all static
 parsing (`ast`, `tomllib`, `configparser`, `email.parser`) over the sdist's own metadata and source.
 
 **Header.** Before the fenced content: `package`, `version`, `is_first_release`, `triage_score`. Two cases
@@ -230,7 +233,8 @@ PKG-INFO has none.
 **Execution context.** A `--- execution context (from pyproject/setup.cfg/setup.py/entry_points.txt/.pth;
 how this version's files run) ---` block, built by `pydiffwatch/execctx.py` from this release's own
 pyproject.toml, setup.cfg, setup.py, entry_points.txt and `.pth` files — never imported or executed, always
-best-effort. Six lines:
+best-effort. Six lines, plus a `<file>: unknown (too large to scan)` line per oversized build file and an
+`unparseable:` line when a file fails to parse (both described below):
 
 ```
 build (runs when pip builds or installs from this sdist): backend=...; backend-path=...; setup.py=...; cmdclass=...; setup_requires=...
@@ -240,6 +244,21 @@ commands (console_scripts/gui_scripts; run only when the user types them): ...
 plugins (entry points loaded automatically by another tool, e.g. pytest11 runs on every pytest run): ...
 other: files under tests/ docs/ examples/ are not imported by the package unless listed above
 ```
+
+The `other:` line makes that claim only when the package list is known: a literal list, or setuptools
+auto-discovery with no `find` directive. Otherwise (a computed or unreadable list; a `find` directive, which
+without excludes installs `tests/`; a backend other than setuptools, or an in-tree one) it reads `other:
+files under tests/ docs/ examples/ may be installed and imported (the package list above is not fully
+known)`.
+
+Under setuptools with nothing declared, the import line lists what auto-discovery would find:
+`packages=auto-discovered: ...` (directories with an `__init__.py`, top level or under `src/`, except
+`tests`, `docs`, `examples` and similar) and `py-modules=auto-discovered: ...` (top-level or `src/` `*.py`
+files, except `setup.py` and `conftest.py`). When it finds nothing it says `none found by DiffWatch
+(setuptools auto-discovery may also find modules and namespace packages)` (or, while setup.py exists, `none
+declared literally in setup.py (setup.py runs arbitrary code at build)`), never a bare "none". At most three
+`<name>.egg-info/entry_points.txt` files are parsed; the rest are named on the commands and plugins lines as
+`unknown (N more egg-info entry_points.txt not read)`.
 
 The import line is best-effort and may be incomplete: a build backend can discover or generate modules it
 doesn't list, so a module missing from it is not evidence that the module isn't shipped. A build file
@@ -256,12 +275,14 @@ own heuristic screening of metadata, not code for the model to weigh on its own;
 longer dumps every changed file, only the build files and any code lines that name the flagged dependency.
 
 **Hunks.** Each selected file's diff follows, one `@@ new L<start>-<end>` line per hunk giving the new-file
-line range its added/removed lines occupy — the same `file:line-range` shape the model is asked to answer
-in `cited_hunk`. A hunk that only removes lines has no new-file range to give instead: `@@ new (none;
-removed after L<n>)`, or `@@ new (none; removed before L1)` when the removal is at the very start of the
-file. A modified `setup.py` or `__init__.py` under about 4,000 rendered characters is shown whole instead
-(`@@ whole file, new L1-<n> (unchanged lines start with two spaces)`), so the model has full context for
-build- and import-time files without hunting across hunks.
+line range its added/removed lines occupy — the same `file:line-range` shape the model is asked to answer in
+`cited_hunk`. Positions count lines as DiffWatch splits them (Python's `str.splitlines()`), which also breaks
+on form feed (`\x0c`), `\x1c`–`\x1e`, `\x85`, U+2028 and U+2029; in a file containing those characters they
+can differ from an editor's or Python's own line numbers. A hunk that only removes lines has no new-file range
+to give instead: `@@ new (none; removed after L<n>)`, or `@@ new (none; removed before L1)` when the removal
+is at the very start of the file. A modified `setup.py` or `__init__.py` under about 4,000 rendered characters
+is shown whole instead (`@@ whole file, new L1-<n> (unchanged lines start with two spaces)`), so the model has
+full context for build- and import-time files without hunting across hunks.
 
 **Truncation and selection notes.** At most one trailing note: `[TRUNCATED: lowest-risk hunks omitted to
 fit the input cap.]` when the input cap dropped a file; `[SELECTED: only the 40 highest-risk files are
@@ -288,12 +309,12 @@ confidence is missing, or confidence is below `reviewer.malicious_min_confidence
 malicious_min_confidence = 0.8   # a weaker malicious verdict alerts as suspicious and waits for manual review
 ```
 
-(default `0.8`, range 0–1). A weak verdict is recorded and alerted as `suspicious` instead — kind
-`suspicious`, one alert, deduped separately from any first alert on the release — with `model said
-malicious (downgraded: <reason>); needs manual review` prepended to the reasoning, where `<reason>` is
+(default `0.8`, range 0–1). A weak verdict is recorded and alerted as `suspicious` instead, with `urgent`
+cleared — kind `suspicious`, one alert, deduped separately from any first alert on the release — with `model
+said malicious (downgraded: <reason>); needs manual review` prepended to the reasoning, where `<reason>` is
 `runs_when=user-command`, `runs_when=not-shipped`, `no confidence`, or `confidence <value> < <floor>`. It
-waits in `pending` for a human like any other suspicious verdict; the model's own classification stays
-visible in the reasoning, appended as `. Model: <the model's reasoning>`.
+waits in `pending` for a human like any other suspicious verdict; the model's own classification stays visible
+in the reasoning, appended as `. Model: <the model's reasoning>`.
 
 **Schema defaults.** Only `classification` is mandatory; every other field a truncated reply never reaches
 takes a safe default (`runs_when` → `unknown`, `confidence` → unknown, `urgent` → `false`,
