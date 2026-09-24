@@ -2,7 +2,7 @@
 
 tomllib / configparser / ast / email.parser only: nothing is imported or executed. One parser helper for every
 author-written structured file (npm #25 parity): it accepts a BOM, maps a non-mapping to {}, and never raises;
-a file that does not parse renders as `<file>: unparseable`."""
+files that do not parse are named on one capped line, `unparseable: a, b, … (+N more)`."""
 import pytest
 
 from pydiffwatch import execctx
@@ -107,7 +107,7 @@ def test_only_top_level_metadata_is_read():
     assert "backend=setuptools.build_meta:__legacy__ [default]" in ctx and "setup.py=absent" in ctx
 
 
-# ---- never raise: malformed input renders as `<file>: unparseable` ----
+# ---- never raise: malformed input is named on the `unparseable:` line ----
 
 _DEEP_TOML = b"a = " + b"[" * 10_000 + b"]" * 10_000 + b"\n"
 _DEEP_INI = b"[options]\npackages = " + b"[" * 10_000 + b"\n"
@@ -127,17 +127,17 @@ _DEEP_INI = b"[options]\npackages = " + b"[" * 10_000 + b"\n"
 ])
 def test_malformed_input_is_unparseable_never_an_exception(name, data):
     ctx = execctx.build({name: data})
-    assert f"{name}: unparseable" in ctx.split("\n")
+    assert f"unparseable: {name}" in ctx.split("\n")
 
 
 def test_deep_but_valid_ini_is_just_text():
-    assert "setup.cfg: unparseable" not in execctx.build({"setup.cfg": _DEEP_INI})
+    assert "unparseable" not in execctx.build({"setup.cfg": _DEEP_INI})
 
 
 def test_deeply_nested_setup_literals_are_computed_not_a_crash():
     nested = b"setup(packages=" + b"[" * 150 + b"'a'" + b"]" * 150 + b")\n"
     ctx = execctx.build({"setup.py": nested})
-    assert "setup.py: unparseable" not in ctx and "packages=<computed>" in ctx
+    assert "unparseable" not in ctx and "packages=<computed>" in ctx
 
 
 # ---- the one parser helper (npm #25 parity): BOM, broken, non-mapping, wrong-typed ----
@@ -195,6 +195,100 @@ def test_wrong_typed_fields_never_raise(files):
     assert ctx.startswith("build ")
 
 
-def test_scripts_of_the_wrong_type_render_as_none():
+def test_scripts_of_the_wrong_type_are_not_reported_as_none():
     ctx = execctx.build({"pyproject.toml": b"[project]\nscripts = 5\n"})
-    assert "commands (console_scripts/gui_scripts; run only when the user types them): none" in ctx.split("\n")
+    assert "commands (console_scripts/gui_scripts; run only when the user types them): <computed>" in ctx.split("\n")
+
+
+# ---- fix round 1: unknown is never rendered as "none" ----
+
+def _line(ctx, prefix):
+    return next(ln for ln in ctx.split("\n") if ln.startswith(prefix))
+
+
+def test_many_unparseable_files_fold_into_one_capped_line():
+    files = {f"e{i:04d}.egg-info/entry_points.txt": b"no section\n" for i in range(1990)}
+    ctx = execctx.build(files)
+    bad = [ln for ln in ctx.split("\n") if "unparseable" in ln]
+    assert len(bad) == 1 and bad[0].startswith("unparseable: e0000.egg-info/entry_points.txt, ")
+    assert "(+1970 more)" in bad[0] and len(ctx) < 10_000
+
+
+def test_an_ini_string_entry_points_in_setup_py_is_parsed():
+    ctx = execctx.build({"setup.py": b"from setuptools import setup\nsetup(name='a', entry_points='''"
+                                     b"[console_scripts]\\nfoo = a.cli:main\\n[pytest11]\\nx = a.plug''')\n"})
+    assert "foo -> a.cli:main" in _line(ctx, "commands") and "pytest11: x -> a.plug" in _line(ctx, "plugins")
+
+
+def test_an_unparseable_ini_string_entry_points_is_computed():
+    ctx = execctx.build({"setup.py": b"setup(entry_points='console_scripts\\nfoo = a:b')\n"})
+    assert "<computed>" in _line(ctx, "commands") and "<computed>" in _line(ctx, "plugins")
+
+
+def test_a_computed_group_value_is_computed_not_none():
+    ctx = execctx.build({"setup.py": b"setup(entry_points={'console_scripts': get_scripts(), 'pytest11': X})\n"})
+    assert _line(ctx, "commands").endswith(": <computed>")
+    assert "pytest11: <computed>" in _line(ctx, "plugins")
+
+
+def test_a_computed_item_in_a_group_list_is_computed():
+    ctx = execctx.build({"setup.py": b"setup(entry_points={'console_scripts': ['foo=a:main', NAME + '=a:b']})\n"})
+    assert "foo -> a:main" in _line(ctx, "commands") and "<computed>" in _line(ctx, "commands")
+
+
+def test_a_decoy_setup_call_makes_every_keyword_computed():
+    ctx = execctx.build({"setup.py": b"if False:\n    setup(name='x')\ndef main():\n"
+                                     b"    setuptools.setup(cmdclass={'install': Evil})\nmain()\n"})
+    assert "cmdclass=<computed>" in ctx and "packages=<computed>" in ctx
+    assert "<computed>" in _line(ctx, "commands") and "<computed>" in _line(ctx, "plugins")
+
+
+def test_an_aliased_setup_makes_every_keyword_computed():
+    ctx = execctx.build({"setup.py": b"from setuptools import setup as s\ns(cmdclass={'install': Evil})\n"})
+    assert "cmdclass=<computed>" in ctx and "setup_requires=<computed>" in ctx
+    assert "<computed>" in _line(ctx, "commands")
+
+
+def test_a_setup_py_without_a_setup_call_is_computed():
+    ctx = execctx.build({"setup.py": b"from mylib import build\nbuild()\n"})
+    assert "cmdclass=<computed>" in ctx and "<computed>" in _line(ctx, "commands")
+
+
+def test_a_single_plain_setup_call_is_still_read_literally():
+    ctx = execctx.build({"setup.py": b"import setuptools\nsetuptools.setup(cmdclass={'build_py': B})\n"})
+    assert "cmdclass=build_py" in ctx and "setup_requires=none" in ctx
+
+
+def test_missing_top_level_txt_is_not_claimed_absent():
+    ctx = execctx.build(_files())
+    assert "top_level.txt=not found in scanned files" in ctx and "absent" not in _line(ctx, "import")
+
+
+def test_an_in_tree_backend_named_like_setuptools_is_not_setuptools():
+    ctx = execctx.build({"pyproject.toml": b"[build-system]\nrequires=[]\nbuild-backend='setuptools_evil'\n"
+                                           b"backend-path=['.']\n", "setup.py": b"setup()\n"})
+    assert "setup.py=present: not run by setuptools_evil unless the backend calls it" in ctx
+    for legacy in (b"setuptools.build_meta", b"setuptools.build_meta:__legacy__"):
+        ctx = execctx.build({"pyproject.toml": b"[build-system]\nbuild-backend='" + legacy + b"'\n",
+                             "setup.py": b"setup()\n"})
+        assert "setup.py=present: its top level runs at build" in ctx
+
+
+@pytest.mark.parametrize("pp", [b"[build-system\nbuild-backend='flit_core.buildapi'", b"build-system = 5\n",
+                                b"[build-system]\nbuild-backend = 5\n"])
+def test_a_broken_or_wrong_typed_pyproject_has_an_unknown_backend(pp):
+    ctx = execctx.build({"pyproject.toml": pp, "setup.py": b"setup()\n"})
+    assert "backend=unknown" in ctx and "[default]" not in ctx
+    assert "its top level runs at build" not in ctx
+
+
+def test_a_pyproject_without_build_backend_is_the_default():
+    ctx = execctx.build({"pyproject.toml": b"[build-system]\nrequires=['setuptools']\n"})
+    assert "backend=setuptools.build_meta:__legacy__ [default]" in ctx
+
+
+def test_default_section_keys_do_not_leak_into_other_sections():
+    cfg = b"[DEFAULT]\nzz = 1\n[options.entry_points]\nconsole_scripts =\n    foo = a:main\n"
+    assert execctx.parse_mapping(cfg, "ini")["options.entry_points"] == {"console_scripts": "\nfoo = a:main"}
+    ctx = execctx.build({"setup.cfg": cfg})
+    assert "zz" not in _line(ctx, "plugins") and "foo -> a:main" in _line(ctx, "commands")

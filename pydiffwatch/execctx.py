@@ -18,10 +18,13 @@ _MAX_ITEMS = 20
 _MAX_LINE = 2_000
 _LIT_DEPTH = 4          # deeper literals in setup() are shown as "<computed>"
 COMPUTED = "<computed>"
+_SETUPTOOLS_BACKENDS = ("setuptools.build_meta", "setuptools.build_meta:__legacy__")
 
 
 def _ini(text: str, delimiters=("=", ":")) -> dict:
-    cp = configparser.ConfigParser(interpolation=None, delimiters=delimiters)
+    # default_section: no header can contain a newline, so an author's [DEFAULT] is an ordinary section and its
+    # keys never leak into every other section.
+    cp = configparser.ConfigParser(interpolation=None, delimiters=delimiters, default_section="\n")
     cp.optionxform = str                                # keep entry-point names' case
     cp.read_string(text)
     return {s: dict(cp[s]) for s in cp.sections()}
@@ -97,29 +100,43 @@ def _lit(node, depth=0):
 
 
 def _setup_kwargs(tree) -> tuple[dict, bool]:
-    """(literal keywords of the first setup() call, whether it also takes **kwargs)."""
+    """(literal keywords of the setup() call, whether any keyword it lacks may still be computed).
+
+    Only a single `setup(...)` / `x.setup(...)` call is read. None, several (a decoy under `if False:` can
+    precede the real call), or `setup` imported under another name: every keyword is unknown."""
+    calls, aliased = [], False
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             f = node.func
-            name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
-            if name == "setup":
-                return ({k.arg: _lit(k.value) for k in node.keywords if k.arg is not None},
-                        any(k.arg is None for k in node.keywords))
-    return {}, False
+            if (f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None) == "setup":
+                calls.append(node)
+        elif isinstance(node, ast.ImportFrom):
+            aliased |= any(a.name == "setup" and a.asname not in (None, "setup") for a in node.names)
+    if len(calls) != 1 or aliased:
+        return {}, True
+    return ({k.arg: _lit(k.value) for k in calls[0].keywords if k.arg is not None},
+            any(k.arg is None for k in calls[0].keywords))
 
 
 # ---- entry points ----
 
+_UNKNOWN_EP = (COMPUTED, "")      # an entry point whose name or target is not statically known
+
+
 def _ep_lines(v) -> list[tuple[str, str]]:
     """Entry points of one group, from a list of "name = target" strings, one INI-style string, or a
-    {name: target} table."""
+    {name: target} table. Anything else, or an item that is not a string, is unknown: never "none"."""
     if isinstance(v, dict):
-        return [(str(k), str(t)) for k, t in v.items() if isinstance(t, str)]
+        return [(str(k), t) if isinstance(t, str) else _UNKNOWN_EP for k, t in v.items()]
     if isinstance(v, str):
         v = v.splitlines()
+    if not isinstance(v, (list, tuple)):
+        return [_UNKNOWN_EP]
     out = []
-    for line in v if isinstance(v, (list, tuple)) else []:
-        if isinstance(line, str) and "=" in line:
+    for line in v:
+        if not isinstance(line, str) or line == COMPUTED:
+            out.append(_UNKNOWN_EP)
+        elif "=" in line:
             name, target = line.split("=", 1)
             if name.strip():
                 out.append((name.strip(), target.strip()))
@@ -127,11 +144,17 @@ def _ep_lines(v) -> list[tuple[str, str]]:
 
 
 def _add_groups(eps: dict, groups) -> None:
-    if groups == COMPUTED:
+    """Merge one source's {group: entries} into eps. None means the source has no entry points; anything
+    that is not statically a table (computed, wrong type, unparseable INI text) is unknown."""
+    if groups is None:
+        return
+    if isinstance(groups, str) and groups != COMPUTED:      # setup.py may pass the INI text itself
+        groups = parse_mapping(groups.encode("utf-8", "surrogatepass"), "entry_points")
+    if not isinstance(groups, dict):
         eps.setdefault(COMPUTED, [])
         return
     for group, v in _dict(groups).items():
-        if isinstance(group, str):
+        if isinstance(group, str) and v is not None:
             eps.setdefault(group.strip(), []).extend(_ep_lines(v))
 
 
@@ -139,12 +162,12 @@ _COMMAND_GROUPS = ("console_scripts", "gui_scripts")
 
 
 def _entry_points_lines(eps: dict) -> tuple[str, str]:
-    cmds = [f"{n} -> {t}" for g in _COMMAND_GROUPS for n, t in eps.get(g, [])]
-    plugins = [f"{g}: {n} -> {t}" for g, lst in eps.items() if g not in _COMMAND_GROUPS and g != COMPUTED
-               for n, t in lst]
+    cmds = [n if n == COMPUTED else f"{n} -> {t}" for g in _COMMAND_GROUPS for n, t in eps.get(g, [])]
+    plugins = [f"{g}: {n}" if n == COMPUTED else f"{g}: {n} -> {t}"
+               for g, lst in eps.items() if g not in _COMMAND_GROUPS and g != COMPUTED for n, t in lst]
     if COMPUTED in eps:
-        cmds.append("setup.py entry_points=<computed>")
-        plugins.append("setup.py entry_points=<computed>")
+        cmds.append(f"entry points={COMPUTED}")
+        plugins.append(f"entry points={COMPUTED}")
     return _join(cmds), _join(plugins)
 
 
@@ -213,13 +236,20 @@ def build(new_files: dict[str, bytes]) -> str:
 
     # build
     backend = bs.get("build-backend")
-    if isinstance(backend, str) and backend.strip():
-        backend, how = backend.strip(), "declared"
+    if ("pyproject.toml" in unparseable or not isinstance(pp.get("build-system", {}), dict)
+            or (backend is not None and not (isinstance(backend, str) and backend.strip()))):
+        backend, shown = None, "unknown"                    # never the default: the real one is not known
+    elif backend is not None:
+        backend = backend.strip()
+        shown = f"{_clip(backend)} [declared]"
     else:
-        backend, how = "setuptools.build_meta:__legacy__", "default"
+        backend = "setuptools.build_meta:__legacy__"
+        shown = f"{backend} [default]"
     if "setup.py" not in new_files:
         setup_py = "absent"
-    elif backend.startswith("setuptools"):
+    elif backend is None:
+        setup_py = "present: runs at build only if the backend is setuptools"
+    elif backend in _SETUPTOOLS_BACKENDS:
         setup_py = "present: its top level runs at build"
     else:
         setup_py = f"present: not run by {_clip(backend)} unless the backend calls it"
@@ -231,7 +261,7 @@ def build(new_files: dict[str, bytes]) -> str:
     sreq = kw("setup_requires")
     sreq = [COMPUTED] if sreq == COMPUTED else (_strs(sreq) or [])
     sreq += _cfg_list(options.get("setup_requires", ""))
-    build_line = (f"build (runs when pip builds or installs from this sdist): backend={_clip(backend)} [{how}]; "
+    build_line = (f"build (runs when pip builds or installs from this sdist): backend={shown}; "
                   f"backend-path={_join(_strs(bs.get('backend-path')) or [])}; setup.py={setup_py}; "
                   f"cmdclass={_join(cmdclass)}; setup_requires={_join(sreq)}")
 
@@ -260,7 +290,7 @@ def build(new_files: dict[str, bytes]) -> str:
     tops = [ln for p in _egg_info(new_files, "top_level.txt")
             for ln in new_files[p].decode("utf-8", errors="replace").split()]
     import_line = (f"import (runs when a program imports the package): packages={pkgs}; py-modules={mods}; "
-                   f"top_level.txt={_join(tops) if tops else 'absent'}")
+                   f"top_level.txt={_join(tops) if tops else 'not found in scanned files'}")
 
     # commands and plugins
     eps: dict = {}
@@ -276,6 +306,7 @@ def build(new_files: dict[str, bytes]) -> str:
              f"commands (console_scripts/gui_scripts; run only when the user types them): {cmds}",
              "plugins (entry points loaded automatically by another tool, e.g. pytest11 runs on every pytest "
              f"run): {plugins}"]
-    lines += [f"{_clip(p)}: unparseable" for p in unparseable]
+    if unparseable:                                     # one line, however many files: bounded
+        lines.append(f"unparseable: {_join(unparseable)}")
     lines.append("other: files under tests/ docs/ examples/ are not imported by the package unless listed above")
     return "\n".join(ln if len(ln) <= _MAX_LINE else ln[:_MAX_LINE] + "…" for ln in lines)
