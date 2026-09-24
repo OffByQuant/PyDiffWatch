@@ -224,6 +224,30 @@ pydiffwatch -c pydiffwatch.toml capture-evidence --release-id <id>
 pydiffwatch -c pydiffwatch.toml capture-evidence --all           # widen to every fired-rule row (more re-fetches)
 ```
 
+**The LLM-review queue.** Review never blocks the scan. When the reviewer can't handle a flagged release,
+the release is parked with a reason and the cursor moves on; the review input is stored (compressed) so a
+later review doesn't depend on PyPI still hosting the sdist.
+
+| reason | when | drained by |
+|---|---|---|
+| `endpoint_unreachable` | the model server is down (each tick prints a warning) | every tick, once it's back |
+| `review_failed` | a review timed out or failed; retried at `timeout` × attempt (300s, 600s, 900s) | every tick, up to `max_review_attempts` (3) |
+| `too_large` | the highest-risk file alone exceeds `max_input_chars` (200k chars) | `review-pending` with a larger-context model |
+
+Each tick retries at most `max_pending_per_tick` (20) queued releases before scanning. The rest wait for
+you — typically with a bigger model pointed at the same database:
+
+```bash
+pydiffwatch -c frontier.toml review-pending                     # too_large + exhausted retries
+pydiffwatch -c frontier.toml review-pending --reason too_large --limit 10
+```
+
+`frontier.toml` is any reviewer config (e.g. `examples/anthropic.toml`) with the same `db_path` and a
+larger `max_input_chars`. `pending` shows the queue counts; the dashboard shows them in its status
+strip. A release with **no** reviewable text at all
+(only binary / oversized-member / maintainer signals) is not queued: no model can review it, so it goes
+straight to `pending` for a human.
+
 ---
 
 ## 6. The dashboard & the `watch` daemon

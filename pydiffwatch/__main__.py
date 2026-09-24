@@ -2,7 +2,8 @@ import argparse
 from . import egress
 from .config import Config, load_config
 from .orchestrator import (run_once, seed_now, list_pending, adjudicate, get_evidence,
-                           backfill_evidence, export_dashboard, watch)
+                           backfill_evidence, export_dashboard, watch, review_pending,
+                           pending_review_counts)
 
 
 def _cfg(args):
@@ -38,6 +39,13 @@ def main():
                    help="set the cursor to PyPI's current serial and exit (start monitoring from now)")
     sub.add_parser("pending",
                    help="list suspicious verdicts awaiting adjudication, each with its diff")
+    rpp = sub.add_parser("review-pending",
+                         help="review releases queued for LLM review (by default: too_large and exhausted "
+                              "retries) — e.g. with -c pointing at a larger-context model")
+    rpp.add_argument("--reason", action="append",
+                     choices=["too_large", "review_failed", "endpoint_unreachable"],
+                     help="only this queue reason (repeatable)")
+    rpp.add_argument("--limit", type=int, default=None, help="review at most N releases")
     adjp = sub.add_parser("adjudicate", help="record your verdict on a queued suspicious release")
     adjp.add_argument("release_id", type=int)
     adjp.add_argument("label", choices=["benign", "malicious", "suspicious"])
@@ -86,7 +94,16 @@ def main():
         s = seed_now(cfg)
         print(f"[pydiffwatch] cursor seeded to serial {s}" if s is not None
               else "[pydiffwatch] could not reach PyPI to read the current serial")
+    elif args.cmd == "review-pending":
+        n, remaining = review_pending(cfg, reasons=args.reason, limit=args.limit)
+        left = ", ".join(f"{k}: {v}" for k, v in sorted(remaining.items())) or "none"
+        print(f"[pydiffwatch] reviewed {n} queued release(s); still queued: {left}")
     elif args.cmd == "pending":
+        queued = pending_review_counts(cfg)
+        if queued:
+            print(f"[pydiffwatch] {sum(queued.values())} release(s) queued for LLM review ("
+                  + ", ".join(f"{k}: {v}" for k, v in sorted(queued.items()))
+                  + ") — see `review-pending`")
         items = list_pending(cfg)
         if not items:
             print("[pydiffwatch] no suspicious verdicts awaiting adjudication"); return

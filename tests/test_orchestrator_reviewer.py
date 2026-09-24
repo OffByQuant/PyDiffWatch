@@ -28,7 +28,8 @@ def test_escalate_success_persists_verdict_and_marks_reviewed(tmp_path):
     rid = store.record_release(conn, "p", "1.0", 1, False, "0.9", "sdist")
 
     class _R:
-        def review(self, diff, triage, **kw): return _malicious_verdict()
+        def prepare(self, diff, triage): return ""
+        def review_text(self, *a, **kw): return _malicious_verdict()
     orchestrator._review_escalated(cfg, conn, _R(), _diff_obj(), _triage_obj(), rid)
 
     assert store.get_stage(conn, "p", "1.0") == "reviewed"
@@ -89,15 +90,17 @@ def test_build_reviewer_anthropic_builds_with_key(monkeypatch):
     assert rvw.backend.primary_model == "claude-sonnet-4-6"
 
 
-def test_llm_down_falls_back_to_heuristic_and_marks_review_failed(tmp_path):
+def test_llm_down_falls_back_to_heuristic_and_parks_for_review(tmp_path):
     cfg = Config(db_path=tmp_path / "o.sqlite")
     conn = store.connect(cfg); store.init_schema(conn)
     rid = store.record_release(conn, "p", "1.0", 1, False, "0.9", "sdist")
 
     class _R:
-        def review(self, diff, triage, **kw): raise reviewer.ReviewUnavailable("down")
+        def prepare(self, diff, triage): return ""
+        def review_text(self, *a, **kw): raise reviewer.ReviewUnavailable("down")
     orchestrator._review_escalated(cfg, conn, _R(), _diff_obj(), _triage_obj(), rid)
 
-    assert store.get_stage(conn, "p", "1.0") == "review_failed"        # non-terminal -> retried next tick
+    assert store.get_stage(conn, "p", "1.0") == "pending_review"       # parked; the queue retries it
+    assert store.pending_reviews(conn)[0]["pending_reason"] == "review_failed"
     alert = conn.execute("SELECT classification FROM alerts WHERE release_id=?", (rid,)).fetchone()
     assert alert["classification"] == "suspicious-heuristic"           # signal not dropped

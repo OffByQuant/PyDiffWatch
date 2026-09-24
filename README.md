@@ -67,6 +67,7 @@ cp examples/local-qwen.toml pydiffwatch.toml    # point at your local model endp
 pydiffwatch -c pydiffwatch.toml seed-now        # start watching "from now"
 pydiffwatch -c pydiffwatch.toml run             # process new releases (repeat on a schedule)
 pydiffwatch -c pydiffwatch.toml pending         # see suspicious releases awaiting your verdict
+pydiffwatch -c pydiffwatch.toml review-pending  # review what the LLM couldn't (e.g. with a bigger model)
 ```
 
 Prefer one command that scans continuously **and** shows you a live results page? Use the built-in daemon:

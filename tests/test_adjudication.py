@@ -8,7 +8,8 @@ from pydiffwatch.models import Verdict, Diff, TriageResult, FiredRule
 
 class _FakeRvw:
     def __init__(self, verdict): self._v = verdict
-    def review(self, d, tr): return self._v
+    def prepare(self, d, tr): return ""
+    def review_text(self, *a, **kw): return self._v
 
 
 def _setup(tmp_path, classification):

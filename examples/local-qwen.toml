@@ -7,3 +7,7 @@ provider = "openai"
 base_url = "http://localhost:8000/v1"
 model = "qwen-singleshot"
 structured_output = "json_schema"
+
+# Qwen 3.x is a reasoning model. With thinking off, reviews ran 1.6-4.4x faster with the same verdicts.
+[reviewer.extra_body]
+chat_template_kwargs = { enable_thinking = false }

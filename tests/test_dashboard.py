@@ -87,3 +87,12 @@ def test_export_dashboard_writes_file(tmp_path):
     out = orchestrator.export_dashboard(cfg)
     assert out.exists()
     assert "evilpkg" in out.read_text()
+
+
+def test_render_shows_pending_llm_review_by_reason():
+    status = dict(last_serial=None, last_poll_age=None, stale=False, releases_total=0, verdicts_total=0,
+                  flagged_total=0, reviewer="x", model_reachable=None,
+                  pending_review={"too_large": 2, "endpoint_unreachable": 5})
+    html = dashboard.render_dashboard([], status=status)
+    assert "7 pending LLM review" in html
+    assert "too_large: 2" in html and "endpoint_unreachable: 5" in html

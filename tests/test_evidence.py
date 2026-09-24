@@ -19,7 +19,7 @@ def _queue_suspicious(cfg, tmp_path):
     tr = TriageResult(50.0, [FiredRule("autoexec", 50.0, "setup.py", (1, 2))], True)
     v = Verdict("p", "1.0", "suspicious", 50.0, tr.fired_rules, False, confidence=0.6,
                 attack_type="install-hook-rce", reasoning="model says...", model="qwen-singleshot")
-    orchestrator._review_escalated(cfg, conn, type("R", (), {"review": lambda s, d, tr: v})(), d, tr, rid)
+    orchestrator._review_escalated(cfg, conn, type("R", (), {"prepare": lambda s, d, tr: "", "review_text": lambda s, *a, **kw: v})(), d, tr, rid)
     return conn, rid
 
 
