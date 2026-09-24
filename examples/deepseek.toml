@@ -20,6 +20,7 @@ model = "deepseek-chat"
 api_key_env = "DEEPSEEK_API_KEY"
 structured_output = "json_object"
 max_output_tokens = 32000
+# malicious_min_confidence = 0.8   # a weaker malicious verdict alerts as suspicious and waits for manual review
 
 # Optional: provider-specific knobs merged verbatim into the request payload. Reserved core fields
 # (model/messages/max_tokens/response_format) always win, so this can't override the prompt or the mode.

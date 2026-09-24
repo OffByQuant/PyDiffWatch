@@ -7,3 +7,4 @@ provider = "anthropic"
 model = "claude-sonnet-4-6"
 escalation_model = "claude-opus-4-8"
 structured_output = "json_schema"
+# malicious_min_confidence = 0.8   # a weaker malicious verdict alerts as suspicious and waits for manual review
