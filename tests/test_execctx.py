@@ -828,3 +828,40 @@ def test_the_other_line_keeps_its_claim_when_the_package_list_is_known(files):
 ])
 def test_the_other_line_makes_no_claim_when_the_package_list_is_not_known(files):
     assert _line(execctx.build(files), "other") == _OTHER_UNKNOWN
+
+
+# ---- residual R2: at most three egg-info top_level.txt are read, each into a bounded collection ----
+
+class _Reads(dict):
+    """new_files that records which top_level.txt sources build() reads."""
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.read = []
+
+    def __getitem__(self, k):
+        if k.endswith("top_level.txt"):
+            self.read.append(k)
+        return super().__getitem__(k)
+
+
+def test_at_most_three_egg_info_top_level_txt_are_read_and_the_rest_are_named(monkeypatch):
+    files = _Reads({f"a{j:02d}.egg-info/top_level.txt": "".join(f"t{j:02d}_{i}\n" for i in range(50)).encode()
+                    for j in range(8)})
+    sizes = []
+    real = execctx._collect
+
+    def spy(slot, entries):
+        real(slot, entries)
+        sizes.append(len(slot[0]))
+    monkeypatch.setattr(execctx, "_collect", spy)
+    ctx = execctx.build(files)
+    assert sorted(set(files.read)) == [f"a{j:02d}.egg-info/top_level.txt" for j in range(3)]
+    assert sizes and max(sizes) <= execctx._MAX_ITEMS + 1
+    u = "unknown (5 more egg-info top_level.txt not read)"
+    assert _field(ctx, "top_level.txt") == ", ".join([u] + [f"t00_{i}" for i in range(19)]) + ", … (+131 more)"
+
+
+def test_unread_top_level_txt_sources_are_named_even_when_the_read_ones_are_empty():
+    files = {f"a{j:02d}.egg-info/top_level.txt": b"\n" if j < 3 else b"x\n" for j in range(5)}
+    ctx = execctx.build(files)
+    assert _field(ctx, "top_level.txt") == "unknown (2 more egg-info top_level.txt not read)"

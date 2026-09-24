@@ -11,6 +11,7 @@ import ast
 import configparser
 import email.parser
 import json
+import re
 import tomllib
 
 _PARSE_ERRORS = (ValueError, SyntaxError, RecursionError, MemoryError, UnicodeDecodeError,
@@ -477,10 +478,15 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
     mods = declared("py_modules", "py-modules", "py_modules") or (", ".join(
         src_unknown + [f"auto-discovered: {_join(_modules(new_files), imp_none)}"])
         if setuptools and pkgs_declared is None and not find else _join(src_unknown, imp_none))
-    tops = [ln for p in _egg_info(new_files, "top_level.txt")
-            for ln in new_files[p].decode("utf-8", errors="replace").split()]
+    egg_tops, tops = _egg_info(new_files, "top_level.txt"), [[], 0]
+    for p in egg_tops[:_MAX_EGG_EPS]:                   # bounded, as entry_points.txt: read lazily, kept capped
+        _collect(tops, (m.group() for m in re.finditer(r"\S+", new_files[p].decode("utf-8", errors="replace"))))
+    # unread sources first: past the cap they would fold into "+N more"
+    tops_unread = ([f"unknown ({len(egg_tops) - _MAX_EGG_EPS} more egg-info top_level.txt not read)"]
+                   if len(egg_tops) > _MAX_EGG_EPS else [])
+    tops = _join(tops_unread + tops[0], extra=tops[1]) if tops_unread or tops[0] else "not found in scanned files"
     import_line = (f"import (runs when a program imports the package): packages={pkgs}; py-modules={mods}; "
-                   f"top_level.txt={_join(tops) if tops else 'not found in scanned files'}")
+                   f"top_level.txt={tops}")
 
     # commands and plugins
     eps: dict = {}
