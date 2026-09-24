@@ -5,6 +5,7 @@ forced structured-output contract. This module owns the prompt/schema/parsing on
 and network egress live in the backend, keeping the diff-handling code network-free (containment)."""
 import json
 import logging
+import re
 import secrets
 from .models import Verdict
 from .backends import ReviewUnavailable, make_backend   # re-exported: orchestrator imports reviewer.ReviewUnavailable
@@ -22,9 +23,14 @@ _MARKER_AFFIX = "===DW-UNTRUSTED-"
 def _new_marker() -> str:
     return f"{_MARKER_AFFIX}{secrets.token_hex(16)}==="   # 16 bytes -> 32 hex chars -> 128 bits
 
-TRUNCATION_NOTE = "\n[TRUNCATED: lowest-risk hunks omitted to fit the input cap.]"
-
 _FIRST_RELEASE_TOP_FILES = 40   # §7: first releases -> top 40 files by per-file score
+TRUNCATION_NOTE = "\n[TRUNCATED: lowest-risk hunks omitted to fit the input cap.]"
+# Fewer files shown than changed, with nothing cut by the cap: say why, never "cap".
+# (No longer than TRUNCATION_NOTE, so the input-size reserve and every cap stay as they were.)
+SELECTION_NOTE = "\n[SELECTED: changed files unrelated to flags are not shown.]"
+FIRST_RELEASE_NOTE = f"\n[SELECTED: only the {_FIRST_RELEASE_TOP_FILES} highest-risk files are shown.]"
+_NOTE_RESERVE = max(len(TRUNCATION_NOTE), len(SELECTION_NOTE), len(FIRST_RELEASE_NOTE))
+
 
 # Property order matters: a reasoning model that counts thinking tokens inside its output budget can
 # truncate the JSON tail. The decision fields (classification, confidence, urgent, recommended_action,
@@ -104,6 +110,9 @@ it. A plugin entry point runs whenever its host tool loads plugins; treat that a
 the user runs on purpose is not persistence "without being asked". The execution context is a best-effort \
 static summary: setup.py is arbitrary code and can do anything at build time, so "none declared literally in \
 setup.py" is not proof that nothing runs, and "unknown" or "<computed>" means exactly that.
+The dependency / binary / ownership signals block is DiffWatch's heuristic screening of PyPI metadata and the \
+file list. Names in it are author-chosen. A finding is a lead to check against the shown build-file hunks, not \
+evidence on its own. It never means malicious by itself, and a missing finding is not proof of safety.
 Without concrete evidence of one of these in the shown code, the verdict is "benign", even when the code \
 uses powerful primitives (subprocess, exec/eval, network, file writes). Use "suspicious" only when the shown \
 code points at one of these but a needed piece is not shown (for example it fetches and runs a payload \
@@ -162,6 +171,20 @@ def _zero_weight_rank(path, weight) -> int:
     return _BUILD_FILES.index(path) if weight == 0.0 and path in _BUILD_FILES else len(_BUILD_FILES)
 
 
+def _dep_pattern(name: str):
+    """A dependency name as a whole PEP 503 name, any case, any of -_. between its parts."""
+    parts = [re.escape(x) for x in re.split(r"[-_.]+", name) if x]
+    return re.compile(r"(?<![\w.-])" + r"[-_.]+".join(parts) + r"(?![\w-]|\.\w)", re.I) if parts else None
+
+
+def _names_a_dep(fd, triage) -> bool:
+    """Whether a file's added lines name what a metadata rule fired on (lines (0, 0): a dependency name, or a
+    binary path, e.g. a loader naming the new .so). Owner changes name no file."""
+    pats = [p for r in triage.fired_rules if r.lines == (0, 0) and r.file != "<ownership>"
+            and (p := _dep_pattern(r.file))]
+    return any(p.search(ln) for h in fd.hunks for ln in h.added for p in pats)
+
+
 def _rank_files(diff, triage):
     weights = _file_weights(triage)
     by_path = {fd.path: fd for fd in diff.changed}
@@ -172,9 +195,11 @@ def _rank_files(diff, triage):
     else:
         flagged = [p for p in by_path if weights.get(p, 0.0) > 0.0]
         # A fire on dependencies, binaries or owners only has no changed file to point at: show the changed
-        # build files (where dependencies are declared), never every changed file.
+        # build files (where dependencies are declared), then files whose added lines name a flagged dependency
+        # (PKG-INFO's Requires-Dist, a requirements helper setup.py reads). Never every changed file.
         ranked_paths = (sorted(flagged, key=lambda p: -weights[p])
-                        or [p for p in _BUILD_FILES if p in by_path])
+                        or [p for p in _BUILD_FILES if p in by_path]
+                        + sorted(p for p in by_path if p not in _BUILD_FILES and _names_a_dep(by_path[p], triage)))
     return ranked_paths, by_path
 
 
@@ -257,7 +282,7 @@ def build_review_input(diff, triage, *, max_chars: int, dropped: list | None = N
     loc_text = f"{_LOC_HEADING} {', '.join(seen)}" if seen else ""
     # info.summary is author-written: it goes inside the markers, flattened to one line by the differ.
     desc = getattr(diff, "description", "")
-    desc_text = f"{_DESC_HEADING}\n  {_one_line(desc)}" if desc else ""
+    desc_text = f"{_DESC_HEADING}\n  {_one_line(desc)[:500]}" if desc else ""    # clipped after escaping
     # Built by execctx from author-written metadata: fenced, and each line indented and escaped to one line so
     # none can pose as a file heading (dropped_from_text) or be taken for code (_has_reviewable_content).
     ctx = getattr(diff, "exec_context", "")
@@ -266,7 +291,7 @@ def build_review_input(diff, triage, *, max_chars: int, dropped: list | None = N
     sig = getattr(diff, "signals", "")
     sig_text = _render_block(_SIG_HEADING, sig, _SIG_MAX_CHARS) if sig else ""
     body_parts = [t for t in (loc_text, desc_text, exec_text, sig_text) if t]
-    used, truncated = len(header) + len(marker) + len(TRUNCATION_NOTE) + len("\n".join(body_parts)), False
+    used, truncated = len(header) + len(marker) + _NOTE_RESERVE + len("\n".join(body_parts)), False
     rendered_paths = []
     for path in ranked_paths:
         rendered = _render_file(by_path[path])
@@ -278,8 +303,10 @@ def build_review_input(diff, triage, *, max_chars: int, dropped: list | None = N
         rendered_paths.append(path)
 
     text = header + "\n".join(body_parts) + f"\n{marker}"
-    if truncated or len(ranked_paths) != len([fd for fd in diff.changed]):
+    if truncated:
         text += TRUNCATION_NOTE
+    elif len(ranked_paths) != len(diff.changed):
+        text += FIRST_RELEASE_NOTE if diff.is_first_release else SELECTION_NOTE
     if dropped is not None:
         weights = _file_weights(triage)
         rendered_set = set(rendered_paths)
@@ -419,7 +446,7 @@ class Reviewer:
         if not _has_reviewable_content(text) and ranked_paths:
             top = len(_render_file(by_path[ranked_paths[0]]))
             if top:
-                needed = len(text) + len(TRUNCATION_NOTE) + top + 1
+                needed = len(text) + _NOTE_RESERVE + top + 1
                 raise InputTooLarge(needed, cap, build_review_input(diff, triage, max_chars=needed))
         return text
 

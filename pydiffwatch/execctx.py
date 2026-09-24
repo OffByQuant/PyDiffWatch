@@ -458,7 +458,7 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
         elif epf is not None:
             path = epf.strip().removeprefix("./")
             flit_paths.append(path)
-            if path in KINDS:
+            if path in KINDS or path == "setup.py":                 # setup.py is parsed as Python
                 ep_unknown_cfg.append(f"unknown (flit entry-points-file {path} is not an entry-points file)")
             elif path in new_files:
                 _add_groups(eps, parsed(path, "entry_points"))

@@ -707,3 +707,10 @@ def test_an_entry_points_file_read_twice_under_one_kind_is_named_once():
     egg = "a.egg-info/entry_points.txt"
     ctx = execctx.build({"pyproject.toml": (_FLIT_OLD + f"entry-points-file = '{egg}'\n").encode(), egg: b"[x"})
     assert _line(ctx, "unparseable") == f"unparseable: {egg}"
+
+
+def test_a_flit_entry_points_file_naming_setup_py_is_unknown_not_reparsed():
+    ctx = execctx.build({"pyproject.toml": (_FLIT_OLD + "entry-points-file = 'setup.py'\n").encode(),
+                         "setup.py": b"from setuptools import setup\nsetup(name='a', cmdclass={'build': B})\n"})
+    expect = "unknown (flit entry-points-file setup.py is not an entry-points file)"
+    assert _line(ctx, "plugins").endswith(f": {expect}") and "unparseable" not in ctx

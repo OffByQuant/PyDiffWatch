@@ -42,8 +42,8 @@ def _signals(a: ArtifactSet, maintainer_context) -> str:
             out.append(f"requires-dist {key}: {_list(items)}")
     deps = []
     for f in a.added_dep_findings:
-        why = (f"typosquat of {_esc(f.get('target'))} (a popular package)" if f.get("reason") == "typosquat"
-               else _DEP_REASONS.get(f.get("reason")) or _esc(f.get("reason")))
+        why = ((f"typosquat of {_esc(f['target'])} (a popular package)" if f.get("target") else "typosquat")
+               if f.get("reason") == "typosquat" else _DEP_REASONS.get(f.get("reason")) or _esc(f.get("reason")))
         deps.append(f"dependency {_esc(f.get('name'))}: {why}")
     out += _capped("dependency", deps)
     bins = []

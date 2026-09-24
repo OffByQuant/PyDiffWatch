@@ -304,3 +304,88 @@ def test_a_hostile_pkg_info_summary_cannot_forge_a_heading(monkeypatch):
     lines = text.split("\n")
     assert not any(ln.startswith(("--- file:", "===DW")) and not _MARKER_RE.fullmatch(ln) for ln in lines)
     assert not reviewer._has_reviewable_content(text) and "evil.py" not in _header(text)
+
+
+# ---- fix round 1 ----
+
+def _versions(monkeypatch, info, per_version):
+    meta = _release({}, [("1.0", "2026-01-01T00:00:00Z"), ("1.1", "2026-02-01T00:00:00Z"),
+                         ("2.0", "2026-03-01T00:00:00Z")])
+    meta["info"] = info
+    asked = []
+    monkeypatch.setattr(fetcher, "_package_json", lambda p, cfg: meta)
+    monkeypatch.setattr(fetcher, "_requires_dist", lambda pkg, ver, cfg: asked.append(ver) or per_version.get(ver, []))
+    monkeypatch.setattr(fetcher, "_dep_json", lambda n, cfg: {"releases": {"0": [{"upload_time_iso_8601": "2020-01-01T00:00:00Z"}]}})
+    monkeypatch.setattr(fetcher, "_download", lambda url, cfg: make_sdist({"a/__init__.py": url.encode()}))
+    return asked
+
+
+def test_a_non_latest_release_screens_its_own_requires_dist_not_the_latest_s(monkeypatch):
+    # 1.1 requires only requests; the latest (2.0) adds reqeusts. 1.1 must not be charged with 2.0's addition.
+    asked = _versions(monkeypatch, {"version": "2.0", "requires_dist": ["requests", "reqeusts"]},
+                      {"1.0": ["six"], "1.1": ["six", "requests>=2", "reqursts"]})
+    art = fetcher.fetch_artifacts(Config(), NewRelease("p", "1.1", 5))
+    assert "1.1" in asked
+    assert [f["name"] for f in art.added_dep_findings] == ["reqursts"]          # its own addition only
+    assert art.requires_dist_change == {"added": ["requests>=2", "reqursts"], "removed": []}
+    assert "reqeusts" not in differ.build_diff(art).signals
+
+
+def test_a_non_latest_release_whose_own_list_is_unavailable_gets_no_findings(monkeypatch):
+    _versions(monkeypatch, {"version": "2.0", "requires_dist": ["reqeusts"]}, {"1.0": ["six", "requests"]})
+    art = fetcher.fetch_artifacts(Config(), NewRelease("p", "1.1", 5))
+    assert art.added_dep_findings == [] and art.requires_dist_change is None   # never "every dep removed"
+
+
+def test_a_dependency_only_fire_also_shows_files_naming_the_flagged_dependency():
+    changed = [_fd("a/core.py", "modified", "x = 2"), _fd("PKG-INFO", "modified", "Requires-Dist: reqeusts (>=0.1)"),
+               _fd("reqs.py", "modified", "DEPS = ['reqeusts_extra', 'Reqeusts']"), _fd("setup.py", "modified", "d")]
+    text = reviewer.build_review_input(Diff("p", "1.1", False, changed, []), _TYPO, max_chars=10_000)
+    heads = [ln for ln in text.split("\n") if ln.startswith("--- file: ")]
+    assert heads == ["--- file: setup.py (modified) ---", "--- file: PKG-INFO (modified) ---",
+                     "--- file: reqs.py (modified) ---"]                         # a/core.py never
+
+
+def test_a_dependency_name_matches_only_as_a_whole_name():
+    changed = [_fd("a/core.py", "modified", "import reqeustsx; my_reqeusts = 1")]
+    text = reviewer.build_review_input(Diff("p", "1.1", False, changed, []), _TYPO, max_chars=10_000)
+    assert "--- file:" not in text and not reviewer._has_reviewable_content(text)
+
+
+def test_the_note_says_cap_only_when_the_cap_cut_something():
+    changed = [_fd("setup.py", "modified", "exec(x)"), _fd("README.py", "modified", "doc")]
+    text = reviewer.build_review_input(Diff("p", "1.1", False, changed, []), _FIRED, max_chars=10_000)
+    assert reviewer.TRUNCATION_NOTE not in text and text.endswith(reviewer.SELECTION_NOTE)
+    assert "cap" not in reviewer.SELECTION_NOTE
+    assert len(reviewer.SELECTION_NOTE) <= len(reviewer.TRUNCATION_NOTE) >= len(reviewer.FIRST_RELEASE_NOTE)  # same reserve
+    big = [_fd("setup.py", "modified", "exec(x)" + "X" * 5_000)]
+    tr = TriageResult(60.0, [FiredRule("py-exec", 60.0, "setup.py", (1, 1)), FiredRule("r", 1.0, "b.py", (1, 1))], True)
+    cut = reviewer.build_review_input(Diff("p", "1.1", False, big + [_fd("b.py")], []), tr, max_chars=5_300)
+    assert cut.endswith(reviewer.TRUNCATION_NOTE) and len(cut) <= 5_300
+    whole = reviewer.build_review_input(Diff("p", "1.1", False, [_fd()], []), _FIRED, max_chars=10_000)
+    assert not whole.endswith((reviewer.TRUNCATION_NOTE, reviewer.SELECTION_NOTE))
+
+
+def test_the_system_prompt_frames_the_signals_block_as_leads_not_evidence():
+    sp = reviewer.SYSTEM_PROMPT
+    assert "dependency / binary / ownership signals block is DiffWatch's heuristic screening" in sp
+    assert "not evidence on its own" in sp and "a missing finding is not proof of safety" in sp
+
+
+def test_the_description_stays_within_500_chars_after_escaping():
+    d = Diff("p", "1.1", False, [_fd()], [], description="\x00" * 500)
+    body = _untrusted(reviewer.build_review_input(d, _FIRED, max_chars=100_000))
+    line = body.split("--- package description (the author's claim; context, not evidence) ---\n", 1)[1].split("\n")[0]
+    assert len(line) <= 2 + 500
+
+
+def test_a_typosquat_finding_without_a_target_says_typosquat():
+    sig = differ.build_diff(_art(added_dep_findings=[{"name": "x", "reason": "typosquat"}])).signals
+    assert sig == "dependency x: typosquat"
+
+
+def test_a_first_release_past_the_top_40_says_so_without_cap():
+    files = [_fd(f"m{i}.py") for i in range(45)]
+    tr = TriageResult(60.0, [FiredRule("py-exec", 60.0, "m0.py", (1, 1))], True)
+    text = reviewer.build_review_input(Diff("p", "1.0", True, files, []), tr, max_chars=100_000)
+    assert text.endswith(reviewer.FIRST_RELEASE_NOTE) and "cap" not in reviewer.FIRST_RELEASE_NOTE

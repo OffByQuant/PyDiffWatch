@@ -203,12 +203,17 @@ def _dep_json(name: str, cfg: Config):
         return {}
 
 def _screen_added_deps(meta: dict, package: str, pred_version: str | None, cfg: Config,
-                       change: dict | None = None) -> list[dict]:
+                       change: dict | None = None, version: str | None = None) -> list[dict]:
     """Diff the new version's declared deps against the predecessor's and flag suspicious additions.
-    new-side deps come free from the package-level `info` (the firehose release is normally the latest;
-    a rare lag mis-reads them, an accepted v1 approximation). Empty additions -> zero network.
+    The new side comes free from the package-level `info` when it is this `version`'s (the latest); for any
+    other release (backfill, retry, --recent, superseded) it is read from the exact version's JSON, and when
+    that is unavailable nothing is screened. No new deps -> no predecessor lookup.
     `change`, when passed, receives the added and removed Requires-Dist lines as written (for the reviewer)."""
-    new_lines = (meta.get("info") or {}).get("requires_dist") or []
+    info = meta.get("info") or {}
+    if version is not None and info.get("version") not in (None, version):
+        new_lines = _requires_dist(package, version, cfg)     # [] on any failure: screen nothing
+    else:
+        new_lines = info.get("requires_dist") or []
     new_reqs = deps.parse_requires_dist(new_lines)
     if not new_reqs:
         return []
@@ -341,11 +346,10 @@ def fetch_artifacts(cfg, rel: NewRelease, attempt: int = 1) -> ArtifactSet | NoS
             same = {(b["path"], b.get("sha256")) for b in prior_bins if b.get("sha256")}
             new_bins = [b for b in new_bins if (b["path"], b.get("sha256")) not in same]
         # signal 5: flag suspicious newly-added dependencies vs the predecessor (update path only).
-        dep_findings = _screen_added_deps(meta, rel.package, prior_ver, cfg, change=req_change)
+        dep_findings = _screen_added_deps(meta, rel.package, prior_ver, cfg, change=req_change, version=rel.version)
     return ArtifactSet(rel.package, rel.version, prior_ver, "sdist",
                        new_files, prior_files, {}, _cap_foreign(new_bins, cfg),
                        is_new_package=is_new, maintainer_metadata=mtmeta,
                        added_dep_findings=dep_findings, prior_error=prior_error, description=summary,
                        too_large=too_large, surface_omitted=surface_omitted,
-                       # only this version's own list: the package-level info is the latest version's
-                       requires_dist_change=req_change if req_change and info.get("version") == rel.version else None)
+                       requires_dist_change=req_change if any(req_change.values()) else None)
