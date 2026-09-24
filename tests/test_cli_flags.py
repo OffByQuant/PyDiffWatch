@@ -76,6 +76,15 @@ def test_model_alone_keeps_the_configs_api_key(tmp_path):
     assert cli._cfg(_args(config=_keyed(tmp_path), model="m")).reviewer.api_key_env == "OPENAI_API_KEY"
 
 
+def test_model_alone_drops_a_non_openai_providers_api_key(tmp_path):
+    # D22: --model switches the reviewer to an OpenAI-compatible server; an anthropic config's key names a
+    # credential for another provider, and must not be sent to that server.
+    p = tmp_path / "c.toml"
+    p.write_text('[reviewer]\nprovider = "anthropic"\napi_key_env = "ANTHROPIC_API_KEY"\n')
+    rc = cli._cfg(_args(config=str(p), model="m")).reviewer
+    assert rc.provider == "openai" and rc.api_key_env is None
+
+
 def _no_scan(monkeypatch, seen=None):
     """Stub everything main() would reach for, so a test can never scan PyPI or touch a real database."""
     seen = {} if seen is None else seen

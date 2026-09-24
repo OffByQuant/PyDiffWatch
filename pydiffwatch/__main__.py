@@ -15,7 +15,7 @@ def _cfg(args):
     if args.model or args.endpoint:       # an OpenAI-compatible server (llama.cpp, llama-swap, Ollama, vLLM)
         rc = dataclasses.replace(cfg.reviewer, provider="openai", model=args.model or cfg.reviewer.model,
                                  base_url=args.endpoint or cfg.reviewer.base_url)
-        if args.endpoint and args.endpoint != cfg.reviewer.base_url:
+        if (args.endpoint and args.endpoint != cfg.reviewer.base_url) or cfg.reviewer.provider != "openai":
             rc = dataclasses.replace(rc, api_key_env=None)    # the config's key is for its own endpoint only
         cfg = dataclasses.replace(cfg, reviewer=rc, reviewer_enabled=True)
     return cfg
