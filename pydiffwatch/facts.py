@@ -192,11 +192,54 @@ class DiffFacts:
     maintainer_changed: bool
 
 
+def _pth_facts(fd, lines, loc, added_lines, added_strs) -> FileFacts:
+    """CPython's `site` executes only the lines of a .pth file that start with `import` followed by a
+    space or tab; every other line is a path and never runs. Parse each such line ON ITS OWN (never the
+    whole file as Python) and feed it through the same call-resolution machinery as a .py file, so
+    autoexec_categories/bound_categories/combos see it. A parse failure or excessive depth on one line
+    is caught and skipped (never crashes), same guards as _file_facts."""
+    cats, autoexec_cats, names, modules = set(), set(), set(), set()
+    had_error = False
+    for i, raw in enumerate(fd.new_text.splitlines(), start=1):
+        if i not in added_lines:
+            continue
+        line = raw.rstrip()
+        if not (line.startswith("import ") or line.startswith("import\t")):
+            continue
+        try:
+            tree = ast.parse(line)
+        except (SyntaxError, RecursionError, MemoryError, ValueError):
+            had_error = True
+            continue
+        if _ast_too_deep(tree):
+            had_error = True
+        try:
+            table = _build_import_table(tree)
+            importtime_ids = _importtime_call_ids(tree)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                cat = _resolve_call(node, table)
+                if cat:
+                    cats.add(cat)
+                    if id(node) in importtime_ids:
+                        autoexec_cats.add(cat)
+                    f = node.func
+                    names.add(f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", ""))
+            modules.update(table.values())
+        except (RecursionError, MemoryError):
+            had_error = True
+    return FileFacts(fd.path, lines, loc, frozenset(cats), frozenset(autoexec_cats), frozenset(names),
+                     frozenset(modules), _blob_present(added_strs), had_error, added_strs)
+
+
 def _file_facts(fd) -> FileFacts:
     added_strs = tuple(ln for h in fd.hunks for ln in h.added)
     added_lines = {j + 1 for h in fd.hunks for j in range(h.new_range[0], h.new_range[1])}
     lines = (fd.hunks[0].new_range[0] + 1, fd.hunks[-1].new_range[1])
     loc = classify_location(fd.path)
+    if fd.new_text is not None and fd.path.endswith(".pth"):
+        return _pth_facts(fd, lines, loc, added_lines, added_strs)
     if fd.new_text is None or not fd.path.endswith((".py", ".pyx", ".pyi")):
         return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, False, added_strs)
     try:

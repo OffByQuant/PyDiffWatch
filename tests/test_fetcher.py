@@ -223,3 +223,14 @@ def test_fetch_no_dep_findings_when_new_version_declares_none(monkeypatch):
     monkeypatch.setattr(fetcher, "_download", lambda url, cfg: blobs[url])
     art = fetcher.fetch_artifacts(Config(), NewRelease("acme", "1.1", 9))
     assert art.added_dep_findings == []
+
+
+def test_extracts_pth_and_entry_points_and_top_level():
+    blob = make_sdist({"setup.py": b"import os\n",
+                       "evil.pth": b"import os;os.system('id')\n",
+                       "pkg.egg-info/entry_points.txt": b"[console_scripts]\nfoo=pkg:main\n",
+                       "pkg.egg-info/top_level.txt": b"pkg\n"})
+    files, _ = fetcher.extract_sdist(blob, Config())
+    assert "evil.pth" in files
+    assert "pkg.egg-info/entry_points.txt" in files
+    assert "pkg.egg-info/top_level.txt" in files

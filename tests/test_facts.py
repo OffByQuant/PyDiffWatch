@@ -200,3 +200,23 @@ def test_importtime_call_ids_iterative_matches_recursive_on_normal_code():
         (9, 4, "class_body_call"),
         (13, 0, "helper"),                             # lambda body itself is never walked (not module_funcs)
     }
+
+
+def test_pth_import_line_yields_process_autoexec():
+    d = _codediff("evil.pth", ["import os;os.system('id')"])
+    f = build_facts(d).files[0]
+    assert "process" in f.autoexec_categories
+    assert f.location_weight == 3.0
+
+
+def test_pth_path_only_lines_yield_nothing():
+    d = _codediff("normal.pth", ["../site-packages", "/opt/pkg/lib"])
+    f = build_facts(d).files[0]
+    assert f.bound_categories == frozenset() and f.autoexec_categories == frozenset()
+
+
+def test_pth_deep_import_line_does_not_crash():
+    pad = "+".join(["1"] * 5000)
+    d = _codediff("evil.pth", [f"import os;os.system('id' + str({pad}))"])
+    f = build_facts(d).files[0]   # must not raise (RecursionError guarded)
+    assert "process" in f.autoexec_categories

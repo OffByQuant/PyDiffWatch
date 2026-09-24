@@ -93,6 +93,16 @@ def test_post_parse_crash_fires_syntax_error_rule_scaled_by_location():
     assert fr_other.weight == 20 * 1.0
 
 
+def test_pth_import_line_fires_autoexec_location():
+    # A .pth file is a startup auto-exec location (site.py executes any `import` line at every
+    # interpreter start). Added on an update -> autoexec-location must fire, same as setup.py.
+    added = ["import os;os.system('id')"]
+    d = Diff("p", "1.1", False, [FileDiff("evil.pth", "added",
+        [Hunk((0, 0), (0, 1), added, [])], "\n".join(added))], [])
+    r = triage(d, Config(), RULES)
+    assert any(fr.rule == "autoexec-location" for fr in r.fired_rules)
+
+
 def test_deep_pad_does_not_mask_a_real_decode_exec_loader():
     # CRITICAL fix: previously the depth guard short-circuited extraction entirely, so padding a real
     # decode->exec loader with a deep expression dropped combo-decode-exec and the release stopped

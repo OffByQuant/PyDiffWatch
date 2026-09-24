@@ -31,8 +31,8 @@ class _BoundedReader:
             raise RefusedToExtract("decompressed-size")
         return chunk
 
-_SRC_EXT = (".py", ".pyx", ".pyi")
-_SRC_NAMES = {"setup.py", "setup.cfg", "pyproject.toml", "PKG-INFO"}
+_SRC_EXT = (".py", ".pyx", ".pyi", ".pth")
+_SRC_NAMES = {"setup.py", "setup.cfg", "pyproject.toml", "PKG-INFO", "entry_points.txt", "top_level.txt"}
 _BIN_EXT = (".so", ".pyd", ".dll", ".dylib")
 # Source in another PROGRAMMING language has no legitimate role in a Python sdist — a strong bad-actor
 # signal (the cudrequest typosquat shipped a PHP login app). Deliberately conservative: C-ext source
