@@ -284,7 +284,7 @@ class Reviewer:
     def prepare(self, diff, triage, cap=None) -> str:
         """Build the review input, or raise InputTooLarge if the highest-risk file can't fit in `cap`
         (default: max_input_chars; the guard passes the endpoint's measured cap)."""
-        cap = cap or self.cfg.reviewer.max_input_chars
+        cap = cap if cap is not None else self.cfg.reviewer.max_input_chars
         text = build_review_input(diff, triage, max_chars=cap)
         ranked_paths, by_path = _rank_files(diff, triage)
         if not _has_reviewable_content(text) and ranked_paths:

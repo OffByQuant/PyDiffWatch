@@ -281,3 +281,19 @@ def test_cap_explain_names_the_binding_limit(tmp_path):
 def test_default_probe_timeout_covers_a_llama_swap_cold_load():
     # Live: llama-swap loading Gemma 4 12B from cold took longer than 60 s, failing calibration.
     assert Config().reviewer.probe_timeout == 180.0
+
+
+def test_small_context_window_still_leaves_room_for_input(tmp_path):
+    # Final review: reserving the full max_output_tokens (32000) left a 32k-context endpoint a cap of 0.
+    clock = Clock()
+    gd, said = _guard(tmp_path, Backend(clock, secs_per_1k_chars=0.001, ctx=32_768), clock)
+    gd.begin_batch()
+    assert gd.input_cap_chars() > 40_000
+
+
+def test_context_with_no_room_warns_once(tmp_path):
+    clock = Clock()
+    gd, said = _guard(tmp_path, Backend(clock, secs_per_1k_chars=0.001, ctx=1_000), clock)
+    gd.begin_batch()
+    assert gd.input_cap_chars() == 0 and gd.input_cap_chars() == 0
+    assert len([s for s in said if "context window" in s]) == 1

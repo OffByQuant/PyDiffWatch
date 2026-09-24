@@ -61,6 +61,7 @@ class ReviewerGuard:
         self.paused_until = s.get("paused_until") or 0.0
         self.slow_streak = s.get("slow_streak") or 0
         self.ctx_tokens = None
+        self.warned_no_room = False
 
     def begin_batch(self):
         """Once per batch, before any review. A paused endpoint gets a health probe; an unmeasured one gets
@@ -120,7 +121,14 @@ class ReviewerGuard:
             terms.append((int(self.tok_s * self.rc.timeout * self.rc.budget_safety * self.cpt),
                           f"≈{self.tok_s:.0f} tok/s × {self.rc.timeout:.0f}s × {self.rc.budget_safety}"))
         if self.ctx_tokens:
-            room = self.ctx_tokens - self.rc.max_output_tokens - len(SYSTEM_PROMPT) / DEFAULT_CPT
+            # Reserve room for the verdict, but never the whole window: a 32k-context endpoint with the default
+            # 32,000-token max_output_tokens would otherwise get a cap of 0 and never review anything.
+            reserve = min(self.rc.max_output_tokens, self.ctx_tokens // 4)
+            room = self.ctx_tokens - reserve - len(SYSTEM_PROMPT) / DEFAULT_CPT
+            if room <= 0 and not self.warned_no_room:
+                self.warned_no_room = True
+                self._say(f"reviewer endpoint {self.endpoint}'s {self.ctx_tokens:,}-token context window leaves no "
+                          f"room for review input; use a model with a larger context")
             terms.append((int(room * self.cpt), f"{self.ctx_tokens:,}-token context window"))
         return terms
 
