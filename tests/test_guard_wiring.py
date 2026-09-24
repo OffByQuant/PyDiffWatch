@@ -226,6 +226,48 @@ def test_auto_drain_leaves_too_large_rows_that_still_do_not_fit(tmp_path):
     assert be.calls == 0 and _reasons(conn) == {"huge": "too_large"}
 
 
+class _CapturingMaxTokens(Backend):
+    def complete(self, **kw):
+        self.captured_max_tokens = kw["max_tokens"]
+        return super().complete(**kw)
+
+
+def _big_review_text():
+    return reviewer.build_review_input(_diff("a", "x" * 90_000), _T, max_chars=1_000_000)
+
+
+def test_max_tokens_clamped_to_the_context_window(tmp_path):
+    # spec C2: an endpoint like vLLM rejects prompt + max_tokens > max_model_len with HTTP 400, so the
+    # default 32000-token max_output_tokens must be clamped to what's left of a 32,768-token window.
+    be = _CapturingMaxTokens()
+    cfg, conn, gd, rvw = _setup(tmp_path, be)
+    gd.ctx_tokens = 32_768
+    rid = store.record_release(conn, "a", "1.0.0", 1, False, None, "tgz")
+    orchestrator._attempt_review(cfg, conn, rvw, rid, "a", "1.0.0", 60.0, _T.fired_rules,
+                                 _big_review_text(), gd)
+    assert be.captured_max_tokens < cfg.reviewer.max_output_tokens
+    assert be.captured_max_tokens >= 256
+
+
+def test_max_tokens_unclamped_when_the_context_window_is_unknown(tmp_path):
+    be = _CapturingMaxTokens()
+    cfg, conn, gd, rvw = _setup(tmp_path, be)
+    assert gd.ctx_tokens is None
+    rid = store.record_release(conn, "a", "1.0.0", 1, False, None, "tgz")
+    orchestrator._attempt_review(cfg, conn, rvw, rid, "a", "1.0.0", 60.0, _T.fired_rules,
+                                 _big_review_text(), gd)
+    assert be.captured_max_tokens == cfg.reviewer.max_output_tokens
+
+
+def test_max_tokens_unclamped_with_no_guard(tmp_path):
+    be = _CapturingMaxTokens()
+    cfg, conn, gd, rvw = _setup(tmp_path, be)
+    rid = store.record_release(conn, "a", "1.0.0", 1, False, None, "tgz")
+    orchestrator._attempt_review(cfg, conn, rvw, rid, "a", "1.0.0", 60.0, _T.fired_rules,
+                                 _big_review_text(), guard=None)
+    assert be.captured_max_tokens == cfg.reviewer.max_output_tokens
+
+
 def test_upgrade_backfills_the_length_of_already_parked_inputs(tmp_path):
     # Rows parked before review_input_chars existed must still become eligible once they fit.
     import zlib

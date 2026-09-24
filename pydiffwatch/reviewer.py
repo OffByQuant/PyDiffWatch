@@ -359,7 +359,8 @@ class Reviewer:
         return self.review_text(diff.package, diff.version, triage.score, triage.fired_rules,
                                 self.prepare(diff, triage), attempt=attempt)
 
-    def review_text(self, package, version, score, fired_rules, user_text, *, attempt: int = 1) -> Verdict:
+    def review_text(self, package, version, score, fired_rules, user_text, *, attempt: int = 1,
+                    max_tokens=None) -> Verdict:
         if not _has_reviewable_content(user_text):
             # Triage fired only on signals with no text to show (binary members, maintainers). A model
             # asked to judge nothing answers "benign"; that is a pass on a package nobody looked at.
@@ -373,7 +374,8 @@ class Reviewer:
                 reasoning=f"UNREVIEWED: triage fired ({rules}) but none of the flagged content could be "
                           f"shown to the reviewer. Needs a human.")
         timeout = self.cfg.reviewer.timeout * attempt
-        args = (package, version, score, fired_rules, user_text, timeout)
+        mt = max_tokens if max_tokens is not None else self.cfg.reviewer.max_output_tokens
+        args = (package, version, score, fired_rules, user_text, timeout, mt)
         v = self._call(self.backend.primary_model, *args)
         # §7 escalation (Claude only): low-confidence verdict -> re-run with the backend's bigger model.
         # The local backend exposes escalation_model=None, so a single model is used. (vet-mcp
@@ -385,10 +387,10 @@ class Reviewer:
             v = self._call(esc, *args)
         return v
 
-    def _call(self, model, package, version, score, fired_rules, user_text, timeout) -> Verdict:
+    def _call(self, model, package, version, score, fired_rules, user_text, timeout, max_tokens) -> Verdict:
         # backend.complete enforces the schema and maps availability failures to ReviewUnavailable (§8).
         text = self.backend.complete(model=model, system=SYSTEM_PROMPT, user_text=user_text,
-                                     schema=REVIEW_SCHEMA, max_tokens=self.cfg.reviewer.max_output_tokens,
+                                     schema=REVIEW_SCHEMA, max_tokens=max_tokens,
                                      timeout=timeout)
         d = json.loads(text)                                  # schema-constrained output -> valid JSON
         attack_type = d["attack_type"] if d["attack_type"] in _ATTACK_TYPES else "none"

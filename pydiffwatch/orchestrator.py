@@ -1,4 +1,4 @@
-import dataclasses, datetime, fcntl, json, logging, os, sqlite3, time
+import dataclasses, datetime, fcntl, json, logging, math, os, sqlite3, time
 from concurrent.futures import ThreadPoolExecutor
 from . import ingest, fetcher, differ, engine, rules, notifier, store, reviewer, egress, dashboard, quarantine
 from . import guard as guard_mod
@@ -90,6 +90,17 @@ def _record(cfg, conn, rid, verdict, score, dropped=()):
         store.update_stage(conn, rid, "reviewed", score, None)
 
 
+def _max_tokens_for(cfg, guard, text) -> int:
+    """spec C2: clamp reviewer.max_output_tokens to what's left of the model's context window once the
+    prompt is accounted for, so an OpenAI-compatible endpoint (e.g. vLLM) doesn't reject prompt + max_tokens
+    > max_model_len with HTTP 400. Unclamped (the config value) when the window isn't known."""
+    max_output_tokens = cfg.reviewer.max_output_tokens
+    if guard is None or guard.ctx_tokens is None:
+        return max_output_tokens
+    prompt_estimate = math.ceil((len(reviewer.SYSTEM_PROMPT) + len(text)) / guard.cpt)
+    return max(256, min(max_output_tokens, guard.ctx_tokens - prompt_estimate - 64))
+
+
 def _attempt_review(cfg, conn, rvw, rid, package, version, score, fired_rules, text, guard=None,
                     dropped=()) -> bool:
     """One review attempt; on failure the release is (re)parked with the reason. Returns False when no more
@@ -106,7 +117,8 @@ def _attempt_review(cfg, conn, rvw, rid, package, version, score, fired_rules, t
     t0 = time.monotonic()
     try:
         with _review_slot(cfg):
-            verdict = rvw.review_text(package, version, score, fired_rules, text, attempt=attempt)
+            verdict = rvw.review_text(package, version, score, fired_rules, text, attempt=attempt,
+                                      max_tokens=_max_tokens_for(cfg, guard, text))
     except reviewer.ReviewUnavailable as e:
         logger.warning("LLM review failed for %s==%s (attempt %d): %s", package, version, attempt, e)
         if _endpoint_down(e):     # an outage, not this release's fault: don't spend an attempt

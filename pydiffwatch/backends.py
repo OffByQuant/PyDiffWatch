@@ -99,6 +99,15 @@ def _egress_hint(e) -> str:
     base = str(e) or type(e).__name__
     code = getattr(e, "code", None)
     if code == 400:
+        body = ""
+        try:
+            body = e.read().decode(errors="replace")   # HTTPError is also the (unread) response object
+        except Exception:
+            pass
+        if "context length" in (base + body).lower() or "max_model_len" in (base + body).lower():
+            return (f"reviewer endpoint returned HTTP 400 ({base}): the request exceeds the model's context "
+                    f"window. Lower reviewer.max_input_chars or reviewer.max_output_tokens, or use a "
+                    f"larger-context model.")
         return (f"reviewer endpoint returned HTTP 400 ({base}): the request was rejected — many endpoints "
                 f"(e.g. DeepSeek) reject the strict json_schema response_format. Set "
                 f'structured_output = "json_object" in [reviewer] (see examples/deepseek.toml).')
