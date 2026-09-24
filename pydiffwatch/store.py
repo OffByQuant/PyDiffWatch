@@ -70,7 +70,7 @@ def migrate_schema(conn):
                      "AND NOT EXISTS (SELECT 1 FROM verdicts v WHERE v.release_id = r.id)",
                      ("UNREVIEWED: pydiffwatch refused to download or unpack it, recorded before refusals were "
                       "queued for review, so the reason was not kept. Not scanned. Needs manual review.", _now()))
-        conn.execute("INSERT INTO meta(key, value) VALUES('unreviewed_refusals', ?)", (_now(),))
+        conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('unreviewed_refusals', ?)", (_now(),))
         conn.commit()
 
 def get_last_serial(conn) -> int:

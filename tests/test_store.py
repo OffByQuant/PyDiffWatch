@@ -119,3 +119,23 @@ def test_record_verdict_inserts_and_is_idempotent_per_release(tmp_path):
     store.record_verdict(conn, rid, v2)
     rows = conn.execute("SELECT confidence, model FROM verdicts WHERE release_id=?", (rid,)).fetchall()
     assert len(rows) == 1 and rows[0]["model"] == "claude-opus-4-8" and rows[0]["confidence"] == 0.97
+
+
+def test_the_one_time_refusal_migration_tolerates_a_concurrent_process_that_ran_it_first(tmp_path):
+    # Two processes can both see the meta marker missing; the second one's INSERT must not fail its startup.
+    cfg = Config(db_path=tmp_path / "db.sqlite")
+    conn = store.connect(cfg); store.init_schema(conn)          # the other process ran it and committed
+
+    class _SawNoMarker:                                        # this process checked just before that
+        def __init__(self, c):
+            self.c = c
+
+        def execute(self, sql, *a):
+            if "FROM meta WHERE key='unreviewed_refusals'" in sql:
+                return self.c.execute("SELECT 1 WHERE 0")
+            return self.c.execute(sql, *a)
+
+        def commit(self):
+            self.c.commit()
+    store.migrate_schema(_SawNoMarker(conn))
+    assert conn.execute("SELECT count(*) FROM meta WHERE key='unreviewed_refusals'").fetchone()[0] == 1
