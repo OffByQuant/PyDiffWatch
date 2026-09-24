@@ -260,6 +260,12 @@ def note_metadata_failure(conn, release_id, detail) -> str:
     conn.commit()
     return stage
 
+def clear_fetch_failures(conn, release_id, note=None):
+    """A fetch (and scan) succeeded: earlier failures no longer count toward the give-up, and their error is
+    replaced by `note` (e.g. a failed prior sdist download) or cleared."""
+    conn.execute("UPDATE releases SET fetch_attempts=0, fetch_note=? WHERE id=?", (note, release_id))
+    conn.commit()
+
 def set_fetch_note(conn, release_id, note):
     conn.execute("UPDATE releases SET fetch_note=? WHERE id=?", (note, release_id))
     conn.commit()

@@ -252,3 +252,43 @@ def test_pending_does_not_call_every_retry_a_metadata_failure(tmp_cfg, monkeypat
     cli.main()
     out = capsys.readouterr().out
     assert "1 release(s) being retried" in out and "metadata failed" not in out
+
+
+# --- Task 8: retry bookkeeping -----------------------------------------------------------------------------
+
+def test_a_release_that_succeeds_clears_its_fetch_note_and_attempts(tmp_cfg, monkeypatch):
+    # D2 / (d): a later success must not leave the old error (or its count) on the row.
+    _feed(monkeypatch, [NewRelease("victim", "1.1", 10)])
+    state = {"fail": True}
+
+    def pkg_json(pkg, cfg):
+        if state["fail"]:
+            raise TimeoutError("metadata hung")
+        return _VICTIM
+    monkeypatch.setattr(fetcher, "_package_json", pkg_json)
+    monkeypatch.setattr(fetcher, "_download", lambda url, cfg: NEW)
+    orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
+    state["fail"] = False
+    orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
+    conn = store.connect(tmp_cfg)
+    row = conn.execute("SELECT stage, fetch_attempts, fetch_note FROM releases WHERE package='victim'").fetchone()
+    assert (row["stage"], row["fetch_attempts"], row["fetch_note"]) == ("triaged", 0, None)
+
+
+def test_entering_the_wheel_only_wait_resets_the_failure_count(tmp_cfg):
+    # (d): 3 failed fetches, then a successful one that parks the release in no_sdist_wait. One failed re-check
+    # after the grace is a first failure, not the 4th: it must retry, not give up with a download-failure alert.
+    conn = store.connect(tmp_cfg); store.init_schema(conn)
+    rel = NewRelease("sw", "1.1", 10)
+    for i in range(store.METADATA_ATTEMPTS - 1):
+        orchestrator._process_fetched(tmp_cfg, conn, None, None, rel, TimeoutError(f"hung {i}"))
+    orchestrator._process_fetched(tmp_cfg, conn, None, None, rel, fetcher.NoSdist(switched_from="1.0"))
+    row = conn.execute("SELECT stage, fetch_attempts, fetch_note FROM releases WHERE package='sw'").fetchone()
+    assert (row["stage"], row["fetch_attempts"], row["fetch_note"]) == ("no_sdist_wait", 0, None)
+    conn.execute("UPDATE releases SET recheck_at=0 WHERE package='sw'"); conn.commit()
+    orchestrator._process_fetched(tmp_cfg, conn, None, None, rel, TimeoutError("recheck hung"))
+    assert store.get_stage(conn, "sw", "1.1") == "metadata_retry"
+    # Its grace is already spent: the retry that sees it still wheel-only decides it, instead of starting a new
+    # wait (with the count reset, wait -> failed re-check -> wait would otherwise never end).
+    orchestrator._process_fetched(tmp_cfg, conn, None, None, rel, fetcher.NoSdist(switched_from="1.0"))
+    assert store.get_stage(conn, "sw", "1.1") == "no_sdist"

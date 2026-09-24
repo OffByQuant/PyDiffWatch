@@ -315,10 +315,13 @@ def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=
         # A switch from an sdist (PyPI's JSON, or our own record when the owner deleted that sdist since) can
         # dodge an sdist-only scan; a package always wheel-only is silent. Wheels often upload before the sdist,
         # so a switch (or an sdist upload event the JSON doesn't show yet) waits for wheel_only_grace_minutes
-        # and is re-fetched before it warns.
+        # and is re-fetched before it warns. A fetch that got this far succeeded: earlier failures stop counting.
+        # A release whose re-check failed (metadata_retry, with its grace spent) is decided by the retry.
+        store.clear_fetch_failures(conn, rid)
         prev = getattr(result, "switched_from", None) or store.previous_sdist_release(conn, rel.package, rel.version)
         now = time.time()
-        due = was == "no_sdist_wait" and (store.recheck_at(conn, rid) or 0) <= now
+        recheck = store.recheck_at(conn, rid)
+        due = was in ("no_sdist_wait", "metadata_retry") and recheck is not None and recheck <= now
         if (prev or rel.sdist_upload) and not due:
             if was != "no_sdist_wait":
                 store.wait_for_sdist(conn, rid, now + cfg.wheel_only_grace_minutes * 60)
@@ -331,8 +334,7 @@ def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=
                              f"manual review.", stage="no_sdist")
         return True
     store.set_baseline(conn, rid, result.prior_version, result.is_new_package)
-    if result.prior_error:
-        store.set_fetch_note(conn, rid, result.prior_error)
+    store.set_fetch_note(conn, rid, result.prior_error)   # None clears an earlier failure's note (D2)
     if result.maintainer_metadata is not None:
         store.update_release_metadata(conn, rid, json.dumps(result.maintainer_metadata))
     if result.is_new_package and cfg.new_package_policy == "skip":
@@ -346,6 +348,7 @@ def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=
         tr = engine.triage(d, cfg, ruleset, {"current": result.maintainer_metadata, "prior": prior_meta})
         store.update_stage(conn, rid, "triaged", tr.score,
                            json.dumps([r.__dict__ for r in tr.fired_rules]))
+        store.clear_fetch_failures(conn, rid, result.prior_error)   # scanned: earlier failures stop counting
         # Persist the flagged payload code itself (not just file:line metadata) so the DB is a
         # self-contained takedown-report source that survives the package being pulled from PyPI.
         ev = reviewer.build_evidence(d, tr, max_chars=cfg.evidence_max_chars) if tr.escalate else None
