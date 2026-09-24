@@ -295,21 +295,21 @@ def test_entering_the_wheel_only_wait_resets_the_failure_count(tmp_cfg):
 
 
 def test_each_retry_gets_a_longer_deadline_and_logs_its_attempt(tmp_cfg, monkeypatch, caplog):
-    # (i), npm #26: attempt k downloads with fetch_deadline_s x k and packument_deadline_s x k (attempt 1 is x1,
-    # so the first try is as strict as ever), and the log line names the error and the attempt.
+    # (i), npm #26: attempt k is passed to the fetcher, which gives the package JSON and sdist downloads k times
+    # their deadlines (test_fetch_deadlines checks which requests scale; attempt 1 is x1, so the first try is as
+    # strict as ever), and the log line names the error and the attempt.
     import logging
     _feed(monkeypatch, [NewRelease("slow", "1.0", 10)])
     seen = []
 
-    def fetch(cfg, rel):
-        seen.append((cfg.fetch_deadline_s, cfg.packument_deadline_s))
+    def fetch(cfg, rel, attempt=1):
+        seen.append(attempt)
         raise TimeoutError("download took too long")
     monkeypatch.setattr(fetcher, "fetch_artifacts", fetch)
     with caplog.at_level(logging.WARNING, logger="pydiffwatch.orchestrator"):
         for _ in range(store.METADATA_ATTEMPTS):
             orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
-    f, p = tmp_cfg.fetch_deadline_s, tmp_cfg.packument_deadline_s
-    assert seen == [(f * k, p * k) for k in range(1, store.METADATA_ATTEMPTS + 1)]
+    assert seen == list(range(1, store.METADATA_ATTEMPTS + 1))
     msgs = [r.getMessage() for r in caplog.records if "slow==1.0" in r.getMessage()]
     assert "(TimeoutError: download took too long); will retry next tick (attempt 1 of 4)" in msgs[0]
     assert "attempt 3 of 4" in msgs[2] and "giving up after 4 attempts" in msgs[3]

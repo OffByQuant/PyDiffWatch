@@ -128,7 +128,7 @@ def test_refused_extract_emits_suspicious_alert(tmp_cfg, monkeypatch):
         NewRelease("bomb", "1.0", 7)])
     # make extraction refuse by patching fetch_artifacts directly
     monkeypatch.setattr(fetcher, "fetch_artifacts",
-                        lambda cfg, rel: (_ for _ in ()).throw(fetcher.RefusedToExtract("bomb")))
+                        lambda cfg, rel, **k: (_ for _ in ()).throw(fetcher.RefusedToExtract("bomb")))
     orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
     conn = store.connect(tmp_cfg)
     stage = conn.execute("SELECT stage FROM releases WHERE package='bomb'").fetchone()[0]
@@ -148,7 +148,7 @@ def test_transient_fetch_error_is_retryable_not_poison(tmp_cfg, monkeypatch):
     monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: [r for r in [good, boom, after] if r.serial > since])
 
     calls = {"n": 0}
-    def flaky_fetch(cfg, rel):
+    def flaky_fetch(cfg, rel, **k):
         if rel.package == "victimx" and calls["n"] == 0:
             calls["n"] += 1
             raise urllib.error.HTTPError("u", 503, "boom", {}, None)  # transient, NOT RefusedTo*

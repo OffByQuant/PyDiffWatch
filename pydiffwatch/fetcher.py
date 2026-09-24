@@ -1,5 +1,5 @@
 import io, gzip, tarfile, hashlib, json, time, urllib.request, urllib.error, posixpath
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from .config import Config
 from .models import NewRelease, ArtifactSet
@@ -247,16 +247,21 @@ def _switched_from(releases: dict, version: str) -> str | None:
                 and (ts := first(files)) is not None and ts < t), default=None)
     return prev[1] if prev and _sdist(releases[prev[1]]) else None
 
-def fetch_artifacts(cfg, rel: NewRelease) -> ArtifactSet | NoSdist:
+def fetch_artifacts(cfg, rel: NewRelease, attempt: int = 1) -> ArtifactSet | NoSdist:
     """Fetch + extract the sdist(s) for one release. The baseline is resolved from PyPI's version
     history (the package JSON), NOT our DB: an UPDATE (a prior version exists) is diffed against its
-    predecessor; a genuinely NEW package (no prior) is handled per cfg.new_package_policy."""
+    predecessor; a genuinely NEW package (no prior) is handled per cfg.new_package_policy.
+    Attempt k (a retry) gives the package JSON and the sdist downloads k times their deadlines. The
+    requires_dist and dependency lookups keep theirs: they swallow every error, so more time can't turn a
+    failure into a success, only lengthen the retry."""
+    slow = cfg if attempt <= 1 else replace(cfg, fetch_deadline_s=cfg.fetch_deadline_s * attempt,
+                                            packument_deadline_s=cfg.packument_deadline_s * attempt)
     if quarantine.is_quarantined(rel.package):
         # Confirmed supply-chain malware — refuse before any byte is pulled. Maps to a terminal
         # 'refused_to_fetch' stage upstream; DiffWatch never re-ingests it. (§6 / quarantine.py)
         raise RefusedToFetch(f"quarantined: {rel.package}")
     try:
-        meta = _package_json(rel.package, cfg)
+        meta = _package_json(rel.package, slow)
     except urllib.error.HTTPError as e:
         if e.code == 404:
             raise MetadataGone(f"{rel.package}: PyPI metadata returned 404") from e
@@ -281,7 +286,7 @@ def fetch_artifacts(cfg, rel: NewRelease) -> ArtifactSet | NoSdist:
         return ArtifactSet(rel.package, rel.version, None, "sdist", {}, {}, {}, [],
                            is_new_package=True, maintainer_metadata=mtmeta, description=summary)
 
-    new_files, new_bins = extract_sdist(_download(new_sd["url"], cfg), cfg)
+    new_files, new_bins = extract_sdist(_download(new_sd["url"], slow), cfg)
     prior_files: dict[str, bytes] = {}
     prior_bins = None
     prior_ver = None
@@ -295,7 +300,7 @@ def fetch_artifacts(cfg, rel: NewRelease) -> ArtifactSet | NoSdist:
     else:
         prior_ver, prior_url = pred
         try:
-            prior_files, prior_bins = extract_sdist(_download(prior_url, cfg), cfg)
+            prior_files, prior_bins = extract_sdist(_download(prior_url, slow), cfg)
         except Exception as e:     # as npm does: diff against nothing (every file reported), and say so
             prior_error = f"prior {prior_ver} sdist unavailable ({type(e).__name__}: {e}); diffed against nothing"
         if prior_bins is not None:

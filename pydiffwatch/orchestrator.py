@@ -277,14 +277,11 @@ def _drain_one(cfg, conn, rvw, row, *, auto, cap, provisional, guard):
 def _fetch_one(cfg, rel, attempt=1):
     """Worker half of the pipeline — runs OFF the main thread. Does NO sqlite and NO notifier work
     (sqlite is single-threaded), only network + in-memory extraction (incl. PyPI-baseline resolution).
-    Attempt k (a retry of a failed release) gets k times the download and metadata deadlines, as review
-    retries get timeout x attempt; attempt 1 keeps them as configured.
+    Attempt k (a retry of a failed release) gets k times the package-JSON and sdist deadlines (see
+    fetcher.fetch_artifacts), as review retries get timeout x attempt; attempt 1 keeps them as configured.
     Returns the ArtifactSet, a NoSdist, or the Exception it caught, for the main thread to map."""
-    if attempt > 1:
-        cfg = dataclasses.replace(cfg, fetch_deadline_s=cfg.fetch_deadline_s * attempt,
-                                  packument_deadline_s=cfg.packument_deadline_s * attempt)
     try:
-        return fetcher.fetch_artifacts(cfg, rel)
+        return fetcher.fetch_artifacts(cfg, rel, attempt=attempt)
     except Exception as e:        # incl. RefusedToFetch/RefusedToExtract — mapped on the main thread
         return e
 

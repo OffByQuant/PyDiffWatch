@@ -294,7 +294,7 @@ def test_a_due_wait_row_is_not_starved_by_a_backlog_of_failing_retries(tmp_cfg, 
     rid = store.record_release(conn, "sw", "1.1", 100, False, None, "sdist")
     store.wait_for_sdist(conn, rid, 0)
 
-    def fetch(cfg, rel):
+    def fetch(cfg, rel, **k):
         if rel.package == "sw":
             return fetcher.NoSdist(switched_from="1.0")
         raise TimeoutError("still down")
