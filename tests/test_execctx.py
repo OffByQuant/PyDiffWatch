@@ -675,3 +675,10 @@ def test_an_unread_flit_entry_points_file_is_unknown(extra, files, too_large, ex
 def test_a_top_level_entry_points_txt_is_not_flit_s_under_another_backend():
     ctx = execctx.build({"pyproject.toml": b"[project]\nname = 'a'\n", "entry_points.txt": b"[pytest11]\np = e:h\n"})
     assert "p -> e:h" not in ctx
+
+
+def test_an_unknown_backend_qualifies_like_an_unparsed_one():
+    ctx = execctx.build({"pyproject.toml": b"[build-system]\nbuild-backend = 5\n"})
+    assert "backend=unknown" in ctx
+    assert _line(ctx, "plugins").endswith(": none in [project] (unknown backend may declare its own)")
+    assert _line(ctx, "startup").endswith(": none in scanned files (unknown backend may generate its own)")

@@ -375,8 +375,9 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
     # declare entry points and generate files we cannot see: its empty fields are qualified, never a bare "none"
     in_tree = bs.get("backend-path") not in (None, [], "")
     ep_none = gen_none = none
-    if backend is not None and (in_tree or backend not in _PARSED_BACKENDS):
-        name = f"in-tree backend {_clip(backend)}" if in_tree else _clip(backend)
+    if backend is None or in_tree or backend not in _PARSED_BACKENDS:
+        name = ("unknown backend" if backend is None else
+                f"in-tree backend {_clip(backend)}" if in_tree else _clip(backend))
         tail = f"; {NOT_LITERAL}" if "setup.py" in new_files else ""
         ep_none = f"none in [project] ({name} may declare its own){tail}"
         gen_none = f"none in scanned files ({name} may generate its own){tail}"
