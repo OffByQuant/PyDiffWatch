@@ -23,7 +23,8 @@ _OK = ('{"classification":"benign","confidence":0.9,"urgent":false,"recommended_
 def _cfg(tmp_path, **rv):
     c = dataclasses.replace(Config(), db_path=tmp_path / "db.sqlite", lock_path=tmp_path / "l",
                             cache_dir=tmp_path / "c", rules_dir=Path("rules/community"))
-    return dataclasses.replace(c, reviewer=dataclasses.replace(c.reviewer, **rv)) if rv else c
+    # The host memory guard reads this machine's real memory; keep these tests independent of it.
+    return dataclasses.replace(c, reviewer=dataclasses.replace(c.reviewer, host_memory_guard=False, **rv))
 
 
 class _Backend:
@@ -37,6 +38,12 @@ class _Backend:
         if self.fail is not None:
             raise reviewer.ReviewUnavailable("boom") from self.fail
         return _OK
+
+    def ping(self, text, *, timeout):     # the reviewer guard's probe / calibration: a fast endpoint
+        return {"prompt_tokens": 5000, "completion_tokens": 1, "prompt_per_second": 100_000.0}
+
+    def context_length(self, model=None):
+        return None
 
 
 def _setup(tmp_path, backend, **rv):
@@ -128,8 +135,8 @@ def test_unreachable_model_does_not_pin_the_cursor(tmp_path, monkeypatch):
     rel = NewRelease("pkg", "1.0.0", 5050)
     monkeypatch.setattr(ingest, "changes_since", lambda *a, **k: [rel])
     from types import SimpleNamespace
-    art = SimpleNamespace(prior_version="0.9.0", is_new_package=False, maintainer_metadata=None)
-    monkeypatch.setattr(fetcher, "fetch_artifacts", lambda cfg, rel: art)
+    art = SimpleNamespace(prior_version="0.9.0", is_new_package=False, maintainer_metadata=None, prior_error=None)
+    monkeypatch.setattr(fetcher, "fetch_artifacts", lambda cfg, rel, **k: art)
     monkeypatch.setattr(orchestrator.differ, "build_diff", lambda art: _diff())
     monkeypatch.setattr(orchestrator.engine, "triage", lambda *a, **k: _T)
     monkeypatch.setattr(orchestrator, "_probe_reviewer", lambda cfg: (False, "127.0.0.1:9"))
@@ -159,3 +166,81 @@ def test_drain_limit_counts_attempts_not_successes(tmp_path):
     be.calls.clear()
     orchestrator.drain_pending(cfg, conn, rvw, auto=True, limit=1)
     assert len(be.calls) == 1
+
+
+def _adjudicated_too_large(tmp_path, be):
+    cfg, conn, rid, rvw = _setup(tmp_path, be, max_input_chars=10_000)
+    store.update_evidence(conn, rid, "payload code")
+    orchestrator._review_escalated(cfg, conn, rvw, _diff("x" * 50_000), _T, rid)
+    store.adjudicate(conn, rid, "malicious", "confirmed by hand")
+    big = dataclasses.replace(cfg, reviewer=dataclasses.replace(cfg.reviewer, max_input_chars=200_000))
+    return big, conn, rid
+
+
+def _row(conn, rid):
+    return tuple(conn.execute("SELECT r.stage, r.evidence IS NOT NULL, v.classification, v.human_label "
+                              "FROM releases r JOIN verdicts v ON v.release_id=r.id WHERE r.id=?", (rid,)).fetchone())
+
+
+def test_a_row_a_person_adjudicated_is_never_re_reviewed_by_either_drain(tmp_path):
+    be = _Backend()
+    big, conn, rid = _adjudicated_too_large(tmp_path, be)
+    rvw = reviewer.Reviewer(big, backend=be)
+    orchestrator.drain_pending(big, conn, rvw, auto=True)               # the cap grew: it fits now
+    orchestrator.drain_pending(big, conn, rvw, auto=False)
+    assert be.calls == []
+    assert _row(conn, rid) == ("pending_review", 1, "suspicious", "malicious")
+    assert store.pending_reviews(conn) == [] and store.pending_review_counts(conn) == {}
+
+
+def test_a_benign_model_verdict_never_drops_the_evidence_of_a_labelled_release(tmp_path):
+    cfg, conn, rid, rvw = _setup(tmp_path, _Backend())
+    store.update_evidence(conn, rid, "payload code")
+    orchestrator._review_escalated(cfg, conn, rvw, _diff(), _T, rid, offline=True)
+    store.record_verdict(conn, rid, orchestrator.Verdict("pkg", "1.0.0", "suspicious", 60.0, [], False, model="none"))
+    store.adjudicate(conn, rid, "malicious", "confirmed by hand")
+    benign = orchestrator.Verdict("pkg", "1.0.0", "benign", 60.0, [], False, model="m", reasoning="fine")
+    orchestrator._record(cfg, conn, rid, benign, 60.0)
+    assert store.get_evidence(conn, rid) == "payload code"
+
+
+def test_the_auto_drain_starts_no_new_review_once_its_time_budget_is_spent(tmp_path):
+    # It runs before the retry sweep and ingest, holding the scan lock: reviewer.timeout bounds it.
+    cfg, conn, rid, rvw = _setup(tmp_path, _Backend())
+    for i, pkg in enumerate(("a", "b", "c")):
+        r = store.record_release(conn, pkg, "1.0.0", 2 + i, False, None, "tgz")
+        orchestrator._review_escalated(cfg, conn, rvw, dataclasses.replace(_diff(), package=pkg), _T, r,
+                                       offline=True)
+    ticks = iter(range(0, 10_000, 200))                     # every clock read is 200s after the last
+    be = _Backend()
+    orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=be), auto=True,
+                               clock=lambda: next(ticks))
+    assert len(be.calls) == 1                               # 200s < 300s: one review; at 400s it stops
+    assert sorted(_pending(conn)) == ["b", "c"]             # the rest wait for the next tick
+    orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=be), auto=False,
+                               reasons=("endpoint_unreachable",), clock=lambda: next(ticks))
+    assert len(be.calls) == 3 and _pending(conn) == {}      # `review-pending` is run by hand: no budget
+
+
+def test_the_auto_drain_neither_selects_exhausted_rows_nor_loads_input_it_does_not_review(tmp_path, monkeypatch):
+    be = _Backend(fail=_TIMEOUT)
+    cfg, conn, rid, rvw = _setup(tmp_path, be)
+    orchestrator._review_escalated(cfg, conn, rvw, _diff(), _T, rid)
+    for _ in range(2):
+        orchestrator.drain_pending(cfg, conn, rvw, auto=True)             # attempt 3: exhausted, warned
+    assert _pending(conn)["pkg"]["review_attempts"] == cfg.reviewer.max_review_attempts
+    big = store.record_release(conn, "big", "1.0.0", 2, False, None, "tgz")
+    store.park_for_review(conn, big, "too_large", "big", "x" * (cfg.reviewer.max_input_chars + 1))
+    ok = store.record_release(conn, "ok", "1.0.0", 3, False, None, "tgz")
+    orchestrator._review_escalated(cfg, conn, rvw, dataclasses.replace(_diff(), package="ok"), _T, ok, offline=True)
+    selected, loaded = [], []
+    real_select, real_load = store.pending_reviews, store.review_input
+    monkeypatch.setattr(store, "pending_reviews",
+                        lambda *a, **k: selected.extend(real_select(*a, **k)) or real_select(*a, **k))
+    monkeypatch.setattr(store, "review_input", lambda row, *a: loaded.append(row["package"]) or real_load(row, *a))
+    orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=_Backend()), auto=True)
+    assert "pkg" not in [r["package"] for r in selected]                   # exhausted: never selected
+    assert all("review_input" not in r.keys() for r in selected)           # no blob until a row is reviewed
+    assert loaded == ["ok"] and store.get_stage(conn, "ok", "1.0.0") == "reviewed"
+    [row] = [r for r in real_select(conn) if r["package"] == "big"]         # re-parked over the cap, input kept
+    assert row["pending_reason"] == "too_large" and len(real_load(row)) == cfg.reviewer.max_input_chars + 1

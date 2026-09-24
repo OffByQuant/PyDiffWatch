@@ -141,6 +141,20 @@ def test_http_400_error_hints_json_object():
         b.complete(model="m", system="s", user_text="u", schema=SCHEMA, max_tokens=10)
 
 
+def test_http_400_error_hints_context_length():
+    # vLLM rejects prompt + max_tokens > max_model_len with a 400 whose body names the limit.
+    class _HTTPErr(Exception):
+        code = 400
+        def read(self):
+            return b'{"error": {"message": "This model\'s maximum context length is 32768 tokens"}}'
+
+    def post(url, payload, timeout, headers=None):
+        raise _HTTPErr("Bad Request")
+    b = OpenAICompatibleBackend("http://x/v1", "m", post=post)
+    with pytest.raises(ReviewUnavailable, match="context window"):
+        b.complete(model="m", system="s", user_text="u", schema=SCHEMA, max_tokens=10)
+
+
 def test_connection_error_hints_base_url():
     def post(url, payload, timeout, headers=None):
         raise ConnectionRefusedError("Connection refused")

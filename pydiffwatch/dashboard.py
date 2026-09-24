@@ -45,12 +45,29 @@ def _conf_pct(conf) -> str:
     return f"{int(round(c))}%"
 
 
-def _card(row: dict) -> str:
+def is_flagged(row: dict) -> bool:
+    """A release needing a person's attention: a malicious/suspicious verdict, or a benign one still
+    sitting in `needs_adjudication` (spec U2: the model only reviewed part of the input). A human
+    adjudication (`human_label`) is the final word when present: 'benign' clears the flag for good
+    (store.adjudicate never moves the release off its stage, so `stage` alone can't tell it's settled);
+    any other label keeps it flagged even if the model's own classification was 'benign'."""
+    human = row.get("human_label")
+    if human is not None:
+        return human.lower() != "benign"
     cls = (row.get("classification") or "benign").lower()
+    return cls in _FLAGGED or row.get("stage") == "needs_adjudication"
+
+
+def _card(row: dict) -> str:
+    # A human adjudication overrides the model's classification for display too, so the badge text
+    # never contradicts is_flagged's styling/report-button decision above.
+    human = row.get("human_label")
+    cls = human.lower() if human is not None else (row.get("classification") or "benign").lower()
     pkg = row.get("package") or ""
     ver = row.get("version") or ""
     e = html.escape
-    flagged = cls in _FLAGGED
+    flagged = is_flagged(row)
+    style_cls = cls if cls in _FLAGGED else ("suspicious" if flagged else cls)   # benign-but-flagged reads as suspicious
     attack = row.get("attack_type") or ""
     attack_html = (f'<span class="k">attack</span><span class="v">{e(attack)}</span>'
                    if attack and attack != "none" else "")
@@ -64,13 +81,19 @@ def _card(row: dict) -> str:
     reason_html = f'<div class="reason">{e(reasoning)}</div>' if reasoning else ""
     cited_html = (f'<div class="cited"><span class="k">cited</span> {e(cited)}</div>'
                   if cited else "")
+    human_html = ""
+    if human:
+        note = row.get("human_note") or ""
+        model_cls = (row.get("classification") or "?").lower()
+        human_html = (f'<div class="human">your verdict: {e(human)}{" — " + e(note) if note else ""}'
+                      f'{f" · model said {e(model_cls)}" if model_cls != human.lower() else ""}</div>')
     triage = row.get("triage_score")
     triage_html = (f'<span class="k">triage</span><span class="v">{int(triage)}</span>'
                    if triage is not None else "")
-    return f"""<div class="card {e(cls)}">
+    return f"""<div class="card {e(style_cls)}">
   <div class="head">
     <div class="pkg">{e(pkg)} <span class="ver">{e(ver)}</span></div>
-    <div class="badge {e(cls)}">{e(cls)}</div>
+    <div class="badge {e(style_cls)}">{e(cls)}</div>
   </div>
   <div class="meta">
     {triage_html}
@@ -78,6 +101,7 @@ def _card(row: dict) -> str:
     {attack_html}
     <span class="k">model</span><span class="v">{e(row.get('model') or '?')}</span>
   </div>
+  {human_html}
   {reason_html}
   {cited_html}
   <div class="actions">{''.join(actions)}</div>
@@ -103,6 +127,7 @@ h1{font-size:24px;letter-spacing:-.3px}.sub{color:var(--muted);margin:6px 0 28px
 .meta .k{color:var(--muted);text-transform:uppercase;letter-spacing:.5px;font-size:11px}
 .meta .v{font-family:var(--mono);margin-right:8px}
 .reason{background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:12px 14px;font-size:14px;line-height:1.55;color:#c9d1d9}
+.human{margin-bottom:10px;font-size:13px;color:var(--ink);font-weight:600}
 .cited{margin-top:8px;font-size:12.5px;color:var(--muted);font-family:var(--mono)}
 .actions{display:flex;gap:10px;margin-top:14px}
 .btn{font-size:13px;font-weight:600;text-decoration:none;padding:8px 14px;border-radius:8px;border:1px solid var(--line);color:var(--ink)}
@@ -121,8 +146,14 @@ footer{color:var(--muted);font-size:12.5px;margin-top:28px;text-align:center}
 
 
 def _rank(row) -> int:
-    cls = (row.get("classification") or "").lower()
-    return {"malicious": 0, "suspicious": 1}.get(cls, 2)
+    # A human adjudication is the final word, as in is_flagged and the badge.
+    human = row.get("human_label")
+    cls = human.lower() if human is not None else (row.get("classification") or "").lower()
+    if cls == "malicious":
+        return 0
+    if is_flagged(row):
+        return 1
+    return 2
 
 
 def _status_strip(status: dict) -> str:
@@ -142,18 +173,30 @@ def _status_strip(status: dict) -> str:
     pending = status.get("pending_review") or {}
     pending_txt = (f"{sum(pending.values())} pending LLM review ("
                    + ", ".join(f"{k}: {v}" for k, v in sorted(pending.items())) + ")") if pending else ""
+    retry = status.get("retry") or {}
+    backlog = []
+    if retry.get("retrying"):
+        oldest = retry.get("oldest_retrying_age")
+        backlog.append(f"{int(retry['retrying'])} scan(s) retrying"
+                       + (f" (oldest first seen {oldest})" if oldest else ""))
+    if retry.get("gave_up"):
+        backlog.append(f"{int(retry['gave_up'])} scan(s) given up")
+    retry_txt = " · ".join(backlog)
+    from .guard import describe
+    g = status.get("guard")
+    guard_txt = describe(g) if g else ""
     return f"""<div class="status">
   <span class="stat"><span class="dot {dot}"></span>{e(model_txt)} <code>{e(status.get('reviewer') or '?')}</code></span>
   <span class="stat">last poll: {e(age)}</span>
   <span class="stat">cursor: {e(serial_txt)}</span>
   <span class="stat">{int(status.get('releases_total') or 0)} releases · {int(status.get('verdicts_total') or 0)} reviewed · {int(status.get('flagged_total') or 0)} flagged</span>
-{f'  <span class="stat">{e(pending_txt)}</span>' + chr(10) if pending_txt else ''}</div>"""
+{f'  <span class="stat">{e(pending_txt)}</span>' + chr(10) if pending_txt else ''}{f'  <span class="stat">{e(retry_txt)}</span>' + chr(10) if retry_txt else ''}{f'  <span class="stat">{e(guard_txt)}</span>' + chr(10) if guard_txt else ''}</div>"""
 
 
 def render_dashboard(rows, status: dict = None, generated_at: str = "") -> str:
     # flagged-first, independent of caller ordering (stable within each class).
     rows = sorted((dict(r) for r in rows), key=_rank)
-    flagged = sum(1 for r in rows if (r.get("classification") or "").lower() in _FLAGGED)
+    flagged = sum(1 for r in rows if is_flagged(r))
     cards = "\n".join(_card(dict(r)) for r in rows) if rows else \
         '<div class="empty">No verdicts yet. Run <code>pydiffwatch run</code> first.</div>'
     gen = f" · generated {html.escape(generated_at)}" if generated_at else ""

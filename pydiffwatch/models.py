@@ -3,6 +3,8 @@ from dataclasses import dataclass, field
 @dataclass(frozen=True)
 class NewRelease:
     package: str; version: str; serial: int
+    new_release: bool = True     # the changelog's `new release` event (the release's first file upload)
+    sdist_upload: bool = False   # its sdist upload event; re-scans a release left no_sdist_wait/no_sdist (wheels first)
 
 @dataclass(frozen=True)
 class ArtifactSet:
@@ -15,6 +17,8 @@ class ArtifactSet:
     is_new_package: bool = False   # True = no prior version on PyPI (genuinely new codebase)
     maintainer_metadata: dict | None = None   # author/maintainer/ownership captured from PyPI JSON
     added_dep_findings: list[dict] = field(default_factory=list)   # signal 5: suspicious added deps
+    prior_error: str | None = None   # the prior sdist couldn't be fetched, so this was diffed against nothing
+    description: str | None = None   # this version's PyPI info.summary: the author's claim, context only
 
 @dataclass(frozen=True)
 class Hunk:
@@ -31,6 +35,7 @@ class Diff:
     package: str; version: str; is_first_release: bool
     changed: list[FileDiff]; added_binaries: list[dict]
     added_dep_findings: list[dict] = field(default_factory=list)   # signal 5: suspicious added deps
+    description: str = ""          # the new version's info.summary, one line: the author's claim, context only
 
 @dataclass(frozen=True)
 class FiredRule:

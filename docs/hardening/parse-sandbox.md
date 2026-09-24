@@ -74,8 +74,8 @@ The shape, if someone wants to contribute it:
 3. **A dispatch** (`run_extract_parse(cfg, bundle)`) that runs the worker under `systemd-run` when
    available and falls back to the pure function in-process otherwise (macOS/dev, or where `systemd-run`
    is absent) — so the sandbox degrades cleanly and the pipeline still runs everywhere.
-4. **Map a worker crash/timeout** to a retryable, non-terminal stage (mirror the existing
-   `fetch_failed` handling) so a sandbox failure never poisons the tick or silently drops a release.
+4. **Map a worker crash/timeout** to the bounded retry queue (mirror the existing `_retry_later`
+   handling) so a sandbox failure never poisons the tick or silently drops a release.
 
 Keep the LLM reviewer call in the **parent**, not the worker — the reviewer needs egress to the model
 endpoint, which the sandbox forbids by design, and the reviewer already handles only structured diff text

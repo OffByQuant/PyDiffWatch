@@ -1,3 +1,4 @@
+import pytest
 import textwrap
 from pydiffwatch.config import Config, ReviewerConfig, load_config
 
@@ -37,9 +38,23 @@ def test_load_config_from_toml(tmp_path):
     assert cfg.reviewer.api_key_env == "ANTHROPIC_API_KEY"
 
 
-def test_load_config_missing_file_returns_defaults(tmp_path):
-    cfg = load_config(tmp_path / "nope.toml")
-    assert cfg.reviewer.base_url == "http://localhost:8000/v1"
+def test_load_config_missing_file_raises(tmp_path):
+    # A mistyped -c path must fail loudly, never silently run on built-in defaults.
+    with pytest.raises(FileNotFoundError, match="nope.toml"):
+        load_config(tmp_path / "nope.toml")
+
+
+def test_cli_missing_config_exits_with_error(tmp_path):
+    import argparse
+    from pydiffwatch.__main__ import _cfg
+    with pytest.raises(SystemExit, match="nope.toml"):
+        _cfg(argparse.Namespace(config=str(tmp_path / "nope.toml"), model=None, endpoint=None))
+
+
+def test_cli_without_config_uses_defaults():
+    import argparse
+    from pydiffwatch.__main__ import _cfg
+    assert _cfg(argparse.Namespace(config=None, model=None, endpoint=None)) == Config()
 
 
 def test_default_max_output_tokens_fits_reasoning_models():
@@ -63,3 +78,9 @@ def test_load_config_reads_reviewer_extra_body(tmp_path):
     '''))
     cfg = load_config(p)
     assert cfg.reviewer.extra_body == {"reasoning": {"enabled": False}}
+
+
+def test_load_config_on_a_directory_raises_file_not_found(tmp_path):
+    # Final review: path.exists() let a directory through to read_text(), an IsADirectoryError traceback.
+    with pytest.raises(FileNotFoundError, match="not a file"):
+        load_config(tmp_path)

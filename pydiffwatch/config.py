@@ -26,6 +26,12 @@ class ReviewerConfig:
     # truncates the JSON before all fields emit. Sized to leave room for reasoning + the full verdict.
     max_output_tokens: int = 32000
     opus_escalation_confidence: float = 0.6
+    budget_safety: float = 0.6         # a review may be predicted to use at most this share of `timeout`
+    probe_timeout: float = 180.0       # health probe / calibration (covers llama-swap loading a model)
+    slowdown_ratio: float = 0.3        # a review below this share of measured speed counts as slow
+    degraded_pause_s: float = 900.0    # after two slow reviews in a row, pause this long before probing
+    host_memory_guard: str | bool = "auto"   # "auto": on when the endpoint is on this machine (loopback)
+    max_swap_used_pct: float = 75.0          # pause reviews at or above this swap use
     # Provider-specific request knobs merged verbatim into the chat-completions payload (openai
     # provider only) — e.g. DeepSeek's reasoning toggle: [reviewer.extra_body] reasoning = {enabled=false}.
     # Reserved core fields (model/messages/max_tokens/response_format) always win; see backends.py.
@@ -48,7 +54,10 @@ class Config:
     dep_brandnew_days: int = 30
     max_dep_lookups: int = 10
     max_decompressed_bytes: int = 120 * 1024 * 1024
-    fetch_timeout_s: float = 30.0
+    fetch_timeout_s: float = 30.0          # per socket read (and XML-RPC call)
+    fetch_deadline_s: float = 120.0        # per download, total
+    packument_deadline_s: float = 300.0    # PyPI JSON metadata, total (big projects list every release)
+    max_metadata_bytes: int = 64_000_000   # PyPI JSON metadata size cap
     max_releases_per_run: int = 2000
     fetch_concurrency: int = 4
     new_package_policy: str = "surface"   # "surface" | "skip" | "full"
@@ -56,17 +65,23 @@ class Config:
     pypi_base: str = "https://pypi.org"
     webhook_url: str | None = None
     evidence_max_chars: int = 200_000
+    retention_days: int = 90          # plain release rows older than this are pruned (0 = keep all)
+    prune_every_hours: float = 24.0   # run/watch prune the database at most this often
+    wheel_only_grace_minutes: float = 60.0   # a switch to wheel-only is re-checked for a late sdist before it warns
     reviewer_enabled: bool = True
     rules_dir: Path = Path("rules/community")
     reviewer: ReviewerConfig = field(default_factory=ReviewerConfig)
 
 
 def load_config(path) -> Config:
-    """Load config from a TOML file, falling back to defaults for a missing file or absent keys.
-    Unknown keys are ignored. API keys are NEVER read from the file — only the env-var name is."""
+    """Load config from a TOML file, falling back to defaults for absent keys. A missing file raises
+    FileNotFoundError (never silently run on defaults). Unknown keys are ignored. API keys are NEVER
+    read from the file — only the env-var name is."""
     path = Path(path)
     if not path.exists():
-        return Config()
+        raise FileNotFoundError(f"config file not found: {path}")
+    if not path.is_file():
+        raise FileNotFoundError(f"config path is not a file: {path}")
     raw = tomllib.loads(path.read_text())
     rv = raw.pop("reviewer", {})
     default_rv = ReviewerConfig()

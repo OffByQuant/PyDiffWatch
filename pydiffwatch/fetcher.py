@@ -1,4 +1,5 @@
-import io, gzip, tarfile, hashlib, json, urllib.request, urllib.error, posixpath
+import io, gzip, tarfile, hashlib, json, time, urllib.request, urllib.error, posixpath
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from .config import Config
 from .models import NewRelease, ArtifactSet
@@ -6,6 +7,15 @@ from . import quarantine, deps, egress
 
 class RefusedToExtract(Exception): ...
 class RefusedToFetch(Exception): ...
+class MetadataGone(Exception): ...          # PyPI's JSON metadata 404s: the project was removed
+class MetadataUnavailable(Exception): ...   # any other metadata failure: retried on later ticks
+
+
+@dataclass(frozen=True)
+class NoSdist:
+    """This version has no sdist (wheel-only, or its wheels uploaded before its sdist). `switched_from`: the
+    previous release, when it had an sdist — a switch to wheel-only, which dodges an sdist-only scan."""
+    switched_from: str | None = None
 
 class _BoundedReader:
     """Forward-only wrapper over a decompressed stream that refuses once cumulative bytes read
@@ -21,8 +31,8 @@ class _BoundedReader:
             raise RefusedToExtract("decompressed-size")
         return chunk
 
-_SRC_EXT = (".py", ".pyx", ".pyi")
-_SRC_NAMES = {"setup.py", "setup.cfg", "pyproject.toml", "PKG-INFO"}
+_SRC_EXT = (".py", ".pyx", ".pyi", ".pth")
+_SRC_NAMES = {"setup.py", "setup.cfg", "pyproject.toml", "PKG-INFO", "entry_points.txt", "top_level.txt"}
 _BIN_EXT = (".so", ".pyd", ".dll", ".dylib")
 # Source in another PROGRAMMING language has no legitimate role in a Python sdist — a strong bad-actor
 # signal (the cudrequest typosquat shipped a PHP login app). Deliberately conservative: C-ext source
@@ -42,9 +52,16 @@ def _foreign_ext(name):
 def _strip_top(name): return name.split("/", 1)[1] if "/" in name else name
 def _unsafe(name): return name.startswith("/") or ".." in name.split("/")
 
+def _sha256_of(fileobj) -> str:
+    """Fingerprint a member without holding it in memory (an oversized source can be up to max_member_bytes)."""
+    h = hashlib.sha256()
+    while chunk := fileobj.read(1 << 20):
+        h.update(chunk)
+    return h.hexdigest()
+
 def extract_sdist(blob: bytes, cfg: Config):
     files: dict[str, bytes] = {}; binaries: list[dict] = []
-    total = 0; count = 0; foreign = 0
+    total = 0; count = 0
     # Decompress through a byte-ceiling and read the tar as a forward-only STREAM ("r|"): both
     # bound peak RAM so a malicious sdist cannot expand to gigabytes in memory during extraction.
     stream = _BoundedReader(gzip.GzipFile(fileobj=io.BytesIO(blob)), cfg.max_decompressed_bytes)
@@ -68,28 +85,58 @@ def extract_sdist(blob: bytes, cfg: Config):
                 files[rel] = tar.extractfile(m).read(cfg.max_source_file_bytes + 1)
             elif _is_source(m.name):
                 # Oversized source: too big to analyze. Record as a signal, never drop silently (spec §8).
-                binaries.append({"path": rel, "size": m.size, "reason": "source-too-large"})
+                binaries.append({"path": rel, "size": m.size, "reason": "source-too-large",
+                                 "sha256": _sha256_of(tar.extractfile(m))})
             elif _is_binary(m.name):
                 data = tar.extractfile(m).read()
                 binaries.append({"path": rel, "sha256": hashlib.sha256(data).hexdigest(),
                                  "size": m.size})
-            elif (fext := _foreign_ext(m.name)) and foreign < cfg.max_foreign_files:
-                # Foreign-language source: record presence (path/ext/size) as a signal — NEVER read the
-                # bytes (cheap, and we don't execute or analyze non-Python code). Cap-and-stop.
+            elif fext := _foreign_ext(m.name):
+                # Foreign-language source: record presence (path/ext/size) as a signal. We fingerprint
+                # the bytes (to drop unchanged files vs the prior release) but never parse or analyze
+                # them — this is not Python code we understand. Every one is hashed (streamed); the
+                # max_foreign_files cap applies after the prior comparison (_cap_foreign), so unchanged
+                # files cannot use it up.
                 binaries.append({"path": rel, "size": m.size, "ext": fext,
-                                 "reason": "foreign-language-source"})
-                foreign += 1
+                                 "reason": "foreign-language-source", "sha256": _sha256_of(tar.extractfile(m))})
     return files, binaries
+
+def _cap_foreign(bins: list[dict], cfg: Config) -> list[dict]:
+    """Keep at most max_foreign_files foreign-language records; other records are untouched."""
+    out, n = [], 0
+    for b in bins:
+        if b.get("reason") == "foreign-language-source":
+            n += 1
+            if n > cfg.max_foreign_files:
+                continue
+        out.append(b)
+    return out
+
+def read_body(r, cfg: Config, limit: int | None = None, deadline: float | None = None) -> bytes:
+    """A response body within a total deadline (seconds; default fetch_deadline_s) and an optional size cap.
+    urlopen's timeout bounds each socket read only, so a connection that trickles bytes would otherwise
+    hold a scan tick forever."""
+    budget = deadline or cfg.fetch_deadline_s
+    end = time.monotonic() + budget
+    buf = bytearray()                             # amortized O(1) append; bytes += is O(n^2)
+    while chunk := r.read1(65536):
+        buf += chunk
+        if limit is not None and len(buf) > limit:
+            raise RefusedToFetch("download-size")
+        if time.monotonic() > end:
+            raise TimeoutError(f"download took longer than {budget:.0f}s")
+    return bytes(buf)
+
+
+def _read_json(r, cfg: Config):
+    return json.loads(read_body(r, cfg, cfg.max_metadata_bytes, cfg.packument_deadline_s))
+
 
 def _download(url: str, cfg: Config) -> bytes:
     egress.assert_web_scheme(url)   # url is from PyPI's JSON — reject file:// before urllib reads a local path
     req = urllib.request.Request(url, headers={"User-Agent": "diffwatch/0.1"})
     with urllib.request.urlopen(req, timeout=cfg.fetch_timeout_s) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
-        buf = bytearray()                             # amortized O(1) append; bytes += is O(n^2)
-        while chunk := r.read(65536):
-            buf += chunk
-            if len(buf) > cfg.max_download_bytes: raise RefusedToFetch("download-size")
-        return bytes(buf)
+        return read_body(r, cfg, cfg.max_download_bytes)
 
 # Files PyPI runs at install or import time — where supply-chain malware must live to execute.
 # Mirrors triage.classify_location's 3x-weighted set; a genuinely new package is scanned ONLY here.
@@ -102,7 +149,7 @@ def _package_json(package: str, cfg: Config) -> dict:
     url = f"{cfg.pypi_base}/pypi/{package}/json"
     egress.assert_web_scheme(url)
     with urllib.request.urlopen(url, timeout=cfg.fetch_timeout_s) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
-        return json.load(r)
+        return _read_json(r, cfg)
 
 def _sdist(files) -> dict | None:
     return next((f for f in (files or []) if f.get("packagetype") == "sdist"), None)
@@ -120,7 +167,7 @@ def _requires_dist(package: str, version: str, cfg: Config) -> list:
         url = f"{cfg.pypi_base}/pypi/{package}/{version}/json"
         egress.assert_web_scheme(url)
         with urllib.request.urlopen(url, timeout=cfg.fetch_timeout_s) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
-            return (json.load(r).get("info") or {}).get("requires_dist") or []
+            return (_read_json(r, cfg).get("info") or {}).get("requires_dist") or []
     except Exception:
         return []   # can't resolve predecessor deps -> screen nothing rather than false-flag
 
@@ -130,7 +177,7 @@ def _dep_json(name: str, cfg: Config):
         url = f"{cfg.pypi_base}/pypi/{name}/json"
         egress.assert_web_scheme(url)
         with urllib.request.urlopen(url, timeout=cfg.fetch_timeout_s) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
-            return json.load(r)
+            return _read_json(r, cfg)
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None
@@ -188,31 +235,62 @@ def _pick_predecessor(meta: dict, version: str):
             best = (ts, ver, f.get("url"))
     return (best[1], best[2]) if best else None
 
-def fetch_artifacts(cfg, rel: NewRelease) -> ArtifactSet | None:
+def _switched_from(releases: dict, version: str) -> str | None:
+    """The release uploaded just before `version` (by each release's first file upload), if it had an sdist.
+    Read from the package JSON already fetched, so it is right on a fresh database too."""
+    def first(files):
+        return min((f["upload_time_iso_8601"] for f in files or [] if f.get("upload_time_iso_8601")), default=None)
+    t = first(releases.get(version))
+    if t is None:
+        return None
+    prev = max(((ts, v) for v, files in releases.items() if v != version
+                and (ts := first(files)) is not None and ts < t), default=None)
+    return prev[1] if prev and _sdist(releases[prev[1]]) else None
+
+def fetch_artifacts(cfg, rel: NewRelease, attempt: int = 1) -> ArtifactSet | NoSdist:
     """Fetch + extract the sdist(s) for one release. The baseline is resolved from PyPI's version
     history (the package JSON), NOT our DB: an UPDATE (a prior version exists) is diffed against its
-    predecessor; a genuinely NEW package (no prior) is handled per cfg.new_package_policy."""
+    predecessor; a genuinely NEW package (no prior) is handled per cfg.new_package_policy.
+    Attempt k (a retry) gives the package JSON and the sdist downloads k times their deadlines. The
+    requires_dist and dependency lookups keep theirs: they swallow every error, so more time can't turn a
+    failure into a success, only lengthen the retry."""
+    slow = cfg if attempt <= 1 else replace(cfg, fetch_deadline_s=cfg.fetch_deadline_s * attempt,
+                                            packument_deadline_s=cfg.packument_deadline_s * attempt)
     if quarantine.is_quarantined(rel.package):
         # Confirmed supply-chain malware — refuse before any byte is pulled. Maps to a terminal
         # 'refused_to_fetch' stage upstream; DiffWatch never re-ingests it. (§6 / quarantine.py)
         raise RefusedToFetch(f"quarantined: {rel.package}")
-    meta = _package_json(rel.package, cfg)
+    try:
+        meta = _package_json(rel.package, slow)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise MetadataGone(f"{rel.package}: PyPI metadata returned 404") from e
+        raise MetadataUnavailable(f"{rel.package}: PyPI metadata returned HTTP {e.code}") from e
+    except RefusedToFetch:
+        raise                                         # over the size cap: a deterministic refusal
+    except Exception as e:
+        raise MetadataUnavailable(f"{rel.package}: {type(e).__name__}: {e}") from e
     new_sd = _sdist(meta.get("releases", {}).get(rel.version))
     if not new_sd:
-        return None                                   # no sdist for this version (wheel-only; Phase 3)
+        return NoSdist(_switched_from(meta.get("releases", {}), rel.version))   # wheel-only: not scanned
     pred = _pick_predecessor(meta, rel.version)
     is_new = pred is None
     mtmeta = _maintainer_metadata(meta, new_sd)
+    info = meta.get("info") or {}
+    # The package-level JSON carries the LATEST version's info; another version's claim is not this one's.
+    summary = info.get("summary") if info.get("version") == rel.version else None
 
     if is_new and cfg.new_package_policy == "skip":
         # New package, skip policy: don't even download — but still record who shipped it, so a later
         # version of this package has a maintainer baseline to diff against (maintainer-set-change).
         return ArtifactSet(rel.package, rel.version, None, "sdist", {}, {}, {}, [],
-                           is_new_package=True, maintainer_metadata=mtmeta)
+                           is_new_package=True, maintainer_metadata=mtmeta, description=summary)
 
-    new_files, new_bins = extract_sdist(_download(new_sd["url"], cfg), cfg)
+    new_files, new_bins = extract_sdist(_download(new_sd["url"], slow), cfg)
     prior_files: dict[str, bytes] = {}
+    prior_bins = None
     prior_ver = None
+    prior_error = None
     dep_findings: list[dict] = []
     if is_new:
         if cfg.new_package_policy == "surface":
@@ -221,10 +299,18 @@ def fetch_artifacts(cfg, rel: NewRelease) -> ArtifactSet | None:
         # "full": keep the whole tree (legacy whole-codebase scan)
     else:
         prior_ver, prior_url = pred
-        prior_files, _ = extract_sdist(_download(prior_url, cfg), cfg)
+        try:
+            prior_files, prior_bins = extract_sdist(_download(prior_url, slow), cfg)
+        except Exception as e:     # as npm does: diff against nothing (every file reported), and say so
+            prior_error = f"prior {prior_ver} sdist unavailable ({type(e).__name__}: {e}); diffed against nothing"
+        if prior_bins is not None:
+            # Only what this release adds or changes is a signal; an unchanged oversized/binary/foreign
+            # file republished release after release is not.
+            same = {(b["path"], b.get("sha256")) for b in prior_bins if b.get("sha256")}
+            new_bins = [b for b in new_bins if (b["path"], b.get("sha256")) not in same]
         # signal 5: flag suspicious newly-added dependencies vs the predecessor (update path only).
         dep_findings = _screen_added_deps(meta, rel.package, prior_ver, cfg)
     return ArtifactSet(rel.package, rel.version, prior_ver, "sdist",
-                       new_files, prior_files, {}, new_bins,
+                       new_files, prior_files, {}, _cap_foreign(new_bins, cfg),
                        is_new_package=is_new, maintainer_metadata=mtmeta,
-                       added_dep_findings=dep_findings)
+                       added_dep_findings=dep_findings, prior_error=prior_error, description=summary)

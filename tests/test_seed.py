@@ -70,3 +70,27 @@ def test_seed_now_returns_none_when_pypi_unreachable(tmp_cfg, monkeypatch):
     conn = store.connect(tmp_cfg)
     assert store.get_last_serial(conn) == 0                # left unseeded
     conn.close()
+
+
+def test_recent_starts_a_fresh_cursor_n_events_back_and_scans_in_the_same_tick(tmp_cfg, monkeypatch):
+    from pydiffwatch import fetcher
+    from pydiffwatch.models import NewRelease
+    monkeypatch.setattr(ingest, "current_serial", lambda cfg: 10_000)
+    seen = []
+    monkeypatch.setattr(ingest, "changes_since",
+                        lambda cfg, since: seen.append(since) or [NewRelease("pkg", "1.0", 9_700)])
+    monkeypatch.setattr(fetcher, "fetch_artifacts", lambda cfg, rel: None)   # no sdist: terminal
+    assert orchestrator.run_once(tmp_cfg, recent=500) == 1
+    assert seen == [9_500]
+    conn = store.connect(tmp_cfg)
+    assert store.get_last_serial(conn) == 9_700
+    conn.close()
+
+
+def test_recent_is_ignored_once_the_cursor_is_set(tmp_cfg, monkeypatch):
+    conn = store.connect(tmp_cfg); store.init_schema(conn); store.set_last_serial(conn, 5000); conn.close()
+    monkeypatch.setattr(ingest, "current_serial", lambda cfg: 10_000)
+    seen = []
+    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: seen.append(since) or [])
+    orchestrator.run_once(tmp_cfg, recent=500)
+    assert seen == [5000]

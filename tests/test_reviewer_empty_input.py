@@ -73,3 +73,14 @@ def test_rendered_code_still_goes_to_llm():
     v, be = _review(Diff("p", "1.0.1", False, [fd], []), _OVERSIZED)
     assert be.calls == 1
     assert v.classification == "benign"
+
+
+def test_a_zero_cap_is_honoured_not_replaced_by_the_default():
+    # Final review: `cap or max_input_chars` turned the guard's cap of 0 into 200,000 chars.
+    fd = FileDiff("setup.py", "modified", [Hunk((0, 1), (0, 1), ["exec(x)"], [])])
+    tr = TriageResult(40.0, [FiredRule("primitives", 40.0, "setup.py", (1, 1))], True)
+    try:
+        reviewer.Reviewer(Config(), backend=_FakeBackend()).prepare(Diff("p", "1.0.1", False, [fd], []), tr, cap=0)
+        raise AssertionError("expected InputTooLarge")
+    except reviewer.InputTooLarge as e:
+        assert e.cap == 0

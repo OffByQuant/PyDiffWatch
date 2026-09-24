@@ -78,8 +78,7 @@ def test_evidence_roundtrip(conn):
     rid = store.record_release(conn, "pkg", "3.0", 9, False, "2.0", "sdist")
     assert conn.execute("SELECT evidence FROM releases WHERE id=?", (rid,)).fetchone()[0] is None
     store.update_evidence(conn, rid, "--- file: setup.py (modified) ---\n+ os.system('id')")
-    assert conn.execute("SELECT evidence FROM releases WHERE id=?",
-                        (rid,)).fetchone()[0] == "--- file: setup.py (modified) ---\n+ os.system('id')"
+    assert store.get_evidence(conn, rid) == "--- file: setup.py (modified) ---\n+ os.system('id')"
 
 def test_migration_adds_evidence_column_idempotent(tmp_path):
     # A DB created before the evidence column existed (the production .sqlite) must gain it via ALTER
@@ -120,3 +119,23 @@ def test_record_verdict_inserts_and_is_idempotent_per_release(tmp_path):
     store.record_verdict(conn, rid, v2)
     rows = conn.execute("SELECT confidence, model FROM verdicts WHERE release_id=?", (rid,)).fetchall()
     assert len(rows) == 1 and rows[0]["model"] == "claude-opus-4-8" and rows[0]["confidence"] == 0.97
+
+
+def test_the_one_time_refusal_migration_tolerates_a_concurrent_process_that_ran_it_first(tmp_path):
+    # Two processes can both see the meta marker missing; the second one's INSERT must not fail its startup.
+    cfg = Config(db_path=tmp_path / "db.sqlite")
+    conn = store.connect(cfg); store.init_schema(conn)          # the other process ran it and committed
+
+    class _SawNoMarker:                                        # this process checked just before that
+        def __init__(self, c):
+            self.c = c
+
+        def execute(self, sql, *a):
+            if "FROM meta WHERE key='unreviewed_refusals'" in sql:
+                return self.c.execute("SELECT 1 WHERE 0")
+            return self.c.execute(sql, *a)
+
+        def commit(self):
+            self.c.commit()
+    store.migrate_schema(_SawNoMarker(conn))
+    assert conn.execute("SELECT count(*) FROM meta WHERE key='unreviewed_refusals'").fetchone()[0] == 1

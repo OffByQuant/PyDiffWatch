@@ -91,10 +91,10 @@ def test_foreign_source_recorded():
                        "app/login.php": b"<?php echo 'hi'; ?>", "pkg/__init__.py": b"x=1\n"})
     files, binaries = fetcher.extract_sdist(blob, Config())
     assert "setup.py" in files and "pkg/__init__.py" in files     # python still extracted
-    assert "app/login.php" not in files                            # foreign bytes never read
+    assert "app/login.php" not in files                            # foreign source never parsed/analyzed
     rec = next(b for b in binaries if b["path"] == "app/login.php")
     assert rec["reason"] == "foreign-language-source" and rec["ext"] == ".php"
-    assert "sha256" not in rec                                     # presence is the signal; no content read
+    assert "sha256" in rec                                         # fingerprinted, so unchanged reposts don't re-fire
 
 def test_legitimate_cext_and_assets_not_foreign():
     blob = make_sdist({"setup.py": b"x=1\n", "_speedups.c": b"int main(){}\n",
@@ -110,10 +110,14 @@ def test_foreign_case_insensitive_and_double_extension():
     assert foreign == {"A.PHP", "setup.py.php"}
 
 def test_foreign_per_package_cap():
+    # Extraction hashes every foreign file (so unchanged ones can be dropped vs the prior release); the cap
+    # applies afterwards, to what is reported (tests/test_unchanged_binaries.py).
     members = {"setup.py": b"x=1\n"} | {f"x{i}.php": b"<?php ?>" for i in range(30)}
     blob = make_sdist(members)
     _, binaries = fetcher.extract_sdist(blob, Config(max_foreign_files=25))
-    assert sum(1 for b in binaries if b.get("reason") == "foreign-language-source") == 25
+    assert sum(1 for b in binaries if b.get("reason") == "foreign-language-source") == 30
+    capped = fetcher._cap_foreign(binaries, Config(max_foreign_files=25))
+    assert sum(1 for b in capped if b.get("reason") == "foreign-language-source") == 25
 
 
 # ---- fetch_artifacts: PyPI-baseline resolution + new-package policy ----
@@ -166,10 +170,10 @@ def test_predecessor_ignores_yanked_and_wheel_only(monkeypatch):
     assert art.prior_version == "1.0"                      # skipped yanked 1.1 and wheel-only 1.2
 
 
-def test_no_sdist_returns_none(monkeypatch):
+def test_no_sdist_returns_no_sdist(monkeypatch):
     monkeypatch.setattr(fetcher, "_package_json", lambda p, cfg: _meta("wheelpkg", [
         ("1.0", "2026-01-01T00:00:00Z", False)]))          # wheel-only release
-    assert fetcher.fetch_artifacts(Config(), NewRelease("wheelpkg", "1.0", 5)) is None
+    assert fetcher.fetch_artifacts(Config(), NewRelease("wheelpkg", "1.0", 5)) == fetcher.NoSdist(None)
 
 
 def test_fetch_captures_maintainer_metadata(monkeypatch):
@@ -219,3 +223,14 @@ def test_fetch_no_dep_findings_when_new_version_declares_none(monkeypatch):
     monkeypatch.setattr(fetcher, "_download", lambda url, cfg: blobs[url])
     art = fetcher.fetch_artifacts(Config(), NewRelease("acme", "1.1", 9))
     assert art.added_dep_findings == []
+
+
+def test_extracts_pth_and_entry_points_and_top_level():
+    blob = make_sdist({"setup.py": b"import os\n",
+                       "evil.pth": b"import os;os.system('id')\n",
+                       "pkg.egg-info/entry_points.txt": b"[console_scripts]\nfoo=pkg:main\n",
+                       "pkg.egg-info/top_level.txt": b"pkg\n"})
+    files, _ = fetcher.extract_sdist(blob, Config())
+    assert "evil.pth" in files
+    assert "pkg.egg-info/entry_points.txt" in files
+    assert "pkg.egg-info/top_level.txt" in files

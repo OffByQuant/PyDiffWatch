@@ -1,3 +1,7 @@
+import ast
+
+import pytest
+
 from pydiffwatch.facts import build_facts
 from pydiffwatch.models import Diff, FileDiff, Hunk
 
@@ -84,3 +88,176 @@ def test_maintainer_changed():
     ctx = {"current": {"roles": ["a", "b"]}, "prior": {"roles": ["a"]}}
     assert build_facts(d, ctx).maintainer_changed is True
     assert build_facts(d, {"current": {"roles": ["a"]}, "prior": {"roles": ["a"]}}).maintainer_changed is False
+
+
+def test_source_that_crashes_the_parser_is_unparseable_not_a_crash():
+    # Final review: ast.parse raises RecursionError on a long attribute chain (~400 KB, under the source cap),
+    # which escaped the SyntaxError handler and failed the release deterministically, pinning the cursor.
+    f = build_facts(_wholefile("m/x.py", "a" + ".b" * 200_000)).files[0]
+    assert f.syntax_error is True
+
+
+def test_parser_memory_and_value_errors_are_unparseable(monkeypatch):
+    from pydiffwatch import facts
+    for exc in (MemoryError(), ValueError("source code string cannot contain null bytes")):
+        def boom(*a, exc=exc, **k):
+            raise exc
+        monkeypatch.setattr(facts.ast, "parse", boom)
+        assert build_facts(_wholefile("m/x.py", "x = 1")).files[0].syntax_error is True
+
+
+def test_post_parse_recursion_crash_marks_unparseable_not_a_crash():
+    # ast.parse succeeds on a wide (not deep) expression, but the old recursive
+    # _calls_outside_funcs walk blew the recursion limit on it -> RecursionError escaped build_facts.
+    src = "x = " + "+".join(["1"] * 5000)
+    f = build_facts(_wholefile("m/__init__.py", src)).files[0]
+    assert f.syntax_error is True
+
+
+def test_post_parse_recursion_crash_marks_unparseable_non_init_file():
+    src = "x = " + "+".join(["1"] * 5000)
+    f = build_facts(_wholefile("pkg/util.py", src)).files[0]
+    assert f.syntax_error is True
+
+
+def test_generated_shape_under_depth_cap_is_not_flagged():
+    # A ~300-term chain (generated-code shape, e.g. a wide string-builder) is well under _MAX_AST_DEPTH
+    # and must not be treated as suspicious on depth alone.
+    src = "x = " + "+".join(["1"] * 300)
+    f = build_facts(_wholefile("pkg/util.py", src)).files[0]
+    assert f.syntax_error is False
+
+
+def test_depth_flag_is_additive_not_a_replacement_for_scanning():
+    # CRITICAL fix: the depth check must never short-circuit the actual extraction. A file with both a
+    # real decode->exec loader AND a deep pad must still report the loader's categories/names -- the
+    # depth flag only adds syntax_error=True, it does not empty out everything else.
+    pad = "+".join(["1"] * 5000)
+    src = f"import base64\npad = {pad}\nexec(base64.b64decode(d))\n"
+    f = build_facts(_wholefile("pkg/util.py", src)).files[0]
+    assert f.syntax_error is True
+    assert "exec" in f.bound_categories and "decode" in f.bound_categories
+
+
+def test_importtime_call_ids_iterative_matches_recursive_on_normal_code():
+    # Equivalence check for the iterative rewrite: nested functions, a class, and top-level calls.
+    from pydiffwatch.facts import _importtime_call_ids
+
+    _FUNC_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+    def _calls_outside_funcs_recursive(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, _FUNC_NODES):
+                continue
+            if isinstance(child, ast.Call):
+                yield child
+            yield from _calls_outside_funcs_recursive(child)
+
+    def _importtime_call_ids_recursive(tree):
+        module_funcs = {n.name: n for n in tree.body
+                        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        importtime = list(_calls_outside_funcs_recursive(tree))
+        ids = {id(c) for c in importtime}
+        for c in importtime:
+            f = c.func
+            if isinstance(f, ast.Name) and f.id in module_funcs:
+                for sub in ast.walk(module_funcs[f.id]):
+                    if isinstance(sub, ast.Call):
+                        ids.add(id(sub))
+        return ids
+
+    src = (
+        "import os\n"
+        "top_level_call()\n"
+        "def helper():\n"
+        "    inner_call()\n"
+        "    def nested():\n"
+        "        deep_call()\n"
+        "    return nested\n"
+        "class C:\n"
+        "    class_body_call()\n"
+        "    def method(self):\n"
+        "        method_call()\n"
+        "lam = lambda: lambda_call()\n"
+        "helper()\n"
+    )
+    tree_a = ast.parse(src)
+    tree_b = ast.parse(src)
+    # Compare by (lineno, col_offset, func-name-ish) since id() differs between the two trees.
+    def _signature(tree, ids):
+        sigs = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and id(node) in ids:
+                f = node.func
+                name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+                sigs.add((node.lineno, node.col_offset, name))
+        return sigs
+
+    expected = _signature(tree_a, _importtime_call_ids_recursive(tree_a))
+    actual = _signature(tree_b, _importtime_call_ids(tree_b))
+    assert actual == expected
+    assert expected == {
+        (2, 0, "top_level_call"),
+        (4, 4, "inner_call"), (6, 8, "deep_call"),     # pulled in by the one-hop expansion of helper()
+        (9, 4, "class_body_call"),
+        (13, 0, "helper"),                             # lambda body itself is never walked (not module_funcs)
+    }
+
+
+def test_pth_import_line_yields_process_autoexec():
+    d = _codediff("evil.pth", ["import os;os.system('id')"])
+    f = build_facts(d).files[0]
+    assert "process" in f.autoexec_categories
+    assert f.location_weight == 3.0
+
+
+def test_pth_path_only_lines_yield_nothing():
+    d = _codediff("normal.pth", ["../site-packages", "/opt/pkg/lib"])
+    f = build_facts(d).files[0]
+    assert f.bound_categories == frozenset() and f.autoexec_categories == frozenset()
+
+
+def test_pth_deep_import_line_does_not_crash():
+    pad = "+".join(["1"] * 5000)
+    d = _codediff("evil.pth", [f"import os;os.system('id' + str({pad}))"])
+    f = build_facts(d).files[0]   # must not raise (RecursionError guarded)
+    assert "process" in f.autoexec_categories
+
+
+def test_pth_bom_prefixed_import_line_yields_process_autoexec():
+    from pydiffwatch.models import Diff, FileDiff, Hunk
+    added = ["import os;os.system('id')"]
+    new_text = "﻿" + "\n".join(added)
+    d = Diff("p", "1.1", False, [FileDiff("evil.pth", "added",
+        [Hunk((0, 0), (0, 1), added, [])], new_text)], [])
+    f = build_facts(d).files[0]
+    assert "process" in f.autoexec_categories
+
+
+def test_pth_invalid_utf8_later_on_import_line_does_not_crash():
+    from pydiffwatch.models import Diff, FileDiff, Hunk
+    new_text = "import os;os.system('id�')"   # replacement char, as errors=\"replace\" decode would yield
+    added = [new_text]
+    d = Diff("p", "1.1", False, [FileDiff("evil.pth", "added",
+        [Hunk((0, 0), (0, 1), added, [])], new_text)], [])
+    f = build_facts(d).files[0]   # must not raise
+    assert "process" in f.autoexec_categories
+
+
+@pytest.mark.parametrize("full", [
+    "import os\n\n@deco(os.system('x'))\ndef f():\n    pass\n",                     # decorator argument
+    "import os\n\ndef f(x=os.system('y')):\n    pass\n",                          # default argument
+    "import os\n\ndef f(*, x=os.system('y')):\n    pass\n",                       # keyword-only default
+    "import os\n\ndef f(x: os.system('y')):\n    pass\n",                         # argument annotation
+    "import os\n\ndef f() -> os.system('y'):\n    pass\n",                        # return annotation
+    "import os\n\ng = lambda x=os.system('y'): x\n",                             # lambda default
+])
+def test_a_call_in_a_function_header_runs_at_import_time(full):
+    # Decorators, defaults and annotations are evaluated when the `def` runs, i.e. at import; only the body waits.
+    f = build_facts(_wholefile("pkg/__init__.py", full)).files[0]
+    assert "process" in f.autoexec_categories
+
+
+def test_a_call_in_a_function_body_still_does_not_run_at_import_time():
+    full = "import os\n\n@staticmethod\ndef f(x=1) -> int:\n    os.system('y')\n"
+    assert "process" not in build_facts(_wholefile("pkg/__init__.py", full)).files[0].autoexec_categories

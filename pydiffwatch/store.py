@@ -16,6 +16,10 @@ CREATE TABLE IF NOT EXISTS verdicts(id INTEGER PRIMARY KEY,
   release_id INTEGER UNIQUE, classification TEXT, confidence REAL,
   attack_type TEXT, reasoning TEXT, cited_hunk TEXT, model TEXT, urgent INTEGER,
   created_at TEXT, human_label TEXT, human_note TEXT, adjudicated_at TEXT);
+CREATE TABLE IF NOT EXISTS reviewer_stats(endpoint TEXT, model TEXT, tok_s REAL, chars_per_token REAL,
+  samples INTEGER, state TEXT, detail TEXT, paused_until REAL, slow_streak INTEGER, updated_at TEXT,
+  PRIMARY KEY(endpoint, model));
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 """
 
 def _now(): return datetime.datetime.now(datetime.UTC).isoformat()
@@ -41,11 +45,33 @@ def migrate_schema(conn):
     except sqlite3.OperationalError:
         conn.execute("ALTER TABLE releases ADD COLUMN evidence TEXT"); conn.commit()
     for col, typ in (("review_attempts", "INTEGER DEFAULT 0"), ("pending_reason", "TEXT"),
-                     ("pending_detail", "TEXT"), ("review_input", "BLOB")):
+                     ("pending_detail", "TEXT"), ("review_input", "BLOB"),
+                     ("fetch_attempts", "INTEGER DEFAULT 0"), ("fetch_note", "TEXT"), ("recheck_at", "REAL")):
         try:
             conn.execute(f"SELECT {col} FROM releases LIMIT 1")
         except sqlite3.OperationalError:
             conn.execute(f"ALTER TABLE releases ADD COLUMN {col} {typ}"); conn.commit()
+    try:
+        conn.execute("SELECT review_input_chars FROM releases LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE releases ADD COLUMN review_input_chars INTEGER")
+        for rid, blob in conn.execute("SELECT id, review_input FROM releases "
+                                      "WHERE review_input IS NOT NULL").fetchall():
+            conn.execute("UPDATE releases SET review_input_chars=? WHERE id=?",
+                         (len(zlib.decompress(blob).decode()), rid))
+        conn.commit()
+    if conn.execute("SELECT 1 FROM meta WHERE key='unreviewed_refusals'").fetchone() is None:
+        # Refused releases recorded before refusals were queued have no verdict, so `pending` never showed
+        # them. Give each the UNREVIEWED verdict once; a row that already has a verdict is left alone.
+        conn.execute("INSERT INTO verdicts(release_id, classification, confidence, attack_type, reasoning, "
+                     "cited_hunk, model, urgent, created_at) "
+                     "SELECT r.id, 'suspicious', 0.0, 'none', ?, '', 'none', 0, ? FROM releases r "
+                     "WHERE r.stage IN ('refused_to_extract', 'refused_to_fetch') "
+                     "AND NOT EXISTS (SELECT 1 FROM verdicts v WHERE v.release_id = r.id)",
+                     ("UNREVIEWED: pydiffwatch refused to download or unpack it, recorded before refusals were "
+                      "queued for review, so the reason was not kept. Not scanned. Needs manual review.", _now()))
+        conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('unreviewed_refusals', ?)", (_now(),))
+        conn.commit()
 
 def get_last_serial(conn) -> int:
     return conn.execute("SELECT last_serial FROM cursor WHERE id=1").fetchone()[0]
@@ -83,15 +109,80 @@ def update_release_metadata(conn, release_id, maintainer_metadata_json):
 def update_evidence(conn, release_id, evidence_text):
     """Persist the flagged payload code (rendered diff TEXT) for a release. Stored INERT — never
     written to an executable path, never run (§0 containment). Self-contained evidence for a PyPI
-    takedown report that survives a device move and the package being pulled from PyPI."""
-    conn.execute("UPDATE releases SET evidence=? WHERE id=?", (evidence_text, release_id))
+    takedown report that survives a device move and the package being pulled from PyPI. Compressed."""
+    conn.execute("UPDATE releases SET evidence=? WHERE id=?", (zlib.compress(evidence_text.encode()), release_id))
     conn.commit()
+
+# A release a person has adjudicated is theirs: no drain re-reviews it, and a later model verdict never drops its
+# evidence.
+_UNLABELLED = "NOT EXISTS(SELECT 1 FROM verdicts v WHERE v.release_id = releases.id AND v.human_label IS NOT NULL)"
+
+def clear_evidence(conn, release_id):
+    conn.execute(f"UPDATE releases SET evidence=NULL WHERE id=? AND {_UNLABELLED}", (release_id,))
+    conn.commit()
+
+def evidence_text(value):
+    """Stored evidence as text: compressed bytes, or plain text written by older versions."""
+    if value is None or isinstance(value, str):
+        return value
+    return zlib.decompress(value).decode()
 
 def get_evidence(conn, release_id):
     """The stored flagged payload code for a release (TEXT), or None if absent. Read-only accessor for
     `diffwatch evidence <release_id>` — works for any release, not just the adjudication queue."""
     row = conn.execute("SELECT evidence FROM releases WHERE id=?", (release_id,)).fetchone()
-    return row[0] if row else None
+    return evidence_text(row[0]) if row else None
+
+def prune(conn, retention_days: int = 0):
+    """Shrink the database, keeping everything a person may act on (verdicts, alerts, the review queues and
+    their evidence):
+    - drop evidence nobody needs: releases reviewed benign, and releases below the review threshold;
+    - compress the remaining evidence stored as plain text by older versions;
+    - with retention_days > 0, delete plain release rows older than that (no verdict, no alert, not in an
+      actionable stage), except each package's newest release, and its newest release carrying maintainer
+      metadata, which get_release_metadata reads as the next release's maintainer baseline;
+    then compact the file."""
+    # needs_adjudication is excluded even when the stored verdict says 'benign': spec U2 routes a
+    # partially-reviewed benign verdict there for a person to look at, and that person may act on it.
+    conn.execute("UPDATE releases SET evidence=NULL WHERE evidence IS NOT NULL AND stage != 'needs_adjudication' "
+                 "AND (stage='triaged' OR id IN "
+                 "(SELECT release_id FROM verdicts WHERE classification='benign' "
+                 "AND COALESCE(human_label,'benign')='benign'))")
+    last = 0    # compress in id-keyed batches, so a large legacy database is never held in memory at once
+    while rows := conn.execute("SELECT id, evidence FROM releases WHERE typeof(evidence)='text' AND id > ? "
+                               "ORDER BY id LIMIT 500", (last,)).fetchall():
+        for rid, text in rows:
+            conn.execute("UPDATE releases SET evidence=? WHERE id=?", (zlib.compress(text.encode()), rid))
+        conn.commit()
+        last = rows[-1][0]
+    if retention_days > 0:
+        cutoff = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=retention_days)).isoformat()
+        # Kept stages a person may still act on: the adjudication queue, refused (never-scanned) releases, the
+        # LLM-review queue, and metadata downloads still retrying or given up on (both shown by `pending`).
+        # Partitioning by (package, has metadata) keeps the newest row overall and the newest with metadata:
+        # PyPI's predecessor skips versions without an sdist, which have no maintainer metadata.
+        conn.execute("DELETE FROM releases WHERE processed_at < ? "
+                     "AND stage NOT IN ('pending_review','needs_adjudication','refused_to_extract',"
+                     "'refused_to_fetch','metadata_retry','gave_up','no_sdist_wait') "
+                     "AND id NOT IN (SELECT release_id FROM verdicts WHERE release_id IS NOT NULL) "
+                     "AND id NOT IN (SELECT release_id FROM alerts WHERE release_id IS NOT NULL) "
+                     "AND id NOT IN (SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY package, "
+                     "maintainer_metadata IS NULL ORDER BY processed_at DESC, id DESC) AS n FROM releases) "
+                     "WHERE n = 1)", (cutoff,))
+    conn.commit()
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.execute("VACUUM")
+
+def maybe_prune(conn, retention_days: int, every_s: float, now: float) -> bool:
+    """prune() if the last one (recorded in the database, so cron-driven `run` counts too) is every_s old."""
+    row = conn.execute("SELECT value FROM meta WHERE key='last_prune'").fetchone()
+    if row and now - float(row[0]) < every_s:
+        return False
+    prune(conn, retention_days)
+    conn.execute("INSERT INTO meta(key, value) VALUES('last_prune', ?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(now),))
+    conn.commit()
+    return True
 
 def releases_needing_evidence(conn, release_id=None, all_flagged=False):
     """Flagged releases whose payload was never captured (evidence IS NULL) — the backfill target set.
@@ -133,30 +224,149 @@ def park_for_review(conn, release_id, reason, detail, review_input):
     """Queue a flagged release for a later LLM review. The review input is kept (compressed) so the
     review doesn't depend on PyPI still hosting the sdist; it is dropped once a verdict lands."""
     conn.execute("UPDATE releases SET stage='pending_review', pending_reason=?, pending_detail=?, "
-                 "review_input=? WHERE id=?",
-                 (reason, detail, zlib.compress(review_input.encode()), release_id))
+                 "review_input=?, review_input_chars=? WHERE id=?",
+                 (reason, detail, zlib.compress(review_input.encode()), len(review_input), release_id))
+    conn.commit()
+
+def set_pending_reason(conn, release_id, reason, detail):
+    """Re-park a pending_review row under a new reason, keeping its stored review input."""
+    conn.execute("UPDATE releases SET stage='pending_review', pending_reason=?, pending_detail=? WHERE id=?",
+                 (reason, detail, release_id))
     conn.commit()
 
 def clear_pending(conn, release_id):
-    conn.execute("UPDATE releases SET pending_reason=NULL, pending_detail=NULL, review_input=NULL WHERE id=?",
+    conn.execute("UPDATE releases SET pending_reason=NULL, pending_detail=NULL, review_input=NULL, "
+                 "review_input_chars=NULL WHERE id=?",
                  (release_id,))
     conn.commit()
 
-def pending_reviews(conn, reasons=None):
+def pending_reviews(conn, reasons=None, max_chars=None, over_chars=None, without_verdict=False,
+                    max_attempts=None, with_input=True):
+    """Rows parked for review and not labelled by a person, optionally only those with `reasons`, input at most
+    `max_chars` or over `over_chars`, or `without_verdict` (never given the UNREVIEWED verdict). With
+    `max_attempts`, a review_failed row with that many attempts that has already warned (has a verdict) is left
+    out: the auto-drain never retries it. `with_input=False` leaves the stored input out (review_input(row, conn)
+    loads it). `has_verdict` says whether a row has a verdict; `review_input_chars` is the input's length."""
     sql = ("SELECT id AS release_id, package, version, triage_score, triage_rules, pending_reason, "
-           "pending_detail, COALESCE(review_attempts,0) AS review_attempts, review_input "
-           "FROM releases WHERE stage='pending_review'")
+           "pending_detail, COALESCE(review_attempts,0) AS review_attempts, review_input_chars, "
+           + ("review_input, " if with_input else "") +
+           "EXISTS(SELECT 1 FROM verdicts v WHERE v.release_id = releases.id) AS has_verdict "
+           f"FROM releases WHERE stage='pending_review' AND {_UNLABELLED}")
     params = list(reasons or [])
     if params:
         sql += f" AND pending_reason IN ({','.join('?' * len(params))})"
+    if max_attempts is not None:
+        sql += (" AND NOT (pending_reason='review_failed' AND COALESCE(review_attempts,0) >= ? "
+                "AND EXISTS(SELECT 1 FROM verdicts v WHERE v.release_id = releases.id))")
+        params.append(max_attempts)
+    if max_chars is not None:
+        sql += " AND review_input_chars <= ?"
+        params.append(max_chars)
+    if over_chars is not None:
+        sql += " AND review_input_chars > ?"
+        params.append(over_chars)
+    if without_verdict:
+        sql += " AND NOT EXISTS(SELECT 1 FROM verdicts v WHERE v.release_id = releases.id)"
     return conn.execute(sql + " ORDER BY id", params).fetchall()
 
-def review_input(row) -> str:
-    return zlib.decompress(row["review_input"]).decode()
+def review_input(row, conn=None) -> str:
+    """A parked row's stored review input; read from `conn` when the row was selected without it."""
+    blob = row["review_input"] if "review_input" in row.keys() else \
+        conn.execute("SELECT review_input FROM releases WHERE id=?", (row["release_id"],)).fetchone()[0]
+    return zlib.decompress(blob).decode()
+
+METADATA_ATTEMPTS = 4    # failed attempts (metadata, sdist download, or diff/triage) before a release is given up on
+
+
+def note_metadata_failure(conn, release_id, detail) -> str:
+    """Count a failed attempt at a release (its metadata or sdist download, or its diff/triage); the release
+    waits in `metadata_retry` (retried each tick, off the cursor) until it has failed METADATA_ATTEMPTS times,
+    then `gave_up`. `detail` (the error) is kept in fetch_note. Returns the new stage."""
+    conn.execute("UPDATE releases SET fetch_attempts=COALESCE(fetch_attempts,0)+1, fetch_note=? WHERE id=?",
+                 (detail, release_id))
+    n = conn.execute("SELECT fetch_attempts FROM releases WHERE id=?", (release_id,)).fetchone()[0]
+    stage = "gave_up" if n >= METADATA_ATTEMPTS else "metadata_retry"
+    conn.execute("UPDATE releases SET stage=? WHERE id=?", (stage, release_id))
+    conn.commit()
+    return stage
+
+def clear_fetch_failures(conn, release_id, note=None):
+    """A fetch (and scan) succeeded: earlier failures no longer count toward the give-up, and their error is
+    replaced by `note` (e.g. a failed prior sdist download) or cleared."""
+    conn.execute("UPDATE releases SET fetch_attempts=0, fetch_note=? WHERE id=?", (note, release_id))
+    conn.commit()
+
+def fetch_attempts(conn, release_id) -> int:
+    return conn.execute("SELECT fetch_attempts FROM releases WHERE id=?", (release_id,)).fetchone()[0] or 0
+
+def set_fetch_note(conn, release_id, note):
+    conn.execute("UPDATE releases SET fetch_note=? WHERE id=?", (note, release_id))
+    conn.commit()
+
+def metadata_retries_due(conn, limit=20, now=None):
+    """Releases to re-fetch off the cursor: wheel-only ones whose wait for a late sdist (no_sdist_wait) is over
+    by `now` (epoch seconds; default: now), soonest due first, then failed ones (metadata_retry), most-tried
+    first: a row once retried reaches gave_up within METADATA_ATTEMPTS tries, even under a steady inflow of new
+    failures and a sweep cut short by its time budget. Each kind gets its own `limit`,
+    so a backlog of failing retries can't starve a due re-check."""
+    now = datetime.datetime.now(datetime.UTC).timestamp() if now is None else now
+    waits = conn.execute("SELECT package, version, serial, fetch_attempts FROM releases WHERE stage='no_sdist_wait' "
+                         "AND recheck_at <= ? ORDER BY recheck_at, serial LIMIT ?", (now, limit)).fetchall()
+    return waits + conn.execute("SELECT package, version, serial, fetch_attempts FROM releases "
+                                "WHERE stage='metadata_retry' ORDER BY COALESCE(fetch_attempts,0) DESC, serial LIMIT ?",
+                                (limit,)).fetchall()
+
+def wait_for_sdist(conn, release_id, recheck_at):
+    """Park a wheel-only release off the cursor until `recheck_at` (epoch seconds), when it is re-fetched."""
+    conn.execute("UPDATE releases SET stage='no_sdist_wait', recheck_at=? WHERE id=?", (recheck_at, release_id))
+    conn.commit()
+
+def recheck_at(conn, release_id):
+    return conn.execute("SELECT recheck_at FROM releases WHERE id=?", (release_id,)).fetchone()[0]
+
+# Stages a release reaches only after its sdist was downloaded, or refused for its size: the store's own evidence
+# that a package shipped one. refused_to_fetch also covers a quarantine refusal and an over-size package JSON,
+# which prove no sdist; counting them errs toward a switch warning, never toward silence.
+SDIST_STAGES = ("triaged", "alerted", "reviewed", "needs_adjudication", "pending_review", "new_package_skipped",
+                "refused_to_extract", "refused_to_fetch")
+
+def previous_sdist_release(conn, package, version):
+    """The package's most recent release recorded before this (recorded) one, if it reached an sdist-scanned
+    stage. It catches a switch the PyPI JSON hides: the owner deleted that sdist after we scanned it."""
+    row = conn.execute("SELECT version, stage FROM releases WHERE package=:p AND version != :v AND serial < "
+                       "(SELECT serial FROM releases WHERE package=:p AND version=:v) "
+                       "ORDER BY serial DESC, id DESC LIMIT 1", {"p": package, "v": version}).fetchone()
+    return row[0] if row and row[1] in SDIST_STAGES else None
+
+def metadata_retry_counts(conn) -> dict:
+    r = conn.execute("SELECT COALESCE(SUM(stage='metadata_retry'),0), COALESCE(SUM(stage='gave_up'),0) "
+                     "FROM releases").fetchone()
+    return {"retrying": r[0], "gave_up": r[1]}
+
+def oldest_retrying_at(conn):
+    """When the longest-waiting release in metadata_retry was first seen (ISO time), or None."""
+    return conn.execute("SELECT MIN(processed_at) FROM releases WHERE stage='metadata_retry'").fetchone()[0]
+
+def get_reviewer_stats(conn, endpoint, model):
+    row = conn.execute("SELECT tok_s, chars_per_token, samples, state, detail, paused_until, slow_streak "
+                       "FROM reviewer_stats WHERE endpoint=? AND model=?", (endpoint, model)).fetchone()
+    return dict(row) if row else None
+
+def save_reviewer_stats(conn, endpoint, model, *, tok_s, chars_per_token, samples, state, detail,
+                        paused_until, slow_streak):
+    conn.execute("""INSERT INTO reviewer_stats(endpoint, model, tok_s, chars_per_token, samples, state, detail,
+                        paused_until, slow_streak, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(endpoint, model) DO UPDATE SET tok_s=excluded.tok_s,
+                        chars_per_token=excluded.chars_per_token, samples=excluded.samples,
+                        state=excluded.state, detail=excluded.detail, paused_until=excluded.paused_until,
+                        slow_streak=excluded.slow_streak, updated_at=excluded.updated_at""",
+                 (endpoint, model, tok_s, chars_per_token, samples, state, detail, paused_until,
+                  slow_streak, _now()))
+    conn.commit()
 
 def pending_review_counts(conn) -> dict:
     return dict(conn.execute("SELECT pending_reason, count(*) FROM releases WHERE stage='pending_review' "
-                             "GROUP BY pending_reason").fetchall())
+                             f"AND {_UNLABELLED} GROUP BY pending_reason").fetchall())
 
 def update_stage(conn, release_id, stage, score=None, rules=None):
     sets = ["stage=?"]; params = [stage]
@@ -192,21 +402,37 @@ def record_verdict(conn, release_id, verdict) -> int:
     conn.commit()
     return conn.execute("SELECT id FROM verdicts WHERE release_id=?", (release_id,)).fetchone()[0]
 
+def clear_unscanned_verdict(conn, release_id):
+    """Drop a release's UNREVIEWED verdict (model 'none'), e.g. the wheel-only switch warning once its sdist
+    arrives and it is re-scanned. A model verdict, or one a person has labelled, is kept."""
+    conn.execute("DELETE FROM verdicts WHERE release_id=? AND model='none' AND human_label IS NULL", (release_id,))
+    conn.commit()
+
 def get_stage(conn, package, version):
     row = conn.execute("SELECT stage FROM releases WHERE package=? AND version=?",
                        (package, version)).fetchone()
     return row[0] if row else None
 
+# Stages at which a release can be left unscanned. Carrying the UNREVIEWED verdict (model 'none'), such a
+# release waits in `pending`, which labels it `(not scanned: <stage>)`; for pending_review the label is the
+# pending_reason (too_large, review_failed).
+UNSCANNED_STAGES = ("refused_to_extract", "refused_to_fetch", "gave_up", "pending_review", "no_sdist")
+
 def pending_adjudication(conn):
-    """Suspicious LLM verdicts queued for agent review (§8.1): stage 'needs_adjudication' and not yet
-    labelled. Joined with the release so the caller can re-fetch the diff."""
-    return conn.execute(
-        """SELECT r.id AS release_id, r.package, r.version, r.serial, r.triage_score, r.triage_rules,
-                  r.evidence,
+    """Releases queued for agent review (§8.1), not yet labelled: suspicious LLM verdicts
+    ('needs_adjudication'), and releases left unscanned with the UNREVIEWED verdict (refused, given up on, or
+    parked for review with the model unable to review it). Joined with the release so the caller can re-fetch
+    the diff."""
+    # The f-string only inserts `?` placeholders; the stages are bound params (sqlite3, not SQLAlchemy).
+    return conn.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+        f"""SELECT r.id AS release_id, r.package, r.version, r.serial, r.triage_score, r.triage_rules,
+                  r.evidence, r.stage, r.pending_reason,
                   v.classification, v.confidence, v.attack_type, v.reasoning, v.cited_hunk, v.model
            FROM releases r JOIN verdicts v ON v.release_id = r.id
-           WHERE r.stage = 'needs_adjudication' AND v.human_label IS NULL
-           ORDER BY r.id""").fetchall()
+           WHERE (r.stage = 'needs_adjudication'
+                  OR (r.stage IN ({','.join('?' * len(UNSCANNED_STAGES))}) AND v.model = 'none'))
+             AND v.human_label IS NULL
+           ORDER BY r.id""", UNSCANNED_STAGES).fetchall()
 
 def adjudicate(conn, release_id, label, note):
     """Record the agent's adjudication on a verdict; returns the release row (for alerting) or None."""
@@ -235,9 +461,9 @@ def count_releases(conn) -> int:
 def all_verdicts(conn):
     return conn.execute(
         """SELECT r.id AS release_id, r.package, r.version, r.prior_version,
-                  r.is_first_release, r.triage_score,
+                  r.is_first_release, r.triage_score, r.stage,
                   v.classification, v.confidence, v.attack_type, v.reasoning,
-                  v.cited_hunk, v.model, v.urgent, v.created_at, v.human_label
+                  v.cited_hunk, v.model, v.urgent, v.created_at, v.human_label, v.human_note
            FROM releases r JOIN verdicts v ON v.release_id = r.id
            ORDER BY CASE v.classification WHEN 'malicious' THEN 0
                     WHEN 'suspicious' THEN 1 ELSE 2 END, r.id DESC""").fetchall()

@@ -38,3 +38,15 @@ def test_escalation_renotifies_but_same_classification_dedupes(tmp_path):
     assert notifier.emit(cfg, c, heur, rid) is True            # first alert
     assert notifier.emit(cfg, c, llm, rid) is True             # escalation -> re-notify (diff classification)
     assert notifier.emit(cfg, c, llm, rid) is False            # exact repeat -> deduped
+
+
+def test_post_webhook_without_url_sends_nothing(monkeypatch):
+    monkeypatch.setattr(notifier.urllib.request, "urlopen", lambda *a, **k: (_ for _ in ()).throw(AssertionError))
+    assert notifier.post_webhook(Config(), "x") is False
+
+
+def test_post_webhook_never_raises(monkeypatch):
+    def boom(req, timeout=None):
+        raise OSError("down")
+    monkeypatch.setattr(notifier.urllib.request, "urlopen", boom)
+    assert notifier.post_webhook(Config(webhook_url="https://hooks.example.com/x"), "x") is False

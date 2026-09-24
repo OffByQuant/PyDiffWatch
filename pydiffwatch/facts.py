@@ -110,6 +110,24 @@ def _resolve_call(node, table) -> str | None:
 
 
 _FUNC_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+# At sys.getrecursionlimit()'s default (1000): hand-written code stays far below this (stdlib max
+# observed ~34); generated code can approach it (a 300-branch elif ladder is depth 304, a ~250-call
+# builder/ORM chain crosses 500, a 600-piece string concat is 601) without being malicious on its own,
+# so the flag is additive to whatever else was found, not a replacement for scanning it. A tree past
+# this depth (e.g. a 5,000-term "1+1+...+1" chain) is what used to RecursionError our Python-level
+# walkers even though ast.parse itself accepts it. Detected with an explicit stack -- no recursion, so
+# this check itself never crashes on the input it is guarding against.
+_MAX_AST_DEPTH = 1000
+
+
+def _ast_too_deep(tree) -> bool:
+    stack = [(tree, 0)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > _MAX_AST_DEPTH:
+            return True
+        stack.extend((child, depth + 1) for child in ast.iter_child_nodes(node))
+    return False
 
 
 def _importtime_call_ids(tree) -> set:
@@ -123,12 +141,24 @@ def _importtime_call_ids(tree) -> set:
                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
 
     def _calls_outside_funcs(node):
-        for child in ast.iter_child_nodes(node):
+        stack = list(ast.iter_child_nodes(node))      # explicit stack: no call-stack depth limit
+        while stack:
+            child = stack.pop()
             if isinstance(child, _FUNC_NODES):
-                continue                              # a function/lambda body runs on call, not at import
+                # Its body runs on call, not at import; its header runs with the `def`/`lambda`: decorators,
+                # defaults and annotations.
+                a = child.args
+                stack.extend(getattr(child, "decorator_list", ()))
+                stack.extend(a.defaults)
+                stack.extend(d for d in a.kw_defaults if d is not None)
+                stack.extend(x.annotation for x in (*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg)
+                             if x is not None and x.annotation is not None)
+                if getattr(child, "returns", None) is not None:
+                    stack.append(child.returns)
+                continue
             if isinstance(child, ast.Call):
                 yield child
-            yield from _calls_outside_funcs(child)
+            stack.extend(ast.iter_child_nodes(child))
 
     importtime = list(_calls_outside_funcs(tree))
     ids = {id(c) for c in importtime}
@@ -172,38 +202,91 @@ class DiffFacts:
     maintainer_changed: bool
 
 
+def _pth_facts(fd, lines, loc, added_lines, added_strs) -> FileFacts:
+    """CPython's `site` executes only the lines of a .pth file that start with `import` followed by a
+    space or tab; every other line is a path and never runs. Parse each such line ON ITS OWN (never the
+    whole file as Python) and feed it through the same call-resolution machinery as a .py file, so
+    autoexec_categories/bound_categories/combos see it. A parse failure or excessive depth on one line
+    is caught and skipped (never crashes), same guards as _file_facts.
+
+    site.addpackage decodes .pth bytes as "utf-8-sig", which strips a leading BOM; the shared differ
+    decoder does not, so a BOM survives into new_text as a leading U+FEFF on line 1. Strip it here (only
+    for .pth line selection) so a BOM-prefixed `import` line is still recognized, matching site."""
+    cats, autoexec_cats, names, modules = set(), set(), set(), set()
+    had_error = False
+    text = fd.new_text[1:] if fd.new_text.startswith("﻿") else fd.new_text
+    for i, raw in enumerate(text.splitlines(), start=1):
+        if i not in added_lines:
+            continue
+        line = raw.rstrip()
+        if not (line.startswith("import ") or line.startswith("import\t")):
+            continue
+        try:
+            tree = ast.parse(line)
+        except (SyntaxError, RecursionError, MemoryError, ValueError):
+            had_error = True
+            continue
+        if _ast_too_deep(tree):
+            had_error = True
+        try:
+            table = _build_import_table(tree)
+            importtime_ids = _importtime_call_ids(tree)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                cat = _resolve_call(node, table)
+                if cat:
+                    cats.add(cat)
+                    if id(node) in importtime_ids:
+                        autoexec_cats.add(cat)
+                    f = node.func
+                    names.add(f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", ""))
+            modules.update(table.values())
+        except (RecursionError, MemoryError):
+            had_error = True
+    return FileFacts(fd.path, lines, loc, frozenset(cats), frozenset(autoexec_cats), frozenset(names),
+                     frozenset(modules), _blob_present(added_strs), had_error, added_strs)
+
+
 def _file_facts(fd) -> FileFacts:
     added_strs = tuple(ln for h in fd.hunks for ln in h.added)
     added_lines = {j + 1 for h in fd.hunks for j in range(h.new_range[0], h.new_range[1])}
     lines = (fd.hunks[0].new_range[0] + 1, fd.hunks[-1].new_range[1])
     loc = classify_location(fd.path)
+    if fd.new_text is not None and fd.path.endswith(".pth"):
+        return _pth_facts(fd, lines, loc, added_lines, added_strs)
     if fd.new_text is None or not fd.path.endswith((".py", ".pyx", ".pyi")):
         return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, False, added_strs)
     try:
         tree = ast.parse(fd.new_text)
-    except SyntaxError:
+    except (SyntaxError, RecursionError, MemoryError, ValueError):   # deep nesting crashes the parser itself
         return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, True, added_strs)
-    table = _build_import_table(tree)
-    importtime_ids = _importtime_call_ids(tree)
-    cats, autoexec_cats, names = set(), set(), set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        lo = getattr(node, "lineno", None)
-        if lo is None:
-            continue
-        hi = getattr(node, "end_lineno", None) or lo
-        if added_lines.isdisjoint(range(lo, hi + 1)):
-            continue
-        cat = _resolve_call(node, table)
-        if cat:
-            cats.add(cat)
-            if id(node) in importtime_ids:
-                autoexec_cats.add(cat)
-            f = node.func
-            names.add(f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", ""))
+    too_deep = _ast_too_deep(tree)   # additive flag only -- every walk below is iterative, so it never
+                                      # excuses us from actually scanning a deep-but-otherwise-normal file
+    try:
+        table = _build_import_table(tree)
+        importtime_ids = _importtime_call_ids(tree)
+        cats, autoexec_cats, names = set(), set(), set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            lo = getattr(node, "lineno", None)
+            if lo is None:
+                continue
+            hi = getattr(node, "end_lineno", None) or lo
+            if added_lines.isdisjoint(range(lo, hi + 1)):
+                continue
+            cat = _resolve_call(node, table)
+            if cat:
+                cats.add(cat)
+                if id(node) in importtime_ids:
+                    autoexec_cats.add(cat)
+                f = node.func
+                names.add(f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", ""))
+    except (RecursionError, MemoryError):   # a parse that succeeds can still blow limits on post-parse walks
+        return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, True, added_strs)
     return FileFacts(fd.path, lines, loc, frozenset(cats), frozenset(autoexec_cats), frozenset(names),
-                     frozenset(table.values()), _blob_present(added_strs), False, added_strs)
+                     frozenset(table.values()), _blob_present(added_strs), too_deep, added_strs)
 
 
 def _normalize_binaries(added_binaries):

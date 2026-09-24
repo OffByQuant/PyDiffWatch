@@ -10,12 +10,14 @@ detection rules, see [RULES.md](RULES.md).
 3. [API keys](#3-api-keys)
 4. [Structured-output modes](#4-structured-output-modes)
 5. [The operating loop](#5-the-operating-loop)
-6. [Running on a harness](#6-running-on-a-harness-cron--systemd--docker--ci)
-7. [State, persistence & containment](#7-state-persistence--containment)
-8. [Alerts](#8-alerts)
-9. [Heuristic-only mode (no LLM)](#9-heuristic-only-mode-no-llm)
-10. [Troubleshooting](#10-troubleshooting)
-11. [Detection scope on brand-new packages](#11-detection-scope-on-brand-new-packages)
+6. [The dashboard & the `watch` daemon](#6-the-dashboard--the-watch-daemon)
+7. [Running on a harness](#7-running-on-a-harness-cron--systemd--docker--ci)
+8. [State, persistence & containment](#8-state-persistence--containment)
+9. [Alerts](#9-alerts)
+10. [Heuristic-only mode (no LLM)](#10-heuristic-only-mode-no-llm)
+11. [Troubleshooting](#11-troubleshooting)
+12. [Detection scope on brand-new packages](#12-detection-scope-on-brand-new-packages)
+13. [Known limit: wheel-only releases](#13-known-limit-wheel-only-releases)
 
 ---
 
@@ -133,6 +135,19 @@ structured_output = "json_schema"
 ```
 then `export ANTHROPIC_API_KEY=sk-ant-...` (see §3).
 
+**Model protection keys** (any provider; see §5 for what they do):
+
+```toml
+[reviewer]
+# Model protection (all optional; defaults shown)
+budget_safety = 0.6          # a review may be predicted to use at most this share of `timeout`
+probe_timeout = 180.0        # health probe / calibration timeout (covers llama-swap loading a model)
+slowdown_ratio = 0.3         # below this share of measured speed counts as slow
+degraded_pause_s = 900       # pause after two slow reviews in a row
+host_memory_guard = "auto"   # on for loopback endpoints; true / false to force
+max_swap_used_pct = 75
+```
+
 ---
 
 ## 3. API keys
@@ -192,8 +207,9 @@ pydiffwatch -c pydiffwatch.toml seed-now
 ```
 
 (You can skip this: a plain `run` on a fresh database self-seeds the cursor to "now" and processes
-nothing that tick, then the next tick polls forward. Use `run --backfill` to process historical releases
-from genesis instead.)
+nothing that tick, then the next tick polls forward. `run --recent N` (or `watch --recent N`) starts N PyPI
+changelog events back instead and scans them right away; one release is several events, so that is fewer
+than N releases. Use `run --backfill` to process historical releases from genesis instead.)
 
 **Each tick** — this is what your scheduler runs:
 
@@ -205,6 +221,25 @@ pydiffwatch -c pydiffwatch.toml run
 its prior version, scores it with the ruleset, and escalates anything ≥ `threshold_t` to the reviewer.
 Clear-malicious verdicts alert immediately; borderline "suspicious" ones queue for your judgement.
 
+**Downloads have deadlines.** Each sdist download is capped at `fetch_deadline_s` (120s total) and PyPI's
+JSON metadata at `packument_deadline_s` (300s total, since a big project lists every release ever
+published); metadata is also capped at `max_metadata_bytes` (64 MB). A metadata **404** means the release
+was pulled before it could be scanned — that's terminal (`metadata_gone`) and alerts on its own, since a
+release PyPI itself removed fast is worth a look. Any other failure on a release (a metadata timeout, 5xx
+or malformed JSON, a failed or timed-out sdist download, an error while diffing or scoring it) retries on
+later ticks without holding up the releases after it; after 4 attempts it becomes `gave_up` and shows up
+in `pending`, with the error kept on the release row (`fetch_note`). Each retry attempt gets that many
+times `fetch_deadline_s`/`packument_deadline_s` (attempt 2 gets 240s/600s, attempt 3 360s/900s, ...), and a
+pre-ingest sweep re-fetches releases due for retry, most-tried first, before a time budget of its own
+(`packument_deadline_s`) runs out — the rest wait for the next tick. `pending` and the dashboard's status
+strip show that backlog: `N release(s) being retried (oldest first seen <age>), M given up on` in `pending`,
+`N scan(s) retrying (oldest first seen <age>) · M scan(s) given up` on the dashboard. A retry backlog
+whose oldest row keeps getting older means PyPI (or your network) keeps failing it. If the
+release's *prior* version fails to download, it's diffed against nothing (every file in the new release
+reported as added) rather than skipped, and the release's evidence says so. Within a diff, an
+oversized/binary/foreign-language file only counts as a signal when this release adds or changes it — an
+unchanged one carried over release after release isn't re-flagged.
+
 **Triage the queue:**
 
 ```bash
@@ -215,13 +250,40 @@ pydiffwatch -c pydiffwatch.toml evidence <id>                # print the stored 
 
 `adjudicate` records `benign` | `malicious` | `suspicious`; a non-benign call emits an alert. `evidence`
 prints the payload code captured **at detection time** and stored in the DB, so it survives the package
-later being pulled from PyPI. To backfill evidence for older flagged rows captured before evidence storage
-existed:
+later being pulled from PyPI. A release pydiffwatch **refused** to download or unpack (over-size, a
+malformed archive) is never scanned, so it can't get a model verdict either — it lands in `pending` too,
+labelled `(not scanned: <stage>)` with an `UNREVIEWED` note explaining what happened and why, for you to
+inspect by hand — see §9 for the full list of unscanned outcomes and their exact wording. To backfill
+evidence for older flagged rows captured before evidence storage existed:
 
 ```bash
 pydiffwatch -c pydiffwatch.toml capture-evidence                 # all reportable rows missing evidence
 pydiffwatch -c pydiffwatch.toml capture-evidence --release-id <id>
 pydiffwatch -c pydiffwatch.toml capture-evidence --all           # widen to every fired-rule row (more re-fetches)
+```
+
+`--all` re-fetches from PyPI for rows the next prune would otherwise drop again anyway — a fired-rule row
+that never reached the reviewer and wasn't adjudicated non-benign isn't one you can act on, so pruning
+clears its evidence once more. Prefer the default (reportable rows only) unless you're specifically
+widening what's kept.
+
+**Keeping the database small.** Evidence is stored compressed, and only for releases escalated to review.
+`run` and `watch` prune the database by themselves at most once every `prune_every_hours` (24). Pruning keeps
+everything a person may act on (verdicts, alerts, the review and metadata-retry queues, refused releases and
+their evidence) and:
+
+- compresses evidence stored as plain text by older versions, and drops it for releases reviewed benign or
+  never escalated to the reviewer;
+- deletes plain release rows older than `retention_days` (90; `0` keeps everything), except each package's
+  newest release and its newest release with maintainer metadata, which the next release's
+  maintainer-change check compares against;
+- compacts the file (`VACUUM`, which needs roughly the database's own size again in free disk space to
+  rewrite it).
+
+To prune right away:
+
+```bash
+pydiffwatch -c pydiffwatch.toml prune
 ```
 
 **The LLM-review queue.** Review never blocks the scan. When the reviewer can't handle a flagged release,
@@ -230,11 +292,13 @@ later review doesn't depend on PyPI still hosting the sdist.
 
 | reason | when | drained by |
 |---|---|---|
+| `model_busy` | the reviewer guard deferred it: breaker open after a timeout, the model degrading, or this machine short on memory | every tick, first, once the guard allows reviews |
+| `in_review` | the process stopped (killed, crashed, rebooted) while the model was reviewing it | every tick; if that review can't finish either, it gets the heuristic alert it missed |
 | `endpoint_unreachable` | the model server is down (each tick prints a warning) | every tick, once it's back |
 | `review_failed` | a review timed out or failed; retried at `timeout` × attempt (300s, 600s, 900s) | every tick, up to `max_review_attempts` (3) |
 | `too_large` | the highest-risk file alone exceeds `max_input_chars` (200k chars) | `review-pending` with a larger-context model |
 
-Each tick retries at most `max_pending_per_tick` (20) queued releases before scanning. The rest wait for
+Each tick retries at most `max_pending_per_tick` (20) queued releases before scanning, and starts no new one once `timeout` (300s) has passed since the first, so a slow model can't hold up the scan for hours. The rest wait for
 you — typically with a bigger model pointed at the same database:
 
 ```bash
@@ -248,6 +312,32 @@ strip. A release with **no** reviewable text at all
 (only binary / oversized-member / maintainer signals) is not queued: no model can review it, so it goes
 straight to `pending` for a human.
 
+**Model protection.** The reviewer measures your endpoint and adapts to it, so a slow or struggling
+model server isn't overloaded — the guard's own state (measured speed, breaker, degradation) is stored
+per endpoint+model in the database (`reviewer_stats`), so it survives restarts:
+
+- **Input size from measured speed.** The tool records how fast the endpoint reads input (from the token
+  counts it reports) and caps each review input at `speed × timeout × budget_safety`. Bigger inputs go to
+  the `too_large` queue. Until the first measurement, a new endpoint gets one small calibration request
+  (filler text, never package content) and a 40,000-char cap.
+- **Circuit breaker.** After a timeout, no more reviews are sent that batch; the next batch sends a tiny
+  health probe first (`probe_timeout`) and resumes only if it answers in time.
+- **Slowdown detector.** Two reviews in a row below `slowdown_ratio` of the measured speed pause reviews
+  for `degraded_pause_s` and print a warning — usually the model server is swapping; restart it.
+- **Host memory guard.** When the model runs on this machine (`host_memory_guard = "auto"` detects a
+  loopback endpoint), reviews pause while swap use is at or above `max_swap_used_pct` or the OS reports
+  memory pressure.
+
+A release deferred by any of these lands in the `model_busy` queue above. `pending` and the dashboard
+show the guard's current state, e.g. `reviews on · 85 tok/s · input cap 52,020 chars`.
+
+**Evidence standard.** The reviewer is told to classify a release "malicious" only when the shown code
+concretely exfiltrates secrets, executes remote or decoded/deobfuscated code, or destroys/persists itself
+— never on powerful-but-unused primitives (`subprocess`, `exec`, network, file writes) alone; "suspicious"
+covers a real-but-partial match. It cites the exact hunk backing its verdict. The prompt also carries the
+release's PyPI `info.summary` (the author-written one-line description) as a fenced description block
+alongside the diff, for context, not as evidence on its own.
+
 ---
 
 ## 6. The dashboard & the `watch` daemon
@@ -260,6 +350,16 @@ highlighted, benign muted — each with a direct PyPI link, and flagged cards ca
 PyPI"** action so going from "the tool flagged this" to "reported for takedown" is one click. It's a single
 self-contained HTML file with no JavaScript; every untrusted string (package name, the model's reasoning,
 cited code) is HTML-escaped, so a package literally named `<script>…</script>` can't attack the page.
+
+**Your own `adjudicate` call is the final word.** Once you've adjudicated a release with
+`pydiffwatch pending` / `pydiffwatch adjudicate <id> ...` (§5), the dashboard shows *your* label, not the
+model's, for that card: a human `benign` clears the flag for good — no highlight, no "Report malware"
+button, and it drops out of the flagged count in the status strip — even if the model called it
+malicious or suspicious. Conversely, a human `malicious` or `suspicious` label keeps the card flagged
+(highlighted, with the report button) even if the model called it benign. The badge text and the sort
+order (malicious first, then flagged, then benign) both follow your label once one is set. The card also
+reads `your verdict: <label> — <your note> · model said <classification>` (the note and the model's call
+only when there is one, and only when it differs from yours).
 
 Generate it from whatever the database already holds:
 
@@ -287,14 +387,21 @@ refreshes the dashboard after each tick, and — with `--serve` — serves it th
 you a running monitor plus a live results page:
 
 ```bash
-pydiffwatch -c pydiffwatch.toml seed-now                  # first time only (start "from now")
-pydiffwatch -c pydiffwatch.toml watch --serve             # scan every 5 min + live dashboard
+pydiffwatch -c pydiffwatch.toml watch --serve --recent 500   # start 500 changelog events back + live dashboard
+pydiffwatch --model qwen-singleshot watch --serve             # same, no config file: OpenAI-compatible server
 # → open http://127.0.0.1:8787/dashboard.html
 ```
 
-`--interval N` sets the seconds between scans (default 300); `--out`/`--port` work as above. A failed scan
+Without `--recent`, a fresh database starts "from now" and the first results appear on the next scan.
+`--recent N` counts PyPI changelog events, not releases: one release is several events (the release plus
+one per uploaded file). While a backlog is waiting (a `--recent` start, or a restart after downtime), `watch`
+scans back-to-back and sleeps only once it has caught up. `--model` / `--endpoint` (default
+`http://localhost:8000/v1`) override the config's reviewer with an OpenAI-compatible server; no API key needed.
+
+`--interval N` sets the seconds between scans once caught up (default 300); `--out`/`--port` work as above. A failed scan
 (network blip, endpoint down) is logged and the daemon keeps going; Ctrl-C stops cleanly. The dashboard's
-status strip shows whether your model endpoint is reachable and how long ago the last scan ran — start your
+status strip shows whether your model endpoint is reachable, how long ago the last scan ran, and the
+review and retry backlogs — start your
 model server (§2) before `watch --serve`, or reviews fall back to heuristics until it's up.
 
 It is a **foreground** process — keep the terminal open, or run it under your agent harness, which will run
@@ -417,10 +524,9 @@ jobs:
 
 ## 8. State, persistence & containment
 
-All state lives under `.diffwatch/` (paths configurable via `db_path`, `cache_dir`, `lock_path`):
+All state lives under `.diffwatch/` (paths configurable via `db_path`, `lock_path`):
 
 - `diffwatch.sqlite` — the cursor, every processed release, verdicts, alerts, and stored payload evidence.
-- `artifact_cache/` — downloaded sdists (size-capped, read in memory, never installed).
 - `diffwatch.lock` — an exclusive `flock` that prevents overlapping `run`s.
 
 Persist `.diffwatch/` and you can move PyDiffWatch between machines without losing the cursor or history.
@@ -447,6 +553,37 @@ webhook_url = "https://hooks.slack.com/services/XXX/YYY/ZZZ"
 ```
 
 Alerts are also printed to stdout and recorded (deduped) in the DB, so a webhook failure never loses one.
+
+**Every unscanned outcome alerts once, then waits for you.** A release pydiffwatch could not get a model
+verdict on is never silently dropped: each such outcome fires exactly one `suspicious-heuristic` alert
+(deduped per release + outcome, so a re-tick never repeats it) whose `reasoning` starts `UNREVIEWED:` and
+ends `Not scanned. Needs manual review.` (refusals, `metadata_gone` and `no_content` end differently — see below), and —
+except `metadata_gone`, which alerts only — the release then waits in `pending` labelled
+`(not scanned: <stage>)`:
+
+| Outcome | `pending` label | Alert wording |
+|---|---|---|
+| Refused to download the sdist (over-size or malformed) | `(not scanned: refused_to_fetch)` | `UNREVIEWED: pydiffwatch refused to download it (<reason>: <why>), so nothing in it was scanned. Oversized or malformed archives can hide a payload from scanners. Needs manual review.` |
+| A new release of a project on the quarantine list | `(not scanned: refused_to_fetch)` | `UNREVIEWED: this project is on pydiffwatch's quarantine list (<reason>), so this release was not downloaded. Not scanned. Needs manual review.` |
+| Refused to unpack the sdist (over-size or malformed archive) | `(not scanned: refused_to_extract)` | `UNREVIEWED: pydiffwatch refused to unpack its sdist (<reason>: <why>), so nothing in it was scanned. Oversized or malformed archives can hide a payload from scanners. Needs manual review.` |
+| Metadata 404s before the release could be scanned | *(alert only — not queued; the files are gone)* | `UNREVIEWED: removed from PyPI before it could be scanned (its metadata returns 404); the files are gone, so there is nothing to review.` |
+| Download/scan failed `METADATA_ATTEMPTS` (4) times running | `(not scanned: gave_up)` | `UNREVIEWED: pydiffwatch failed to download or scan it 4 times and gave up (last error: <last error>). Not scanned. Needs manual review.` |
+| Review input exceeds the endpoint's cap | `(not scanned: too_large)` | `` UNREVIEWED: its review input is too large for the model (<detail>); run `review-pending` with a larger-context model. Not scanned. Needs manual review. `` |
+| Review failed `max_review_attempts` (3) times running | `(not scanned: review_failed)` | `` UNREVIEWED: the model failed to review it <n> times (last error: <last error>); retries are used up. Run `review-pending` to try again, e.g. with another model. Not scanned. Needs manual review. `` |
+| With the reviewer on, triage fired only on signals with no text to show the model (a dependency, binary or maintainer change) | `(not scanned: no_content)` | `UNREVIEWED: triage fired (<rules>) but none of the flagged content could be shown to the reviewer. Needs a human.` |
+| A release switches to wheel-only (see §13) after `wheel_only_grace_minutes` | `(not scanned: no_sdist)` | `UNREVIEWED: switched to wheel-only: the previous release <prev> shipped an sdist and this one ships only wheels, which pydiffwatch does not scan. Not scanned. Needs manual review.` |
+
+The refused-to-download/-unpack `<reason>` is one of `decompressed-size`, `members`, `member-name` (a name
+too long **or** containing a control character), `member-size`, `total-size`, `download-size`, or
+`bad-archive: ...`.
+
+**A benign verdict on truncated input is not final.** When the reviewer's input cap drops a file that
+carried fired-rule weight — including a first release with more than 40 weighted (score > 0) files, since
+only the top 40 by weight are ever shown to the model — a `benign` classification is routed to
+adjudication instead of saved silently, with `reviewed partially: <files> not shown` prepended to the
+`reasoning` (and one `suspicious-heuristic` alert). It shows up in `pending` like any other model verdict
+(`model: benign conf=... attack=...`), not as `(not scanned: ...)` — it *was* reviewed, just not on every
+file.
 
 ---
 
@@ -475,6 +612,7 @@ GPU and no API budget, or to keep monitoring when your endpoint is down.
 | First `run` returns `processed 0 releases` | expected — a fresh DB seeds the cursor to "now" and processes nothing that tick; the next tick polls forward. Use `run --backfill` to process history instead. |
 | `a scan is already running …` | another run holds the lock — the message names the holder pid and the lock file. If it's your scheduled tick, harmless; space the schedule. If nothing is actually running, a prior run hung or was killed mid-fetch and still holds the lock: kill the reported pid and re-run. The lock is an OS advisory lock that frees when its process exits — deleting the lock file does **not** release a live lock. |
 | Local endpoint refused / connection error | the model server isn't up, or `base_url` is wrong (check the port and the trailing `/v1`). From Docker, use `host.docker.internal`, not `localhost`. |
+| `pydiffwatch: config file not found: ...` | `-c` named a path that doesn't exist. This is a hard error, on purpose — it never silently falls back to defaults and scans with the wrong reviewer/paths. Check the path. |
 
 ---
 
@@ -492,3 +630,25 @@ prior version to diff against. `new_package_policy` controls how those are handl
 Under the default, malware that lives in a non-auto-exec module of a brand-new package (e.g.
 `src/pkg/utils/helper.py`) is **not** scanned — first-release ≠ full scan. Set `new_package_policy = "full"`
 if you want complete coverage of first releases and can absorb the extra volume.
+
+---
+
+## 13. Known limit: wheel-only releases
+
+PyDiffWatch reads **sdists** only. A release that ships no sdist for that version — a wheel-only upload —
+has nothing to diff or scan; it's recorded with stage `no_sdist` and skipped, not treated as an error.
+Built-distribution review (inspecting the wheel itself) is on the [roadmap](README.md#-roadmap) but not
+implemented.
+
+A package that has **always** been wheel-only is recorded as `no_sdist` silently — there's no earlier
+sdist release to have lost coverage on. But when a release **switches**, i.e. the package's previous
+release shipped an sdist and this one doesn't, that's worth a warning — except wheels often finish
+uploading before the sdist does, so an immediate check would false-positive on a release that's still
+mid-upload. To cover that, a detected switch waits `wheel_only_grace_minutes` (default 60) and is
+re-checked once that grace period is up. Only if the sdist still hasn't shown up does it warn (the
+`no_sdist` row in §9's table above) and settle into `no_sdist`; if the sdist shows up first, the release
+is scanned normally and no warning fires. Set it in the config file:
+
+```toml
+wheel_only_grace_minutes = 60   # how long a wheel-only switch waits for a late sdist before it warns
+```

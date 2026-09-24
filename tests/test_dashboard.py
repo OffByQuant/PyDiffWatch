@@ -36,6 +36,58 @@ def test_render_escapes_untrusted_package_name():
     assert "&lt;script&gt;" in out
 
 
+def test_render_partial_review_benign_gets_report_link_and_flagged_styling():
+    # spec U2: a benign verdict routed to needs_adjudication (a file the model never saw carried
+    # fired-rule weight) must not render as a clean, dimmed "benign" card — a person still needs to
+    # look at it.
+    out = dashboard.render_dashboard([{"package": "partpkg", "version": "1.0.0",
+                                       "classification": "benign", "stage": "needs_adjudication"}])
+    assert "Report malware on PyPI" in out
+    assert 'class="card suspicious"' in out
+    assert ">benign<" in out       # the model's actual classification is still shown as text
+
+
+def test_render_counts_partial_review_benign_as_flagged_for_review():
+    out = dashboard.render_dashboard([{"package": "partpkg", "version": "1.0.0",
+                                       "classification": "benign", "stage": "needs_adjudication"}])
+    assert "1 flagged for review" in out
+
+
+def test_is_flagged():
+    assert dashboard.is_flagged({"classification": "malicious"}) is True
+    assert dashboard.is_flagged({"classification": "suspicious"}) is True
+    assert dashboard.is_flagged({"classification": "benign"}) is False
+    assert dashboard.is_flagged({"classification": "benign", "stage": "needs_adjudication"}) is True
+    assert dashboard.is_flagged({"classification": "benign", "stage": "reviewed"}) is False
+
+
+def test_is_flagged_honors_a_human_adjudication():
+    # store.adjudicate never moves the release off its stage, so a human "benign" on a partial-review
+    # release (still stage='needs_adjudication') must clear the flag -- and a human override the other
+    # way (model said benign, human found it malicious) must keep it flagged.
+    still_queued_but_cleared = {"classification": "benign", "stage": "needs_adjudication",
+                                "human_label": "benign"}
+    assert dashboard.is_flagged(still_queued_but_cleared) is False
+    overridden_to_malicious = {"classification": "benign", "stage": "needs_adjudication",
+                               "human_label": "malicious"}
+    assert dashboard.is_flagged(overridden_to_malicious) is True
+
+
+def test_render_after_human_adjudication_matches_the_human_label():
+    # The badge must never contradict is_flagged's report-button/styling decision.
+    cleared = dashboard.render_dashboard([{"package": "partpkg", "version": "1.0.0",
+                                           "classification": "benign", "stage": "needs_adjudication",
+                                           "human_label": "benign"}])
+    assert "Report malware on PyPI" not in cleared
+    assert 'class="card benign"' in cleared and ">benign<" in cleared
+
+    overridden = dashboard.render_dashboard([{"package": "partpkg", "version": "1.0.0",
+                                              "classification": "benign", "stage": "needs_adjudication",
+                                              "human_label": "malicious"}])
+    assert "Report malware on PyPI" in overridden
+    assert 'class="card malicious"' in overridden and ">malicious<" in overridden
+
+
 def test_render_orders_flagged_first():
     out = dashboard.render_dashboard([
         {"package": "benignpkg", "version": "1.0.0", "classification": "benign"},
@@ -55,7 +107,7 @@ def test_watch_refreshes_dashboard_each_tick_and_is_bounded(tmp_path, monkeypatc
     cfg = _cfg(tmp_path)
     # don't hit PyPI: stub the scan so watch() only exercises its loop + dashboard refresh
     ticks = {"n": 0}
-    monkeypatch.setattr(orchestrator, "run_once", lambda c: ticks.__setitem__("n", ticks["n"] + 1))
+    monkeypatch.setattr(orchestrator, "run_once", lambda c, **k: ticks.__setitem__("n", ticks["n"] + 1))
     sleeps = []
     n = orchestrator.watch(cfg, interval=42, iterations=3, sleep_fn=sleeps.append)
     assert n == 3
@@ -66,7 +118,7 @@ def test_watch_refreshes_dashboard_each_tick_and_is_bounded(tmp_path, monkeypatc
 
 def test_watch_survives_a_failing_scan(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
-    def boom(c):
+    def boom(c, **k):
         raise RuntimeError("scan exploded")
     monkeypatch.setattr(orchestrator, "run_once", boom)
     n = orchestrator.watch(cfg, iterations=2, sleep_fn=lambda _: None)
@@ -96,3 +148,48 @@ def test_render_shows_pending_llm_review_by_reason():
     html = dashboard.render_dashboard([], status=status)
     assert "7 pending LLM review" in html
     assert "too_large: 2" in html and "endpoint_unreachable: 5" in html
+
+
+def test_render_shows_reviewer_guard_state():
+    html = dashboard.render_dashboard([], status={"guard": {
+        "state": "open", "detail": "breaker open after timeout", "tok_s": 85.0, "cap_chars": 52020,
+        "host_memory": "swap 83% used"}})
+    assert "reviews paused (timeout)" in html and "85 tok/s" in html and "52,020" in html
+    assert "swap 83% used" in html
+
+
+def test_rank_uses_the_human_label_like_the_badge_and_the_flagged_count(tmp_path):
+    # (h), npm #24: a model-malicious release a person cleared as benign sinks below the flagged ones, and a
+    # model-benign one a person labelled malicious rises to the top. The status strip's count agrees.
+    rows = [{"package": "cleared", "version": "1", "classification": "malicious", "human_label": "benign"},
+            {"package": "queued", "version": "1", "classification": "suspicious"},
+            {"package": "caught", "version": "1", "classification": "benign", "human_label": "malicious"}]
+    out = dashboard.render_dashboard(rows, status={"flagged_total": sum(map(dashboard.is_flagged, rows))})
+    assert out.index("caught") < out.index("queued") < out.index("cleared")
+    assert "2 flagged for review" in out and "2 flagged</span>" in out
+
+
+def test_a_labelled_card_shows_your_verdict_your_note_and_what_the_model_said(tmp_path):
+    # npm #24: "your verdict: X — <note> · model said Y", the note escaped like every other untrusted string.
+    cfg = Config(db_path=tmp_path / "db.sqlite", lock_path=tmp_path / "l", reviewer_enabled=False)
+    conn = store.connect(cfg); store.init_schema(conn)
+    rid = store.record_release(conn, "caught", "1.0", 1, False, None, "sdist")
+    store.record_verdict(conn, rid, Verdict("caught", "1.0", "benign", 60.0, [], False, model="m"))
+    store.adjudicate(conn, rid, "malicious", "curl|sh in setup.py <script>")
+    out = orchestrator.export_dashboard(cfg).read_text()
+    assert "your verdict: malicious — curl|sh in setup.py &lt;script&gt; · model said benign" in out
+    assert "<script>" not in out
+
+
+def test_a_card_without_a_note_or_a_disagreement_keeps_the_line_short():
+    out = dashboard.render_dashboard([{"package": "p", "version": "1", "classification": "malicious",
+                                       "human_label": "malicious"}])
+    assert "your verdict: malicious</div>" in out
+    assert "your verdict" not in dashboard.render_dashboard([{"package": "p", "version": "1",
+                                                              "classification": "malicious"}])
+
+
+def test_the_retry_backlog_leaves_the_last_poll_age_alone():
+    out = dashboard.render_dashboard([], status={"last_poll_age": "2 minutes ago", "retry": {
+        "retrying": 1, "gave_up": 0, "oldest_retrying_age": "3 hours ago"}})
+    assert "last poll: 2 minutes ago" in out and "1 scan(s) retrying (oldest first seen 3 hours ago)" in out

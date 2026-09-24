@@ -16,13 +16,23 @@ def _norm(name: str) -> str:
     return re.sub(r"[-_.]+", "-", (name or "").strip().lower())
 
 
-# Maintainer `rrdrqup` (PyPI account created 2026-05-30) pushed these three in a burst. Quarantined
+# One new maintainer account pushed these three in a burst. Quarantined
 # as deceptive typosquats — never fetch/process/install. Static review (verdicts in DB):
 #   - cudrequest   : typosquat of `requests`; ships an insecure PHP login app — NO active payload.
 #   - pythondocxx  : typosquat of `python-docx`; an OpenRouter AI CLI — NO active payload.
 #   - requestspillows: wheel-only, NOT yet inspected — precautionary; malice UNCONFIRMED (revisit).
-KNOWN_MALICIOUS = frozenset({"cudrequest", "pythondocxx", "requestspillows"})
+REASONS = {
+    "cudrequest": "typosquat of `requests`; ships an insecure PHP login app, no active payload found",
+    "pythondocxx": "typosquat of `python-docx`; an OpenRouter AI CLI, no active payload found",
+    "requestspillows": "wheel-only, not yet inspected; quarantined as a precaution, malice unconfirmed",
+}
+KNOWN_MALICIOUS = frozenset(REASONS)
 
 
 def is_quarantined(package: str) -> bool:
     return _norm(package) in KNOWN_MALICIOUS
+
+
+def reason(package: str) -> str:
+    """Why the project is quarantined (shown in its alert), or "" when it isn't."""
+    return REASONS.get(_norm(package), "")

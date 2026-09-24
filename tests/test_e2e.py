@@ -53,7 +53,7 @@ def test_cursor_resume_across_runs(tmp_cfg, monkeypatch):
                         lambda url, cfg: blobs[tuple(url.replace("mock://", "").split("/"))])
 
     monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: [
-        r for r in [type("R", (), {"package": "victim", "version": "1.0", "serial": 10})()]
+        r for r in [NewRelease("victim", "1.0", 10)]
         if r.serial > since])
     orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
     conn = store.connect(tmp_cfg)
@@ -62,7 +62,7 @@ def test_cursor_resume_across_runs(tmp_cfg, monkeypatch):
 
     # second run: a new release at serial 11; changes_since must only see it (since=10)
     monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: [
-        r for r in [type("R", (), {"package": "victim", "version": "1.1", "serial": 11})()]
+        r for r in [NewRelease("victim", "1.1", 11)]
         if r.serial > since])
     n = orchestrator.run_once(tmp_cfg)
     assert n == 1                      # only the new release processed
@@ -128,7 +128,7 @@ def test_refused_extract_emits_suspicious_alert(tmp_cfg, monkeypatch):
         NewRelease("bomb", "1.0", 7)])
     # make extraction refuse by patching fetch_artifacts directly
     monkeypatch.setattr(fetcher, "fetch_artifacts",
-                        lambda cfg, rel: (_ for _ in ()).throw(fetcher.RefusedToExtract("bomb")))
+                        lambda cfg, rel, **k: (_ for _ in ()).throw(fetcher.RefusedToExtract("bomb")))
     orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
     conn = store.connect(tmp_cfg)
     stage = conn.execute("SELECT stage FROM releases WHERE package='bomb'").fetchone()[0]
@@ -139,8 +139,8 @@ def test_refused_extract_emits_suspicious_alert(tmp_cfg, monkeypatch):
     conn.close()
 
 def test_transient_fetch_error_is_retryable_not_poison(tmp_cfg, monkeypatch):
-    # A transient (non-RefusedTo*) error mid-batch must NOT abort the tick, must NOT advance the
-    # cursor past the failed release, and must be reprocessed+alerted on a later tick (no silent drop).
+    # A transient (non-RefusedTo*) error mid-batch must NOT abort the tick, must NOT pin the cursor at the
+    # failed release, and must be reprocessed+alerted on a later tick from the retry queue (no silent drop).
     import urllib.error
     good = NewRelease("good", "1.0", 10)
     boom = NewRelease("victimx", "1.1", 11)
@@ -148,7 +148,7 @@ def test_transient_fetch_error_is_retryable_not_poison(tmp_cfg, monkeypatch):
     monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: [r for r in [good, boom, after] if r.serial > since])
 
     calls = {"n": 0}
-    def flaky_fetch(cfg, rel):
+    def flaky_fetch(cfg, rel, **k):
         if rel.package == "victimx" and calls["n"] == 0:
             calls["n"] += 1
             raise urllib.error.HTTPError("u", 503, "boom", {}, None)  # transient, NOT RefusedTo*
@@ -162,18 +162,17 @@ def test_transient_fetch_error_is_retryable_not_poison(tmp_cfg, monkeypatch):
     n1 = orchestrator.run_once(tmp_cfg, seed_if_fresh=False)   # tick 1: good ok, victimx fails transiently
     assert n1 == 3
     conn = store.connect(tmp_cfg)
-    # cursor must NOT have advanced past the failed release (still at 10, the last contiguous terminal)
-    assert store.get_last_serial(conn) == 10
-    # victimx recorded but in a retryable stage, no alert yet
-    assert store.get_stage(conn, "victimx", "1.1") == "fetch_failed"
+    # the cursor moves on; victimx waits in the bounded retry queue, no alert yet
+    assert store.get_last_serial(conn) == 12
+    assert store.get_stage(conn, "victimx", "1.1") == "metadata_retry"
     assert conn.execute("SELECT COUNT(*) FROM alerts a JOIN releases r ON r.id=a.release_id "
                         "WHERE r.package='victimx'").fetchone()[0] == 0
     conn.close()
 
-    n2 = orchestrator.run_once(tmp_cfg)             # tick 2: changes_since(10) returns victimx+after; victimx now succeeds
+    n2 = orchestrator.run_once(tmp_cfg)             # tick 2: the retry queue re-fetches victimx; it now succeeds
     conn = store.connect(tmp_cfg)
     assert store.get_stage(conn, "victimx", "1.1") in ("triaged", "alerted")
     assert conn.execute("SELECT COUNT(*) FROM alerts a JOIN releases r ON r.id=a.release_id "
                         "WHERE r.package='victimx'").fetchone()[0] == 1   # malicious now alerted
-    assert store.get_last_serial(conn) == 12        # cursor caught up after success
+    assert store.get_last_serial(conn) == 12
     conn.close()

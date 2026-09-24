@@ -1,13 +1,14 @@
 # Local OpenAI-compatible endpoint (llama-swap / vLLM / LM Studio serving e.g. Qwen). No API key.
 # This is the default profile. Point base_url at your server.
 threshold_t = 40.0
+# wheel_only_grace_minutes = 60   # how long a wheel-only switch waits for a late sdist before it warns
 
 [reviewer]
 provider = "openai"
 base_url = "http://localhost:8000/v1"
-model = "qwen-singleshot"
+model = "qwen-singleshot"          # replace with a model id your server lists at <base_url>/models
 structured_output = "json_schema"
 
-# Qwen 3.x is a reasoning model. With thinking off, reviews ran 1.6-4.4x faster with the same verdicts.
+# Qwen 3.x is a reasoning model. Turn thinking off: reviews get several times faster.
 [reviewer.extra_body]
 chat_template_kwargs = { enable_thinking = false }

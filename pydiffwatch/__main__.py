@@ -1,13 +1,32 @@
 import argparse
-from . import egress
+import dataclasses
+from . import egress, store
 from .config import Config, load_config
 from .orchestrator import (run_once, seed_now, list_pending, adjudicate, get_evidence,
                            backfill_evidence, export_dashboard, watch, review_pending,
-                           pending_review_counts)
+                           pending_review_counts, metadata_retry_counts, prune)
 
 
 def _cfg(args):
-    return load_config(args.config) if args.config else Config()
+    try:
+        cfg = load_config(args.config) if args.config else Config()
+    except FileNotFoundError as e:
+        raise SystemExit(f"pydiffwatch: {e}")
+    if args.model or args.endpoint:       # an OpenAI-compatible server (llama.cpp, llama-swap, Ollama, vLLM)
+        rc = dataclasses.replace(cfg.reviewer, provider="openai", model=args.model or cfg.reviewer.model,
+                                 base_url=args.endpoint or cfg.reviewer.base_url)
+        if (args.endpoint and args.endpoint != cfg.reviewer.base_url) or cfg.reviewer.provider != "openai":
+            rc = dataclasses.replace(rc, api_key_env=None)    # the config's key is for its own endpoint only
+        cfg = dataclasses.replace(cfg, reviewer=rc, reviewer_enabled=True)
+    return cfg
+
+
+def _non_negative(text):
+    """argparse type for --recent: a count of changelog events; 0 means start now, as with no --recent."""
+    n = int(text)
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or more, got {n}")
+    return n
 
 
 def _reach(host):
@@ -30,20 +49,31 @@ def main():
     p = argparse.ArgumentParser(prog="pydiffwatch")
     p.add_argument("-c", "--config", default=None,
                    help="path to a pydiffwatch.toml config file (see examples/); defaults to built-ins")
+    p.add_argument("--model", default=None,
+                   help="reviewer model name on an OpenAI-compatible server (llama.cpp, llama-swap, Ollama, "
+                        "vLLM); no API key needed. Overrides the config file")
+    p.add_argument("--endpoint", default=None,
+                   help="that server's URL (default: http://localhost:8000/v1), e.g. "
+                        "http://192.168.1.20:8000/v1 for a model on another machine")
     sub = p.add_subparsers(dest="cmd", required=True)
     runp = sub.add_parser("run", help="process new releases since the cursor (one tick)")
     runp.add_argument("--backfill", action="store_true",
                       help="process from the cursor as-is (PyPI genesis on a fresh DB) instead of "
                            "seeding a fresh cursor to now")
+    runp.add_argument("--recent", type=_non_negative, default=None, metavar="N",
+                      help="on a fresh database, start N PyPI changelog events back instead of now (one "
+                           "release is several events: the release plus one per uploaded file)")
     sub.add_parser("seed-now",
                    help="set the cursor to PyPI's current serial and exit (start monitoring from now)")
     sub.add_parser("pending",
                    help="list suspicious verdicts awaiting adjudication, each with its diff")
+    sub.add_parser("prune", help="shrink the database now (run/watch also do it daily): compress evidence, drop "
+                                 "it for benign releases, apply retention_days, compact; findings and queues stay")
     rpp = sub.add_parser("review-pending",
                          help="review releases queued for LLM review (by default: too_large and exhausted "
                               "retries) — e.g. with -c pointing at a larger-context model")
     rpp.add_argument("--reason", action="append",
-                     choices=["too_large", "review_failed", "endpoint_unreachable"],
+                     choices=["too_large", "review_failed", "endpoint_unreachable", "model_busy"],
                      help="only this queue reason (repeatable)")
     rpp.add_argument("--limit", type=int, default=None, help="review at most N releases")
     adjp = sub.add_parser("adjudicate", help="record your verdict on a queued suspicious release")
@@ -74,8 +104,13 @@ def main():
     wp = sub.add_parser("watch",
                         help="daemon loop: scan for new releases on an interval, refresh the "
                              "dashboard each tick, and (with --serve) serve it on localhost")
-    wp.add_argument("--interval", type=int, default=300, help="seconds between scans (default: 300)")
+    wp.add_argument("--interval", type=int, default=300,
+                    help="seconds between scans once caught up (default: 300)")
     wp.add_argument("--out", default=None, help="dashboard HTML path (default: <db dir>/dashboard.html)")
+    wp.add_argument("--recent", type=_non_negative, default=None, metavar="N",
+                    help="on a fresh database, start N PyPI changelog events back instead of now (one "
+                         "release is several events), so the dashboard fills within minutes (ignored once "
+                         "scanning has started)")
     wp.add_argument("--serve", action="store_true",
                     help="also serve the dashboard on 127.0.0.1 (localhost only) while watching")
     wp.add_argument("--port", type=int, default=8787, help="port for --serve (default: 8787)")
@@ -88,17 +123,29 @@ def main():
     # mutates global socket state, so it stays a CLI-entry concern (see egress.py docstring).
     egress.install_guard(cfg)   # default-deny host allowlist for the whole process (see egress.py)
     if args.cmd == "run":
-        n = run_once(cfg, seed_if_fresh=not args.backfill)
+        n = run_once(cfg, seed_if_fresh=not args.backfill, recent=args.recent)
         print(f"[pydiffwatch] processed {n} releases")
     elif args.cmd == "seed-now":
         s = seed_now(cfg)
         print(f"[pydiffwatch] cursor seeded to serial {s}" if s is not None
               else "[pydiffwatch] could not reach PyPI to read the current serial")
+    elif args.cmd == "prune":
+        print(f"[pydiffwatch] pruned {cfg.db_path}: freed {prune(cfg) / 1048576:.1f} MB")
     elif args.cmd == "review-pending":
         n, remaining = review_pending(cfg, reasons=args.reason, limit=args.limit)
         left = ", ".join(f"{k}: {v}" for k, v in sorted(remaining.items())) or "none"
         print(f"[pydiffwatch] reviewed {n} queued release(s); still queued: {left}")
     elif args.cmd == "pending":
+        from .guard import describe
+        from .orchestrator import guard_status
+        gs = guard_status(cfg)
+        if gs:
+            print(f"[pydiffwatch] reviewer: {describe(gs)}")
+        mr = metadata_retry_counts(cfg)
+        if mr["retrying"] or mr["gave_up"]:
+            oldest = f" (oldest first seen {mr['oldest_retrying_age']})" if mr["oldest_retrying_age"] else ""
+            print(f"[pydiffwatch] failed to download or scan: {mr['retrying']} release(s) being retried{oldest}, "
+                  f"{mr['gave_up']} given up on after {store.METADATA_ATTEMPTS} attempts (not scanned)")
         queued = pending_review_counts(cfg)
         if queued:
             print(f"[pydiffwatch] {sum(queued.values())} release(s) queued for LLM review ("
@@ -106,12 +153,13 @@ def main():
                   + ") — see `review-pending`")
         items = list_pending(cfg)
         if not items:
-            print("[pydiffwatch] no suspicious verdicts awaiting adjudication"); return
-        print(f"[pydiffwatch] {len(items)} suspicious verdict(s) awaiting adjudication:\n")
+            print("[pydiffwatch] nothing awaiting adjudication"); return
+        print(f"[pydiffwatch] {len(items)} release(s) awaiting adjudication:\n")
         for it in items:
-            print(f"=== release_id={it['release_id']}  {it['package']}=={it['version']}  "
-                  f"(model: {it['classification']} conf={it['confidence']} attack={it['attack_type']}) ===")
-            print(f"  model reason: {it['reasoning']}")
+            why = (f"not scanned: {it['not_scanned']}" if it["not_scanned"] else
+                   f"model: {it['classification']} conf={it['confidence']} attack={it['attack_type']}")
+            print(f"=== release_id={it['release_id']}  {it['package']}=={it['version']}  ({why}) ===")
+            print(f"  {'reason' if it['not_scanned'] else 'model reason'}: {it['reasoning']}")
             print(f"  cited_hunk: {it['cited_hunk']}")
             if it["diff_text"] is not None:
                 label = "stored payload evidence" if it["evidence_stored"] else "diff under review (re-fetched)"
@@ -158,7 +206,7 @@ def main():
             threading.Thread(target=httpd.serve_forever, daemon=True).start()
             print(f"[pydiffwatch] serving http://{args.host}:{args.port}/{out.name} ({_reach(args.host)})")
         print(f"[pydiffwatch] watching — scanning every {args.interval}s, Ctrl-C to stop")
-        n = watch(cfg, interval=args.interval, out_path=args.out)
+        n = watch(cfg, interval=args.interval, out_path=args.out, recent=args.recent)
         if httpd:
             httpd.server_close()
         print(f"\n[pydiffwatch] stopped after {n} scan(s)")
