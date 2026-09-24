@@ -298,9 +298,9 @@ def _discovered(files) -> list[str]:
         if parts[-1] != "__init__.py":
             continue
         if len(parts) == 2 or (len(parts) == 3 and parts[0] == "src"):
-            # letters, digits, "_" and "-" only: no separator (";", "=", ",", space, ".") can pose as a field,
-            # and a flat-layout -stubs or any src/ directory setuptools installs under such a name is still listed
-            if parts[-2] not in _NOT_PACKAGES and re.fullmatch(r"[A-Za-z0-9_-]+", parts[-2]):
+            # an identifier once "-" reads as "_": no separator (";", "=", ",", space, ".") can pose as a field,
+            # while a hyphenated (flat-layout -stubs, src/) or non-ASCII directory setuptools installs is listed
+            if parts[-2] not in _NOT_PACKAGES and parts[-2].replace("-", "_").isidentifier():
                 pkgs.append(parts[-2])
     return pkgs
 

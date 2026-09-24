@@ -255,9 +255,9 @@ Under setuptools with nothing declared, the import line lists what auto-discover
 `packages=auto-discovered: ...` (directories with an `__init__.py`, top level or under `src/`, except
 `tests`, `docs`, `examples` and similar) and `py-modules=auto-discovered: ...` (top-level or `src/` `*.py`
 files, except `setup.py` and `conftest.py`). A module is listed only when its name is a Python identifier,
-as setuptools installs only those. A package directory is listed when its name uses only letters, digits,
-`_` and `-`, so a flat-layout `foo-stubs` or a hyphenated `src/` directory still shows, while a name with
-`;`, `=`, `,`, a space or a dot never does. When it finds nothing it says `none found by DiffWatch
+as setuptools installs only those. A package directory is listed when its name is a Python identifier
+once each `-` reads as `_`, so a flat-layout `foo-stubs`, a hyphenated `src/` directory or a non-ASCII name
+like `pkgé` still shows, while a name with `;`, `=`, `,`, a space or a dot never does. When it finds nothing it says `none found by DiffWatch
 (setuptools auto-discovery may also find modules and namespace packages)` (or, while setup.py exists,
 `none declared literally in setup.py (setup.py runs arbitrary code at build)`), never a bare "none". At
 most three `<name>.egg-info/entry_points.txt` files are parsed; the rest are named on the commands and

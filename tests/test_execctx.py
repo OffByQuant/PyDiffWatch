@@ -933,3 +933,10 @@ def test_an_unknown_entry_after_a_group_s_cap_still_shows():
     assert cmds.startswith(f"{execctx.COMPUTED}, c0 -> m:f, ") and cmds.endswith(", … (+11 more)")
     assert plugins.startswith(f"pytest11: {execctx.COMPUTED}, pytest11: p0 -> m, ")
     assert plugins.endswith(", … (+11 more)")
+
+
+# ---- residuals round 2: a non-ASCII identifier package directory is listed ----
+
+def test_a_non_ascii_package_directory_is_listed():
+    ctx = execctx.build({"pyproject.toml": _ST, "pkgé/__init__.py": b""})
+    assert _field(ctx, "packages") == "auto-discovered: pkgé"
