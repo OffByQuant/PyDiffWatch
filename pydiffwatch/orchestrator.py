@@ -432,15 +432,25 @@ def _retry_later(cfg, conn, rid, rel, e) -> bool:
     return True
 
 
-def _retry_metadata(cfg, conn, rvw, ruleset, offline, guard):
+def _retry_metadata(cfg, conn, rvw, ruleset, offline, guard, clock=time.monotonic):
     """Re-fetch and re-scan releases that failed on an earlier tick. They are behind the cursor already,
-    so a result here never gates it; a repeat failure counts toward the give-up (_retry_later)."""
+    so a result here never gates it; a repeat failure counts toward the give-up (_retry_later).
+    It runs before ingest, holding the scan lock, so it has a time budget (packument_deadline_s): no new window
+    of fetch_concurrency rows starts once it is spent, and the rest wait for the next tick."""
     rows = store.metadata_retries_due(conn)
-    due = [NewRelease(r["package"], r["version"], r["serial"]) for r in rows]
-    attempts = [(r["fetch_attempts"] or 0) + 1 for r in rows]
-    with ThreadPoolExecutor(max_workers=max(1, cfg.fetch_concurrency)) as ex:
-        for rel, result in zip(due, ex.map(lambda r, k: _fetch_one(cfg, r, k), due, attempts)):
-            _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline, guard)
+    W = max(1, cfg.fetch_concurrency)
+    t0 = clock()
+    with ThreadPoolExecutor(max_workers=W) as ex:
+        for start in range(0, len(rows), W):
+            if clock() - t0 >= cfg.packument_deadline_s:
+                logger.warning("retry sweep used its %.0fs budget; %d release(s) wait for the next tick",
+                               cfg.packument_deadline_s, len(rows) - start)
+                break
+            window = [(NewRelease(r["package"], r["version"], r["serial"]), (r["fetch_attempts"] or 0) + 1)
+                      for r in rows[start:start + W]]
+            futs = [(rel, ex.submit(_fetch_one, cfg, rel, k)) for rel, k in window]
+            for rel, fut in futs:
+                _process_fetched(cfg, conn, rvw, ruleset, rel, fut.result(), offline, guard)
 
 
 def seed_now(cfg: Config):

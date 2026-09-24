@@ -301,3 +301,30 @@ def test_a_due_wait_row_is_not_starved_by_a_backlog_of_failing_retries(tmp_cfg, 
     monkeypatch.setattr(fetcher, "fetch_artifacts", fetch)
     orchestrator._retry_metadata(tmp_cfg, conn, None, None, False, None)
     assert store.get_stage(conn, "sw", "1.1") == "no_sdist"       # decided on the first tick
+
+
+def test_the_retry_sweep_stops_at_its_time_budget_and_leaves_the_rest_for_next_tick(tmp_cfg, monkeypatch):
+    # Review finding 2: with deadlines x attempt, 40 trickling rows could hold the scan lock for hours before
+    # ingest. The sweep stops starting windows once packument_deadline_s has passed; the rest waits a tick, and
+    # rows tried least come first, so the same failing rows don't take every tick's budget.
+    import threading
+    conn = store.connect(tmp_cfg); store.init_schema(conn)
+    for i in range(10):
+        rid = store.record_release(conn, f"bad{i}", "1.0", i + 1, False, None, "sdist")
+        store.update_stage(conn, rid, "metadata_retry")
+    clock, lock = [0.0], threading.Lock()
+
+    def fetch(cfg, rel):
+        with lock:
+            clock[0] += 200.0                      # each fetch trickles for 200 s
+        raise TimeoutError("trickling")
+    monkeypatch.setattr(fetcher, "fetch_artifacts", fetch)
+
+    def attempts():
+        return sorted(r[0] for r in conn.execute("SELECT fetch_attempts FROM releases"))
+    W = tmp_cfg.fetch_concurrency
+    orchestrator._retry_metadata(tmp_cfg, conn, None, None, False, None, clock=lambda: clock[0])
+    assert attempts() == [0] * (10 - W) + [1] * W          # one window (800 s > 300 s budget), then stop
+    clock[0] = 0.0
+    orchestrator._retry_metadata(tmp_cfg, conn, None, None, False, None, clock=lambda: clock[0])
+    assert attempts() == [0] * (10 - 2 * W) + [1] * (2 * W)  # next tick: rows not yet tried go first
