@@ -101,7 +101,9 @@ HOW FILES RUN. A file runs at build or install only if it is setup.py, the decla
 listed in the execution context, or code they import. A .pth import line runs at every interpreter start once \
 installed. __init__.py and top-level modules run on import. A console script runs only when the user types \
 it. A plugin entry point runs whenever its host tool loads plugins; treat that as automatic. A setup command \
-the user runs on purpose is not persistence "without being asked".
+the user runs on purpose is not persistence "without being asked". The execution context is a best-effort \
+static summary: setup.py is arbitrary code and can do anything at build time, so "none declared literally in \
+setup.py" is not proof that nothing runs, and "unknown" or "<computed>" means exactly that.
 Without concrete evidence of one of these in the shown code, the verdict is "benign", even when the code \
 uses powerful primitives (subprocess, exec/eval, network, file writes). Use "suspicious" only when the shown \
 code points at one of these but a needed piece is not shown (for example it fetches and runs a payload \
@@ -151,14 +153,26 @@ def _render_file(fd) -> str:
     return "\n".join(lines)
 
 
+_BUILD_FILES = ("setup.py", "pyproject.toml", "setup.cfg")
+
+
+def _zero_weight_rank(path, weight) -> int:
+    """Among zero-weight files the top-level build files come first, so a big zero-weight file (an inflated
+    egg-info entry_points.txt) cannot crowd them out. Weighted files keep their order."""
+    return _BUILD_FILES.index(path) if weight == 0.0 and path in _BUILD_FILES else len(_BUILD_FILES)
+
+
 def _rank_files(diff, triage):
     weights = _file_weights(triage)
     by_path = {fd.path: fd for fd in diff.changed}
     if diff.is_first_release:
-        ranked_paths = sorted(by_path, key=lambda p: -weights.get(p, 0.0))[:_FIRST_RELEASE_TOP_FILES]
+        ranked_paths = sorted(by_path, key=lambda p: (-weights.get(p, 0.0),
+                                                      _zero_weight_rank(p, weights.get(p, 0.0))))
+        ranked_paths = ranked_paths[:_FIRST_RELEASE_TOP_FILES]
     else:
         flagged = [p for p in by_path if weights.get(p, 0.0) > 0.0]
-        ranked_paths = sorted(flagged, key=lambda p: -weights[p]) or sorted(by_path)  # fallback: all
+        ranked_paths = (sorted(flagged, key=lambda p: -weights[p])
+                        or sorted(by_path, key=lambda p: (_zero_weight_rank(p, 0.0), p)))  # fallback: all
     return ranked_paths, by_path
 
 

@@ -138,3 +138,40 @@ def test_a_hostile_block_is_capped_after_escaping_and_the_hunk_still_renders():
 def test_an_ordinary_block_is_not_marked_truncated():
     text = reviewer.build_review_input(_update(_files()), TriageResult(50.0, [], True), max_chars=20_000)
     assert "(context truncated)" not in text
+
+
+# ---- fix round 3: build files are never crowded out by a big zero-weight file ----
+
+def test_a_big_egg_info_file_cannot_crowd_out_the_build_files():
+    from pydiffwatch.models import Diff, FileDiff, Hunk
+    eps = ["[console_scripts]"] + [f"cmd{i:05d} = brandnew.cli:main" for i in range(9000)]      # ~260 KB
+    def added(path, lines):
+        return FileDiff(path, "added", [Hunk((0, 0), (0, len(lines)), lines, [])], "\n".join(lines))
+    d = Diff("brandnew", "1.0", True, [
+        added("brandnew.egg-info/entry_points.txt", eps),
+        added("brandnew/__init__.py", ["import base64", "exec(base64.b64decode('eA=='))"]),
+        added("pyproject.toml", ["[build-system]", "build-backend='setuptools.build_meta'"]),
+        added("setup.py", ["from setuptools import setup", "setup(name='brandnew')"])], [])
+    tr = TriageResult(60.0, [FiredRule("py-exec", 60.0, "brandnew/__init__.py", (2, 2))], True)
+    dropped = []
+    text = reviewer.build_review_input(d, tr, max_chars=200_000, dropped=dropped)
+    lines = text.split("\n")
+    order = [ln for ln in lines if ln.startswith("--- file: ")]
+    assert order == ["--- file: brandnew/__init__.py (added) ---", "--- file: setup.py (added) ---",
+                     "--- file: pyproject.toml (added) ---"]                 # weighted first, then build files
+    assert dropped == [] and reviewer.dropped_from_text(tr.fired_rules, text) == []
+    assert len(text) <= 200_000
+
+
+def test_build_files_lead_the_zero_weight_fallback_of_an_update():
+    from pydiffwatch.models import Diff, FileDiff, Hunk
+    fds = [FileDiff(p, "modified", [Hunk((0, 1), (0, 1), ["x"], ["y"])]) for p in ("a.py", "setup.cfg", "setup.py")]
+    text = reviewer.build_review_input(Diff("p", "1.1", False, fds, []), TriageResult(0.0, [], True),
+                                       max_chars=10_000)
+    assert [ln for ln in text.split("\n") if ln.startswith("--- file: ")] == [
+        "--- file: setup.py (modified) ---", "--- file: setup.cfg (modified) ---", "--- file: a.py (modified) ---"]
+
+
+def test_the_prompt_says_the_summary_is_best_effort():
+    sp = reviewer.SYSTEM_PROMPT
+    assert "best-effort" in sp and "setup.py is arbitrary code" in sp
