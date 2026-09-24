@@ -16,6 +16,7 @@ import tomllib
 _PARSE_ERRORS = (ValueError, SyntaxError, RecursionError, MemoryError, UnicodeDecodeError,
                  configparser.Error, tomllib.TOMLDecodeError)
 _MAX_ITEMS = 20
+_MAX_EGG_EPS = 3        # egg-info entry_points.txt files parsed; the rest are named as unknown, never read
 _MAX_LINE = 2_000
 _LIT_DEPTH = 4          # deeper literals in setup() are shown as "<computed>"
 COMPUTED = "<computed>"
@@ -93,9 +94,10 @@ def _cfg_directive(v, what: str) -> str | None:
     return None
 
 
-def _join(items, empty="none") -> str:
+def _join(items, empty="none", extra=0) -> str:
+    """extra: items counted but never collected (see _collect)."""
     items = list(dict.fromkeys(_clip(x) for x in items if str(x).strip()))
-    more = len(items) - _MAX_ITEMS
+    more = max(0, len(items) - _MAX_ITEMS) + extra
     return ", ".join(items[:_MAX_ITEMS]) + (f", … (+{more} more)" if more > 0 else "") if items else empty
 
 
@@ -206,26 +208,40 @@ def _setup_kwargs(tree) -> tuple[dict, bool]:
 _UNKNOWN_EP = (COMPUTED, "")      # an entry point whose name or target is not statically known
 
 
-def _ep_lines(v) -> list[tuple[str, str]]:
+def _ep_lines(v):
     """Entry points of one group, from a list of "name = target" strings, one INI-style string, or a
     {name: target} table. Anything else, an item that is not a string, or a line with no `=` (or an empty
     name) is unknown, never dropped; only blank and `#`/`;` comment lines are skipped."""
     if isinstance(v, dict):
-        return [(str(k), t) if isinstance(t, str) else _UNKNOWN_EP for k, t in v.items()]
+        yield from ((str(k), t) if isinstance(t, str) else _UNKNOWN_EP for k, t in v.items())
+        return
     if isinstance(v, str):
         v = v.splitlines()
     if not isinstance(v, (list, tuple)):
-        return [_UNKNOWN_EP]
-    out = []
+        yield _UNKNOWN_EP
+        return
     for line in v:
         if isinstance(line, str) and (not line.strip() or line.lstrip().startswith(("#", ";"))):
             continue                                    # blank or comment line of an INI-style value
         if not isinstance(line, str) or line == COMPUTED or "=" not in line or not line.split("=", 1)[0].strip():
-            out.append(_UNKNOWN_EP)                     # never dropped silently
+            yield _UNKNOWN_EP                           # never dropped silently
         else:
             name, target = line.split("=", 1)
-            out.append((name.strip(), target.strip()))
-    return out
+            yield name.strip(), target.strip()
+
+
+def _collect(slot: list, entries) -> None:
+    """slot = [kept, more]: keep a group's first _MAX_ITEMS + 1 distinct entries (one more than _join shows, so
+    it still says "+N more") and only count the rest, so memory is bounded however many a source declares.
+    An entry repeated after the cap is counted again: the count may overstate, never understate."""
+    kept = slot[0]
+    for e in entries:
+        if e in kept:
+            continue
+        if len(kept) <= _MAX_ITEMS:
+            kept.append(e)
+        else:
+            slot[1] += 1
 
 
 def _table(v):
@@ -241,26 +257,28 @@ def _add_groups(eps: dict, groups) -> None:
     if isinstance(groups, str) and groups != COMPUTED:      # setup.py may pass the INI text itself
         groups = parse_mapping(groups.encode("utf-8", "surrogatepass"), "entry_points")
     if not isinstance(groups, dict):
-        eps.setdefault(COMPUTED, [])
+        eps.setdefault(COMPUTED, [[], 0])
         return
     for group, v in groups.items():
         if not isinstance(group, str):
-            eps.setdefault(COMPUTED, [])                # a group we cannot name: unknown, not dropped
+            eps.setdefault(COMPUTED, [[], 0])           # a group we cannot name: unknown, not dropped
         elif v is not None:
-            eps.setdefault(group.strip(), []).extend(_ep_lines(v))
+            _collect(eps.setdefault(group.strip(), [[], 0]), _ep_lines(v))
 
 
 _COMMAND_GROUPS = ("console_scripts", "gui_scripts")
 
 
 def _entry_points_lines(eps: dict, unknown: list, empty: str) -> tuple[str, str]:
-    cmds = [n if n == COMPUTED else f"{n} -> {t}" for g in _COMMAND_GROUPS for n, t in eps.get(g, [])]
-    plugins = [f"{g}: {n}" if n == COMPUTED else f"{g}: {n} -> {t}"
-               for g, lst in eps.items() if g not in _COMMAND_GROUPS and g != COMPUTED for n, t in lst]
+    plugin_groups = [g for g in eps if g not in _COMMAND_GROUPS and g != COMPUTED]
+    cmds = [n if n == COMPUTED else f"{n} -> {t}" for g in _COMMAND_GROUPS for n, t in eps.get(g, [[]])[0]]
+    plugins = [f"{g}: {n}" if n == COMPUTED else f"{g}: {n} -> {t}" for g in plugin_groups for n, t in eps[g][0]]
     if COMPUTED in eps:
         cmds.append(f"entry points={COMPUTED}")
         plugins.append(f"entry points={COMPUTED}")
-    return _join(cmds + unknown, empty), _join(plugins + unknown, empty)
+    # unknown first: past the cap it would fold into "+N more" and the line would hide that sources went unread
+    return (_join(unknown + cmds, empty, sum(eps[g][1] for g in _COMMAND_GROUPS if g in eps)),
+            _join(unknown + plugins, empty, sum(eps[g][1] for g in plugin_groups)))
 
 
 # ---- discovery ----
@@ -453,8 +471,11 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
     ep_unknown_cfg = [d] if (d := _cfg_directive(cfg_eps, "entry points")) else []
     if not d:
         _add_groups(eps, cfg_eps.strip() or None)               # INI text inline in [options]
-    for p in _egg_info(new_files, "entry_points.txt"):
+    egg_eps = _egg_info(new_files, "entry_points.txt")
+    for p in egg_eps[:_MAX_EGG_EPS]:                    # bounded: each may be as large as the extraction cap
         _add_groups(eps, parsed(p, "entry_points"))
+    if len(egg_eps) > _MAX_EGG_EPS:
+        ep_unknown_cfg.append(f"unknown ({len(egg_eps) - _MAX_EGG_EPS} more egg-info entry_points.txt not read)")
     flit_paths = []                                     # flit's [tool.flit.metadata] entry-points-file, INI format
     if backend in _FLIT_BACKENDS:
         epf = _dict(_dict(_dict(pp.get("tool")).get("flit")).get("metadata")).get("entry-points-file")

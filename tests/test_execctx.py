@@ -207,11 +207,14 @@ def _line(ctx, prefix):
 
 
 def test_many_unparseable_files_fold_into_one_capped_line():
+    # at most three egg-info entry_points.txt are read (final review I1): the rest are named, never parsed
     files = {f"e{i:04d}.egg-info/entry_points.txt": b"no section\n" for i in range(1990)}
     ctx = execctx.build(files)
-    bad = [ln for ln in ctx.split("\n") if "unparseable" in ln]
-    assert len(bad) == 1 and bad[0].startswith("unparseable: e0000.egg-info/entry_points.txt, ")
-    assert "(+1970 more)" in bad[0] and len(ctx) < 10_000
+    bad = [ln for ln in ctx.split("\n") if ln.startswith("unparseable")]
+    assert bad == ["unparseable: e0000.egg-info/entry_points.txt, e0001.egg-info/entry_points.txt, "
+                   "e0002.egg-info/entry_points.txt"]
+    assert "unknown (1987 more egg-info entry_points.txt not read)" in _line(ctx, "commands")
+    assert len(ctx) < 10_000
 
 
 def test_an_ini_string_entry_points_in_setup_py_is_parsed():
@@ -351,7 +354,7 @@ def test_an_unparseable_setup_py_makes_its_fields_unknown():
     ctx = execctx.build({"setup.py": b"from setuptools import setup\nsetup(name='x', entry_points={'pytest11': ['p = e']}\n",
                          "a.egg-info/entry_points.txt": b"[console_scripts]\nc = a:main\n"})
     u = "unknown (setup.py unparseable)"
-    assert _line(ctx, "commands").endswith(f"c -> a:main, {u}") and _line(ctx, "plugins").endswith(u)
+    assert _line(ctx, "commands").endswith(f": {u}, c -> a:main") and _line(ctx, "plugins").endswith(u)
     assert f"cmdclass={u}" in ctx and f"setup_requires={u}" in ctx and f"py-modules={u}" in ctx
     assert "backend-path=none" in ctx                                    # only pyproject declares it
 
@@ -714,3 +717,40 @@ def test_a_flit_entry_points_file_naming_setup_py_is_unknown_not_reparsed():
                          "setup.py": b"from setuptools import setup\nsetup(name='a', cmdclass={'build': B})\n"})
     expect = "unknown (flit entry-points-file setup.py is not an entry-points file)"
     assert _line(ctx, "plugins").endswith(f": {expect}") and "unparseable" not in ctx
+
+
+# ---- final review I1: memory and CPU stay bounded on many large egg-info entry_points.txt ----
+
+def _egg_eps(n_files, n_entries):
+    return {f"a{j:02d}.egg-info/entry_points.txt":
+            ("[console_scripts]\n" + "".join(f"c{j:02d}_{i} = m:f\n" for i in range(n_entries))).encode()
+            for j in range(n_files)}
+
+
+def test_at_most_three_egg_info_entry_points_txt_are_parsed_and_the_rest_are_named(monkeypatch):
+    calls = []
+    real = execctx.parse_mapping
+    monkeypatch.setattr(execctx, "parse_mapping", lambda data, kind: calls.append(kind) or real(data, kind))
+    ctx = execctx.build(_egg_eps(8, 50))
+    assert calls.count("entry_points") == 3
+    u = "unknown (5 more egg-info entry_points.txt not read)"
+    assert u in _line(ctx, "commands") and u in _line(ctx, "plugins")
+    assert _line(ctx, "commands").endswith(f": {u}, c00_0 -> m:f, c00_1 -> m:f, c00_2 -> m:f, " + ", ".join(
+        f"c00_{i} -> m:f" for i in range(3, 19)) + ", … (+131 more)")   # the note + 3 files x 50 entries, 20 shown
+
+
+def test_one_group_keeps_at_most_one_more_entry_than_is_shown_and_counts_the_rest():
+    eps = {}
+    execctx._add_groups(eps, {"console_scripts": [f"c{i} = m:f" for i in range(5_000)]})
+    execctx._add_groups(eps, {"console_scripts": [f"d{i} = m:f" for i in range(5_000)]})
+    kept, more = eps["console_scripts"]
+    assert len(kept) == execctx._MAX_ITEMS + 1 and more == 10_000 - execctx._MAX_ITEMS - 1
+    cmds, _ = execctx._entry_points_lines(eps, [], "none")
+    assert cmds.endswith(f", … (+{10_000 - execctx._MAX_ITEMS} more)") and cmds.startswith("c0 -> m:f, ")
+
+
+def test_plugin_groups_count_their_uncollected_entries():
+    eps = {}
+    execctx._add_groups(eps, {"pytest11": [f"p{i} = m" for i in range(100)], "x": ["a = b"]})
+    _, plugins = execctx._entry_points_lines(eps, [], "none")
+    assert plugins.startswith("pytest11: p0 -> m, ") and plugins.endswith(", … (+81 more)")
