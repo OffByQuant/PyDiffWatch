@@ -225,8 +225,10 @@ Clear-malicious verdicts alert immediately; borderline "suspicious" ones queue f
 JSON metadata at `packument_deadline_s` (300s total, since a big project lists every release ever
 published); metadata is also capped at `max_metadata_bytes` (64 MB). A metadata **404** means the release
 was pulled before it could be scanned — that's terminal (`metadata_gone`) and alerts on its own, since a
-release PyPI itself removed fast is worth a look. Any other metadata failure (timeout, 5xx, malformed
-JSON) retries on later ticks; after 4 attempts it becomes `gave_up` and shows up in `pending`. If the
+release PyPI itself removed fast is worth a look. Any other failure on a release (a metadata timeout, 5xx
+or malformed JSON, a failed or timed-out sdist download, an error while diffing or scoring it) retries on
+later ticks without holding up the releases after it; after 4 attempts it becomes `gave_up` and shows up
+in `pending`, with the error kept on the release row (`fetch_note`). If the
 release's *prior* version fails to download, it's diffed against nothing (every file in the new release
 reported as added) rather than skipped, and the release's evidence says so. Within a diff, an
 oversized/binary/foreign-language file only counts as a signal when this release adds or changes it — an

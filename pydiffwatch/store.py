@@ -230,12 +230,13 @@ def pending_reviews(conn, reasons=None, max_chars=None):
 def review_input(row) -> str:
     return zlib.decompress(row["review_input"]).decode()
 
-METADATA_ATTEMPTS = 4    # failed metadata downloads before a release is given up on (visibly, in `pending`)
+METADATA_ATTEMPTS = 4    # failed attempts (metadata, sdist download, or diff/triage) before a release is given up on
 
 
 def note_metadata_failure(conn, release_id, detail) -> str:
-    """Count a failed metadata download; the release waits in `metadata_retry` (retried each tick, off the
-    cursor) until it has failed METADATA_ATTEMPTS times, then `gave_up`. Returns the new stage."""
+    """Count a failed attempt at a release (its metadata or sdist download, or its diff/triage); the release
+    waits in `metadata_retry` (retried each tick, off the cursor) until it has failed METADATA_ATTEMPTS times,
+    then `gave_up`. `detail` (the error) is kept in fetch_note. Returns the new stage."""
     conn.execute("UPDATE releases SET fetch_attempts=COALESCE(fetch_attempts,0)+1, fetch_note=? WHERE id=?",
                  (detail, release_id))
     n = conn.execute("SELECT fetch_attempts FROM releases WHERE id=?", (release_id,)).fetchone()[0]

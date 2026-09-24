@@ -133,7 +133,7 @@ def main():
             print(f"[pydiffwatch] reviewer: {describe(gs)}")
         mr = metadata_retry_counts(cfg)
         if mr["retrying"] or mr["gave_up"]:
-            print(f"[pydiffwatch] PyPI metadata failed to download: {mr['retrying']} release(s) being retried, "
+            print(f"[pydiffwatch] failed to download or scan: {mr['retrying']} release(s) being retried, "
                   f"{mr['gave_up']} given up on after {store.METADATA_ATTEMPTS} attempts (not scanned)")
         queued = pending_review_counts(cfg)
         if queued:

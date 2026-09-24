@@ -167,3 +167,88 @@ def test_a_retried_release_that_then_fails_to_download_stays_in_the_retry_queue(
     conn = store.connect(tmp_cfg)
     row = conn.execute("SELECT stage, fetch_attempts FROM releases WHERE package='victim'").fetchone()
     assert (row["stage"], row["fetch_attempts"]) == ("metadata_retry", 2)
+
+
+# Final review: every non-terminal per-release failure goes to the same bounded retry queue. A failed sdist
+# download (incl. a fetch_deadline_s expiry) or a diff/triage exception used to be `fetch_failed`, which held
+# the cursor at that release on every tick for as long as the failure lasted — forever, if it was deterministic.
+
+def test_a_failed_sdist_download_is_retried_without_pinning_the_cursor(tmp_cfg, monkeypatch):
+    _feed(monkeypatch, [NewRelease("victim", "1.1", 10), NewRelease("after", "1.0", 11)])
+    monkeypatch.setattr(fetcher, "_package_json",
+                        lambda pkg, cfg: _VICTIM if pkg == "victim" else _meta(pkg, [("1.0", "2026-01-01T00:00:00Z")]))
+    tries = []
+
+    def download(url, cfg):
+        if "victim" in url:
+            tries.append(url)
+            raise TimeoutError("download took longer than 120s")
+        return NEW
+    monkeypatch.setattr(fetcher, "_download", download)
+    orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
+    conn = store.connect(tmp_cfg)
+    assert store.get_last_serial(conn) == 11
+    row = conn.execute("SELECT stage, fetch_note FROM releases WHERE package='victim'").fetchone()
+    assert row["stage"] == "metadata_retry"
+    assert "TimeoutError" in row["fetch_note"] and "120s" in row["fetch_note"]
+    for _ in range(4):
+        orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
+    assert store.get_stage(conn, "victim", "1.1") == "gave_up"
+    assert len([u for u in tries if u.endswith("/1.1")]) == 4               # bounded
+    assert store.metadata_retry_counts(conn) == {"retrying": 0, "gave_up": 1}
+
+
+def test_a_diff_or_triage_failure_is_retried_without_pinning_the_cursor(tmp_cfg, monkeypatch):
+    from pydiffwatch import engine
+    _feed(monkeypatch, [NewRelease("victim", "1.1", 10), NewRelease("after", "1.0", 11)])
+    monkeypatch.setattr(fetcher, "_package_json",
+                        lambda pkg, cfg: _VICTIM if pkg == "victim" else _meta(pkg, [("1.0", "2026-01-01T00:00:00Z")]))
+    monkeypatch.setattr(fetcher, "_download", lambda url, cfg: NEW)
+    real = engine.triage
+
+    def triage(d, *a, **k):
+        if d.package == "victim":
+            raise RecursionError("maximum recursion depth exceeded")
+        return real(d, *a, **k)
+    monkeypatch.setattr(engine, "triage", triage)
+    orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
+    conn = store.connect(tmp_cfg)
+    assert store.get_last_serial(conn) == 11
+    row = conn.execute("SELECT stage, fetch_note FROM releases WHERE package='victim'").fetchone()
+    assert row["stage"] == "metadata_retry" and "RecursionError" in row["fetch_note"]
+
+
+def test_a_retry_that_fails_after_the_download_notes_the_real_error(tmp_cfg, monkeypatch):
+    # The retry queue's own fallback used to note the result's type name, which read "ArtifactSet".
+    from pydiffwatch import engine
+    _feed(monkeypatch, [NewRelease("victim", "1.1", 10)])
+    state = {"meta_fails": True}
+
+    def pkg_json(pkg, cfg):
+        if state["meta_fails"]:
+            raise TimeoutError("metadata hung")
+        return _VICTIM
+    monkeypatch.setattr(fetcher, "_package_json", pkg_json)
+    monkeypatch.setattr(fetcher, "_download", lambda url, cfg: NEW)
+    monkeypatch.setattr(engine, "triage", lambda *a, **k: (_ for _ in ()).throw(ValueError("bad rule state")))
+    orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
+    state["meta_fails"] = False
+    orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
+    conn = store.connect(tmp_cfg)
+    row = conn.execute("SELECT stage, fetch_attempts, fetch_note FROM releases WHERE package='victim'").fetchone()
+    assert (row["stage"], row["fetch_attempts"]) == ("metadata_retry", 2)
+    assert "ValueError" in row["fetch_note"] and "bad rule state" in row["fetch_note"]
+    assert "ArtifactSet" not in row["fetch_note"]
+
+
+def test_pending_does_not_call_every_retry_a_metadata_failure(tmp_cfg, monkeypatch, capsys):
+    from pydiffwatch import __main__ as cli
+    conn = store.connect(tmp_cfg); store.init_schema(conn)
+    rid = store.record_release(conn, "p", "1.0", 1, False, None, "sdist")
+    store.update_stage(conn, rid, "metadata_retry")
+    monkeypatch.setattr(cli, "_cfg", lambda args: tmp_cfg)
+    monkeypatch.setattr(cli.egress, "install_guard", lambda cfg: None)
+    monkeypatch.setattr(sys, "argv", ["pydiffwatch", "pending"])
+    cli.main()
+    out = capsys.readouterr().out
+    assert "1 release(s) being retried" in out and "metadata failed" not in out

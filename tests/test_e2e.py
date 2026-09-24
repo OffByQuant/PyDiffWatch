@@ -139,8 +139,8 @@ def test_refused_extract_emits_suspicious_alert(tmp_cfg, monkeypatch):
     conn.close()
 
 def test_transient_fetch_error_is_retryable_not_poison(tmp_cfg, monkeypatch):
-    # A transient (non-RefusedTo*) error mid-batch must NOT abort the tick, must NOT advance the
-    # cursor past the failed release, and must be reprocessed+alerted on a later tick (no silent drop).
+    # A transient (non-RefusedTo*) error mid-batch must NOT abort the tick, must NOT pin the cursor at the
+    # failed release, and must be reprocessed+alerted on a later tick from the retry queue (no silent drop).
     import urllib.error
     good = NewRelease("good", "1.0", 10)
     boom = NewRelease("victimx", "1.1", 11)
@@ -162,18 +162,17 @@ def test_transient_fetch_error_is_retryable_not_poison(tmp_cfg, monkeypatch):
     n1 = orchestrator.run_once(tmp_cfg, seed_if_fresh=False)   # tick 1: good ok, victimx fails transiently
     assert n1 == 3
     conn = store.connect(tmp_cfg)
-    # cursor must NOT have advanced past the failed release (still at 10, the last contiguous terminal)
-    assert store.get_last_serial(conn) == 10
-    # victimx recorded but in a retryable stage, no alert yet
-    assert store.get_stage(conn, "victimx", "1.1") == "fetch_failed"
+    # the cursor moves on; victimx waits in the bounded retry queue, no alert yet
+    assert store.get_last_serial(conn) == 12
+    assert store.get_stage(conn, "victimx", "1.1") == "metadata_retry"
     assert conn.execute("SELECT COUNT(*) FROM alerts a JOIN releases r ON r.id=a.release_id "
                         "WHERE r.package='victimx'").fetchone()[0] == 0
     conn.close()
 
-    n2 = orchestrator.run_once(tmp_cfg)             # tick 2: changes_since(10) returns victimx+after; victimx now succeeds
+    n2 = orchestrator.run_once(tmp_cfg)             # tick 2: the retry queue re-fetches victimx; it now succeeds
     conn = store.connect(tmp_cfg)
     assert store.get_stage(conn, "victimx", "1.1") in ("triaged", "alerted")
     assert conn.execute("SELECT COUNT(*) FROM alerts a JOIN releases r ON r.id=a.release_id "
                         "WHERE r.package='victimx'").fetchone()[0] == 1   # malicious now alerted
-    assert store.get_last_serial(conn) == 12        # cursor caught up after success
+    assert store.get_last_serial(conn) == 12
     conn.close()

@@ -11,7 +11,8 @@ _FLAGGED = ("malicious", "suspicious")
 
 # Stages that represent a completed analysis or permanent decision; skipped on future ticks.
 # pending_review is terminal for the cursor: the LLM-review queue retries it, not the scan. Likewise
-# metadata_retry: failed metadata downloads are retried from the release rows, not the changelog.
+# metadata_retry: a release whose metadata or sdist download, or diff/triage, failed is retried from its
+# release row (bounded, then gave_up), not the changelog.
 TERMINAL = {"triaged", "alerted", "reviewed", "new_package_skipped", "needs_adjudication",
             "refused_to_extract", "no_sdist", "refused_to_fetch", "pending_review",
             "metadata_gone", "metadata_retry", "gave_up"}
@@ -207,7 +208,8 @@ def _queue_refusal(cfg, conn, rid, rel, note):
 def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=None) -> bool:
     """Main-thread half: record the release, map a completed fetch `result` (ArtifactSet | None |
     Exception) to a stage, diff/triage/review, emit alerts. ALL sqlite + notifier work happens here.
-    Returns True iff the release reached a terminal stage."""
+    Returns True iff the release reached a terminal stage; a failure is queued for retry (_retry_later),
+    which is terminal for the cursor."""
     rid = store.record_release(conn, rel.package, rel.version, rel.serial, False, None, "sdist")
     if isinstance(result, fetcher.RefusedToFetch):
         store.update_stage(conn, rid, "refused_to_fetch")
@@ -225,14 +227,8 @@ def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=
                       confidence=0.0, attack_type="none", cited_hunk="", model="none",
                       reasoning="removed from PyPI before it could be scanned (its metadata returns 404)"), rid)
         return True
-    if isinstance(result, fetcher.MetadataUnavailable):
-        stage = store.note_metadata_failure(conn, rid, str(result))
-        logger.warning("metadata download failed for %s==%s (%s): %s", rel.package, rel.version, stage, result)
-        return True   # retried from the release row on later ticks; the cursor moves on
-    if isinstance(result, Exception):
-        logger.warning("fetch_failed for %s==%s; will retry next tick", rel.package, rel.version)
-        store.update_stage(conn, rid, "fetch_failed")
-        return False  # non-terminal: cursor must not advance past this release
+    if isinstance(result, Exception):   # metadata or sdist download failed (incl. a deadline expiry)
+        return _retry_later(conn, rid, rel, result)
     if result is None:
         store.update_stage(conn, rid, "no_sdist")   # no sdist for this version — permanent
         return True
@@ -260,23 +256,26 @@ def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=
         if tr.escalate:
             _review_escalated(cfg, conn, rvw, d, tr, rid, offline=offline, guard=guard)
         return True   # terminal: an unfinished LLM review is parked in the pending-review queue
-    except Exception:
-        logger.exception("processing failed for %s==%s; will retry next tick", rel.package, rel.version)
-        store.update_stage(conn, rid, "fetch_failed")
-        return False  # non-terminal: cursor must not advance past this release
+    except Exception as e:
+        logger.exception("processing failed for %s==%s", rel.package, rel.version)
+        return _retry_later(conn, rid, rel, e)
+
+
+def _retry_later(conn, rid, rel, e) -> bool:
+    """Queue a failed release for retry from its row (store.note_metadata_failure: bounded, then gave_up,
+    both shown by `pending`). The cursor moves on: a failure that never clears must not pin it."""
+    stage = store.note_metadata_failure(conn, rid, f"{type(e).__name__}: {e}")
+    logger.warning("scan failed for %s==%s (%s): %s: %s", rel.package, rel.version, stage, type(e).__name__, e)
+    return True
 
 
 def _retry_metadata(cfg, conn, rvw, ruleset, offline, guard):
-    """Re-fetch releases whose metadata download failed on an earlier tick. They are behind the cursor
-    already, so a result here never gates it."""
+    """Re-fetch and re-scan releases that failed on an earlier tick. They are behind the cursor already,
+    so a result here never gates it; a repeat failure counts toward the give-up (_retry_later)."""
     due = [NewRelease(r["package"], r["version"], r["serial"]) for r in store.metadata_retries_due(conn)]
     with ThreadPoolExecutor(max_workers=max(1, cfg.fetch_concurrency)) as ex:
         for rel, result in zip(due, ex.map(lambda r: _fetch_one(cfg, r), due)):
-            if not _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline, guard):
-                # A later step failed transiently. The changelog won't bring this release back, so it
-                # stays in this queue (and counts toward the give-up) rather than sit in fetch_failed.
-                rid = store.record_release(conn, rel.package, rel.version, rel.serial, False, None, "sdist")
-                store.note_metadata_failure(conn, rid, f"retry failed after metadata: {type(result).__name__}")
+            _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline, guard)
 
 
 def seed_now(cfg: Config):
@@ -525,7 +524,7 @@ def _cursor(cfg) -> int:
 
 def _behind(cfg, before: int) -> bool:
     """True when the tick moved the cursor and at least max_releases_per_run PyPI changelog events are
-    still waiting. A pinned cursor (a release that keeps failing to fetch) is never "behind": retrying it
+    still waiting. A pinned cursor (the PyPI changelog call keeps failing) is never "behind": retrying it
     back-to-back would hammer PyPI."""
     after = _cursor(cfg)
     if after <= before:
