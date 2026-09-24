@@ -201,12 +201,18 @@ def _review_escalated(cfg, conn, rvw, d, tr, rid, *, offline=False, guard=None):
         if offline:
             _park_auto(conn, rid, "endpoint_unreachable", "reviewer endpoint unreachable", text)
         else:
+            # Queued before the model call, which can take minutes: a kill mid-review leaves the release in the
+            # auto-drain queue rather than at `triaged`, which no tick revisits. A finished review un-parks it.
+            _park_auto(conn, rid, "in_review", "the review was interrupted before it finished", text)
             _attempt_review(cfg, conn, rvw, rid, d.package, d.version, tr.score, tr.fired_rules, text, guard,
                             dropped=dropped)
     if store.get_stage(conn, d.package, d.version) == "pending_review":
-        # Not reviewed yet: alert on the heuristic now rather than wait for the queue to drain.
-        notifier.emit(cfg, conn, Verdict(d.package, d.version, "suspicious-heuristic",
-                                         tr.score, tr.fired_rules, False), rid)
+        _alert_heuristic(cfg, conn, rid, d.package, d.version, tr.score, tr.fired_rules)
+
+
+def _alert_heuristic(cfg, conn, rid, package, version, score, fired_rules):
+    """Not reviewed yet: alert on the heuristic now rather than wait for the queue to drain."""
+    notifier.emit(cfg, conn, Verdict(package, version, "suspicious-heuristic", score, fired_rules, False), rid)
 
 
 def drain_pending(cfg, conn, rvw, *, auto: bool, reasons=None, limit=None, guard=None) -> int:
@@ -215,7 +221,7 @@ def drain_pending(cfg, conn, rvw, *, auto: bool, reasons=None, limit=None, guard
     releases and exhausted retries — run it with a larger-context model config. Inputs over this endpoint's cap are skipped
     (auto: re-parked as too_large). `limit` caps attempts, not successes. Returns the number reviewed."""
     if auto:
-        reasons = ("model_busy", "endpoint_unreachable", "review_failed")
+        reasons = ("model_busy", "in_review", "endpoint_unreachable", "review_failed")
     elif not reasons:
         reasons = ("too_large", "review_failed")
     cap = guard.input_cap_chars() if guard is not None else cfg.reviewer.max_input_chars
@@ -272,8 +278,13 @@ def _drain_one(cfg, conn, rvw, row, *, auto, cap, provisional, guard):
         return False, True
     fired_rules = _rules_from_json(row["triage_rules"])
     dropped = reviewer.dropped_from_text(fired_rules, text)   # spec U2: recovered from stored text
-    return True, _attempt_review(cfg, conn, rvw, rid, row["package"], row["version"], row["triage_score"],
-                                 fired_rules, reviewer.refresh_marker(text), guard, dropped=dropped)
+    go_on = _attempt_review(cfg, conn, rvw, rid, row["package"], row["version"], row["triage_score"],
+                            fired_rules, reviewer.refresh_marker(text), guard, dropped=dropped)
+    if row["pending_reason"] == "in_review" and \
+            store.get_stage(conn, row["package"], row["version"]) == "pending_review":
+        # A review interrupted by a kill, and still not done: the first-park alert it never got.
+        _alert_heuristic(cfg, conn, rid, row["package"], row["version"], row["triage_score"], fired_rules)
+    return True, go_on
 
 
 

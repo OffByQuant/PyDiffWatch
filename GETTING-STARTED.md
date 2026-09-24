@@ -290,6 +290,7 @@ later review doesn't depend on PyPI still hosting the sdist.
 | reason | when | drained by |
 |---|---|---|
 | `model_busy` | the reviewer guard deferred it: breaker open after a timeout, the model degrading, or this machine short on memory | every tick, first, once the guard allows reviews |
+| `in_review` | the process stopped (killed, crashed, rebooted) while the model was reviewing it | every tick; if that review can't finish either, it gets the heuristic alert it missed |
 | `endpoint_unreachable` | the model server is down (each tick prints a warning) | every tick, once it's back |
 | `review_failed` | a review timed out or failed; retried at `timeout` × attempt (300s, 600s, 900s) | every tick, up to `max_review_attempts` (3) |
 | `too_large` | the highest-risk file alone exceeds `max_input_chars` (200k chars) | `review-pending` with a larger-context model |

