@@ -67,6 +67,18 @@ def _clip_files(paths, limit=300) -> str:
     return _clip(", ".join(paths), limit)
 
 
+def _weak_malicious(cfg, verdict) -> str:
+    """Why a malicious verdict's evidence is weak (spec decision 2), or "" when it is not: the cited code runs
+    only on a user command or is not shipped, or confidence is missing or below malicious_min_confidence.
+    runs_when `unknown` alone is not weak."""
+    if verdict.runs_when in ("user-command", "not-shipped"):
+        return f"runs_when={verdict.runs_when}"
+    if verdict.confidence is None:
+        return "no confidence"
+    floor = cfg.reviewer.malicious_min_confidence
+    return f"confidence {verdict.confidence:g} < {floor:g}" if verdict.confidence < floor else ""
+
+
 def _record(cfg, conn, rid, verdict, score, dropped=()):
     store.clear_pending(conn, rid)
     # spec U2: a benign verdict is not final when the input cap dropped a file that carried fired-rule
@@ -79,6 +91,16 @@ def _record(cfg, conn, rid, verdict, score, dropped=()):
         store.update_stage(conn, rid, "needs_adjudication", score, None)  # -> `pydiffwatch pending`
         notifier.emit(cfg, conn, dataclasses.replace(v, classification="suspicious-heuristic"), rid,
                      dedupe_suffix="partial-review")                      # one alert; a person looks at it
+        return
+    if verdict.classification == "malicious" and (weak := _weak_malicious(cfg, verdict)):
+        # spec decision 2: weak evidence never alerts as malicious. It is recorded and alerted as suspicious and
+        # waits in `pending`; the model's own label and reasoning stay in the reasoning for the person.
+        note = f"model said malicious (downgraded: {weak}); needs manual review"
+        reasoning = f"{note}. Model: {verdict.reasoning}" if verdict.reasoning else note
+        v = dataclasses.replace(verdict, classification="suspicious", reasoning=reasoning)
+        store.record_verdict(conn, rid, v)
+        store.update_stage(conn, rid, "needs_adjudication", score, None)  # -> `pydiffwatch pending`
+        notifier.emit(cfg, conn, v, rid, dedupe_suffix="downgraded")       # one alert; a person looks at it
         return
     store.record_verdict(conn, rid, verdict)
     # Route by the model's classification. A `suspicious` verdict is queued for human adjudication — it

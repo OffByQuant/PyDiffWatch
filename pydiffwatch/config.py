@@ -26,6 +26,9 @@ class ReviewerConfig:
     # truncates the JSON before all fields emit. Sized to leave room for reasoning + the full verdict.
     max_output_tokens: int = 32000
     opus_escalation_confidence: float = 0.6
+    # A `malicious` verdict below this confidence, or on code that runs only on a user command or is not shipped,
+    # is weak: it alerts as `suspicious` with "needs manual review" and waits in `pending` (spec decision 2).
+    malicious_min_confidence: float = 0.8
     budget_safety: float = 0.6         # a review may be predicted to use at most this share of `timeout`
     probe_timeout: float = 180.0       # health probe / calibration (covers llama-swap loading a model)
     slowdown_ratio: float = 0.3        # a review below this share of measured speed counts as slow
@@ -36,6 +39,11 @@ class ReviewerConfig:
     # provider only) — e.g. DeepSeek's reasoning toggle: [reviewer.extra_body] reasoning = {enabled=false}.
     # Reserved core fields (model/messages/max_tokens/response_format) always win; see backends.py.
     extra_body: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        c = self.malicious_min_confidence
+        if isinstance(c, bool) or not isinstance(c, (int, float)) or not 0.0 <= c <= 1.0:
+            raise ValueError(f"reviewer.malicious_min_confidence must be a number from 0 to 1, got {c!r}")
 
 
 @dataclass(frozen=True)

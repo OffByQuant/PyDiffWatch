@@ -63,3 +63,4 @@ class Verdict:
     cited_hunk: str | None = None
     recommended_action: str | None = None
     model: str | None = None          # which Claude model produced this verdict (-> verdicts.model)
+    runs_when: str | None = None      # the model's answer to when the cited code runs (not stored)

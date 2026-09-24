@@ -377,11 +377,11 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
     # a backend whose own config is not parsed here (another backend, or any in-tree one via backend-path) may
     # declare entry points and generate files we cannot see: its empty fields are qualified, never a bare "none"
     in_tree = bs.get("backend-path") not in (None, [], "")
+    name = ("unknown backend" if backend is None else
+            f"in-tree backend {_clip(backend)}" if in_tree else _clip(backend))
+    tail = f"; {NOT_LITERAL}" if "setup.py" in new_files else ""
     ep_none = gen_none = none
     if backend is None or in_tree or backend not in _PARSED_BACKENDS:
-        name = ("unknown backend" if backend is None else
-                f"in-tree backend {_clip(backend)}" if in_tree else _clip(backend))
-        tail = f"; {NOT_LITERAL}" if "setup.py" in new_files else ""
         ep_none = f"none in [project] ({name} may declare its own){tail}"
         gen_none = f"none in scanned files ({name} may generate its own){tail}"
     cmdclass = []
@@ -406,8 +406,15 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
     startup = ("startup (.pth files; an `import` line runs at every interpreter start if the file is installed "
                f"into site-packages): {_join(pths, gen_none)}")  # setup.py or a backend may write a .pth
 
-    # import
+    # import: setup.py, [tool.setuptools] and setup.cfg declare packages only to setuptools itself. Under any other
+    # backend (or an in-tree one, or an unknown one) they say nothing about what is installed: not read, and an
+    # empty field is qualified, never a bare "none"
+    setuptools = backend in _SETUPTOOLS_BACKENDS and not in_tree
+    imp_none = none if setuptools else f"none in scanned files ({name} may generate its own){tail}"
+
     def declared(setup_name, st_name, cfg_name):
+        if not setuptools:
+            return None
         v = kw(setup_name)
         if v == COMPUTED:
             return COMPUTED
@@ -425,8 +432,8 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
 
     src_unknown = unknown("pyproject.toml", "setup.py", "setup.cfg")
     pkgs = declared("packages", "packages", "packages") or ", ".join(
-        src_unknown + [f"auto-discovered: {_join(_discovered(new_files), gen_none)}"])
-    mods = declared("py_modules", "py-modules", "py_modules") or _join(src_unknown, gen_none)
+        src_unknown + [f"auto-discovered: {_join(_discovered(new_files), imp_none)}"])
+    mods = declared("py_modules", "py-modules", "py_modules") or _join(src_unknown, imp_none)
     tops = [ln for p in _egg_info(new_files, "top_level.txt")
             for ln in new_files[p].decode("utf-8", errors="replace").split()]
     import_line = (f"import (runs when a program imports the package): packages={pkgs}; py-modules={mods}; "

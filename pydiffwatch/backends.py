@@ -65,21 +65,26 @@ def _usage_of(data) -> dict | None:
 # Enum fields that must NOT hard-fail on an out-of-enum value: a loose/prompt-only endpoint may emit a
 # synonym, and discarding the whole verdict over it would throw away the decision signal. These are
 # clamped toward caution at Verdict construction (reviewer.py): attack_type -> "none", and
-# recommended_action -> report-to-pypi (malicious) / monitor (otherwise). Only `classification` — for
-# which no safe default exists — stays a hard failure. This check itself is non-mutating.
-_SOFT_ENUM_KEYS = frozenset({"attack_type", "recommended_action"})
+# recommended_action -> report-to-pypi (malicious) / monitor (otherwise), runs_when -> unknown. Only
+# `classification` — for which no safe default exists — stays a hard failure. This check itself is non-mutating.
+_SOFT_ENUM_KEYS = frozenset({"attack_type", "recommended_action", "runs_when"})
+# The one key a verdict must carry (spec B6): every other key has a default the reviewer fills in, so a reply
+# truncated after `classification` keeps its verdict. The schema still lists them all as required, which strict
+# json_schema endpoints demand.
+_MANDATORY_KEYS = frozenset({"classification"})
 
 
 def validate_verdict(parsed, schema):
-    """Minimal client-side schema check (no jsonschema dep): required keys present, enum membership.
-    Raises ReviewUnavailable on any miss (except _SOFT_ENUM_KEYS, which are clamped downstream). Used
+    """Minimal client-side schema check (no jsonschema dep): mandatory keys present, enum membership.
+    Raises ReviewUnavailable on any miss (except _SOFT_ENUM_KEYS, which are clamped downstream, and required keys
+    outside _MANDATORY_KEYS, which the reviewer defaults). Used
     in EVERY structured-output mode so a loose/prompt-only endpoint can never slip an out-of-contract
     verdict past the reviewer. Non-mutating: returns `parsed` unchanged."""
     if not isinstance(parsed, dict):
         raise ReviewUnavailable(f"verdict is not a JSON object (got {type(parsed).__name__}): the model "
                                 f"returned malformed output; lower structured_output or use a stronger model.")
     for key in schema.get("required", []):
-        if key not in parsed:
+        if key not in parsed and key in _MANDATORY_KEYS:
             raise ReviewUnavailable(f"verdict missing required key {key!r}: the model returned an incomplete "
                                     f"verdict, often truncated by a reasoning model. Raise "
                                     f"reviewer.max_output_tokens, or disable thinking via [reviewer.extra_body].")
