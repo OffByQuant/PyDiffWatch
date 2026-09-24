@@ -187,3 +187,9 @@ def test_a_card_without_a_note_or_a_disagreement_keeps_the_line_short():
     assert "your verdict: malicious</div>" in out
     assert "your verdict" not in dashboard.render_dashboard([{"package": "p", "version": "1",
                                                               "classification": "malicious"}])
+
+
+def test_the_retry_backlog_leaves_the_last_poll_age_alone():
+    out = dashboard.render_dashboard([], status={"last_poll_age": "2 minutes ago", "retry": {
+        "retrying": 1, "gave_up": 0, "oldest_retrying_age": "3 hours ago"}})
+    assert "last poll: 2 minutes ago" in out and "1 scan(s) retrying (oldest first seen 3 hours ago)" in out

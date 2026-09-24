@@ -486,7 +486,8 @@ def _retry_later(cfg, conn, rid, rel, e) -> bool:
     if stage == "gave_up" and was != "gave_up":
         _alert_unscanned(cfg, conn, rid, rel.package, rel.version,
                          f"UNREVIEWED: pydiffwatch failed to download or scan it {store.METADATA_ATTEMPTS} times "
-                         f"and gave up (last error: {_clip(note)}). Not scanned. Needs manual review.", stage="gave_up")
+                         f"and gave up (last error: {_clip(note)}). Not scanned. Needs manual review.",
+                         stage="gave_up")
     return True
 
 
@@ -657,7 +658,8 @@ def review_pending(cfg: Config, reasons=None, limit=None):
 def _retry_backlog(conn) -> dict:
     """Releases retrying a failed download/scan and given up on, and how long ago the oldest retrying one was
     first seen (e.g. '3 hours ago'; None when nothing is retrying)."""
-    return {**store.metadata_retry_counts(conn), "oldest_retrying_age": _poll_age(store.oldest_retrying_at(conn))[0]}
+    return {**store.metadata_retry_counts(conn),
+            "oldest_retrying_age": _poll_age(store.oldest_retrying_at(conn))[0]}
 
 
 def metadata_retry_counts(cfg: Config) -> dict:

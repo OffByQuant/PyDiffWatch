@@ -176,8 +176,9 @@ def _status_strip(status: dict) -> str:
     retry = status.get("retry") or {}
     backlog = []
     if retry.get("retrying"):
-        age = retry.get("oldest_retrying_age")
-        backlog.append(f"{int(retry['retrying'])} scan(s) retrying" + (f" (oldest first seen {age})" if age else ""))
+        oldest = retry.get("oldest_retrying_age")
+        backlog.append(f"{int(retry['retrying'])} scan(s) retrying"
+                       + (f" (oldest first seen {oldest})" if oldest else ""))
     if retry.get("gave_up"):
         backlog.append(f"{int(retry['gave_up'])} scan(s) given up")
     retry_txt = " · ".join(backlog)
