@@ -133,7 +133,10 @@ def _file_weights(triage) -> dict:
 
 
 def _render_file(fd) -> str:
-    lines = [f"--- file: {fd.path} ({fd.change_kind}) ---"]
+    # fd.path is an author-chosen sdist member name: escaped (_one_line) so it can never smuggle a
+    # raw newline into the heading and forge an extra, unprefixed line that looks like another file's
+    # heading (dropped_from_text below parses headings back out of already-rendered text).
+    lines = [f"--- file: {_one_line(fd.path)} ({fd.change_kind}) ---"]
     for h in fd.hunks:
         for ln in h.removed:
             lines.append(f"- {ln}")
@@ -222,6 +225,29 @@ def build_review_input(diff, triage, *, max_chars: int, dropped: list | None = N
         dropped.extend(sorted((p for p in by_path if p not in rendered_set and weights.get(p, 0.0) > 0.0),
                               key=lambda p: -weights[p]))
     return text
+
+
+_CHANGE_KINDS = ("added", "removed", "modified")
+
+
+def dropped_from_text(fired_rules, text: str) -> list[str]:
+    """Recover build_review_input's dropped-file list from already-built review text plus the
+    release's fired rules — for a path (drain_pending) that only has the stored text, not the
+    original Diff/TriageResult to hand to build_review_input directly. Weighted files (summed
+    fired-rule weight > 0) whose file-heading line is absent from `text`, highest weight first.
+
+    Matched as a WHOLE text line (`p` escaped with `_one_line`, exactly as `_render_file` escapes it),
+    never a substring: every rendered diff line carries a leading '+ '/'- ' (see _render_file), the
+    description/flagged_locations lines carry their own fixed prefixes, and `_one_line` means a path
+    can never smuggle a raw newline into the text — so package content can never forge a match for a
+    heading it isn't.
+    """
+    weights: dict[str, float] = {}
+    for r in fired_rules:
+        weights[r.file] = weights.get(r.file, 0.0) + r.weight
+    lines = set(text.split("\n"))
+    return [p for p, w in sorted(weights.items(), key=lambda kv: -kv[1])
+            if w > 0.0 and not any(f"--- file: {_one_line(p)} ({k}) ---" in lines for k in _CHANGE_KINDS)]
 
 
 def build_evidence(diff, triage, *, max_chars: int) -> str:

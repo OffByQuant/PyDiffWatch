@@ -36,6 +36,31 @@ def test_render_escapes_untrusted_package_name():
     assert "&lt;script&gt;" in out
 
 
+def test_render_partial_review_benign_gets_report_link_and_flagged_styling():
+    # spec U2: a benign verdict routed to needs_adjudication (a file the model never saw carried
+    # fired-rule weight) must not render as a clean, dimmed "benign" card — a person still needs to
+    # look at it.
+    out = dashboard.render_dashboard([{"package": "partpkg", "version": "1.0.0",
+                                       "classification": "benign", "stage": "needs_adjudication"}])
+    assert "Report malware on PyPI" in out
+    assert 'class="card suspicious"' in out
+    assert ">benign<" in out       # the model's actual classification is still shown as text
+
+
+def test_render_counts_partial_review_benign_as_flagged_for_review():
+    out = dashboard.render_dashboard([{"package": "partpkg", "version": "1.0.0",
+                                       "classification": "benign", "stage": "needs_adjudication"}])
+    assert "1 flagged for review" in out
+
+
+def test_is_flagged():
+    assert dashboard.is_flagged({"classification": "malicious"}) is True
+    assert dashboard.is_flagged({"classification": "suspicious"}) is True
+    assert dashboard.is_flagged({"classification": "benign"}) is False
+    assert dashboard.is_flagged({"classification": "benign", "stage": "needs_adjudication"}) is True
+    assert dashboard.is_flagged({"classification": "benign", "stage": "reviewed"}) is False
+
+
 def test_render_orders_flagged_first():
     out = dashboard.render_dashboard([
         {"package": "benignpkg", "version": "1.0.0", "classification": "benign"},

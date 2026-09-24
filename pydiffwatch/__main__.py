@@ -152,8 +152,8 @@ def main():
                   + ") — see `review-pending`")
         items = list_pending(cfg)
         if not items:
-            print("[pydiffwatch] no suspicious verdicts awaiting adjudication"); return
-        print(f"[pydiffwatch] {len(items)} suspicious verdict(s) awaiting adjudication:\n")
+            print("[pydiffwatch] nothing awaiting adjudication"); return
+        print(f"[pydiffwatch] {len(items)} release(s) awaiting adjudication:\n")
         for it in items:
             why = (f"not scanned: {it['not_scanned']}" if it["not_scanned"] else
                    f"model: {it['classification']} conf={it['confidence']} attack={it['attack_type']}")

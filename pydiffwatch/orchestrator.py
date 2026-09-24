@@ -7,8 +7,6 @@ from .models import Verdict, NewRelease, FiredRule
 
 logger = logging.getLogger(__name__)
 
-_FLAGGED = ("malicious", "suspicious")
-
 # Stages that represent a completed analysis or permanent decision; skipped on future ticks.
 # pending_review is terminal for the cursor: the LLM-review queue retries it, not the scan. Likewise
 # metadata_retry: a release whose metadata or sdist download, or diff/triage, failed is retried from its
@@ -70,7 +68,9 @@ def _record(cfg, conn, rid, verdict, score, dropped=()):
     # spec U2: a benign verdict is not final when the input cap dropped a file that carried fired-rule
     # weight — the model never saw it, so route to adjudication instead of saving silently.
     if verdict.classification == "benign" and dropped:
-        v = dataclasses.replace(verdict, reasoning=f"reviewed partially: {_clip_files(dropped)} not shown")
+        note = f"reviewed partially: {_clip_files(dropped)} not shown"
+        reasoning = f"{note}. Model: {verdict.reasoning}" if verdict.reasoning else note
+        v = dataclasses.replace(verdict, reasoning=reasoning)
         store.record_verdict(conn, rid, v)
         store.update_stage(conn, rid, "needs_adjudication", score, None)  # -> `pydiffwatch pending`
         notifier.emit(cfg, conn, dataclasses.replace(v, classification="suspicious-heuristic"), rid,
@@ -94,8 +94,8 @@ def _attempt_review(cfg, conn, rvw, rid, package, version, score, fired_rules, t
     """One review attempt; on failure the release is (re)parked with the reason. Returns False when no more
     reviews should be sent now (endpoint unreachable, guard deferring, or the guard's breaker just opened),
     so a drain stops instead of hammering the server. `dropped`: weighted files this text's cap dropped
-    (spec U2), carried through to _record — empty for a re-drained parked row, whose original prepare()
-    call is gone."""
+    (spec U2), carried through to _record — from `rvw.dropped_files` on a fresh review, or recovered
+    from the stored text via reviewer.dropped_from_text() when drain_pending re-drives a parked row."""
     if guard is not None:
         why = guard.admit()
         if why:
@@ -188,8 +188,10 @@ def drain_pending(cfg, conn, rvw, *, auto: bool, reasons=None, limit=None, guard
                                 _rules_from_json(row["triage_rules"]), f"needs {len(text)} chars; {explain}", text)
             continue
         tried += 1
+        fired_rules = _rules_from_json(row["triage_rules"])
+        dropped = reviewer.dropped_from_text(fired_rules, text)   # spec U2: recovered from stored text
         if not _attempt_review(cfg, conn, rvw, rid, row["package"], row["version"], row["triage_score"],
-                               _rules_from_json(row["triage_rules"]), reviewer.refresh_marker(text), guard):
+                               fired_rules, reviewer.refresh_marker(text), guard, dropped=dropped):
             break
         if store.get_stage(conn, row["package"], row["version"]) != "pending_review":
             done += 1
@@ -699,7 +701,7 @@ def export_dashboard(cfg: Config, out_path=None, generated_at: str = ""):
         "last_serial": cur["last_serial"] if cur else None,
         "last_poll_age": age, "stale": stale,
         "releases_total": releases_total, "verdicts_total": len(rows),
-        "flagged_total": sum(1 for r in rows if (r.get("classification") or "").lower() in _FLAGGED),
+        "flagged_total": sum(1 for r in rows if dashboard.is_flagged(r)),
         "reviewer": reviewer_label, "model_reachable": reachable, "pending_review": pending_review,
         "guard": guard_status(cfg),
     }

@@ -138,7 +138,10 @@ def prune(conn, retention_days: int = 0):
       actionable stage), except each package's newest release, and its newest release carrying maintainer
       metadata, which get_release_metadata reads as the next release's maintainer baseline;
     then compact the file."""
-    conn.execute("UPDATE releases SET evidence=NULL WHERE evidence IS NOT NULL AND (stage='triaged' OR id IN "
+    # needs_adjudication is excluded even when the stored verdict says 'benign': spec U2 routes a
+    # partially-reviewed benign verdict there for a person to look at, and that person may act on it.
+    conn.execute("UPDATE releases SET evidence=NULL WHERE evidence IS NOT NULL AND stage != 'needs_adjudication' "
+                 "AND (stage='triaged' OR id IN "
                  "(SELECT release_id FROM verdicts WHERE classification='benign' "
                  "AND COALESCE(human_label,'benign')='benign'))")
     last = 0    # compress in id-keyed batches, so a large legacy database is never held in memory at once
@@ -378,7 +381,7 @@ def count_releases(conn) -> int:
 def all_verdicts(conn):
     return conn.execute(
         """SELECT r.id AS release_id, r.package, r.version, r.prior_version,
-                  r.is_first_release, r.triage_score,
+                  r.is_first_release, r.triage_score, r.stage,
                   v.classification, v.confidence, v.attack_type, v.reasoning,
                   v.cited_hunk, v.model, v.urgent, v.created_at, v.human_label
            FROM releases r JOIN verdicts v ON v.release_id = r.id

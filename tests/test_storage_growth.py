@@ -89,6 +89,17 @@ def test_prune_compresses_legacy_evidence_and_drops_what_nobody_needs(tmp_path):
     assert _raw(conn, below) is None and _raw(conn, cleared) is None
 
 
+def test_prune_keeps_evidence_for_a_partial_review_benign_verdict_awaiting_adjudication(tmp_path):
+    # spec U2: a benign verdict on truncated input is routed to needs_adjudication, not saved silently
+    # — a person may still act on it, so prune must not wipe its evidence (and must not keep re-picking
+    # it up via releases_needing_evidence on every capture-evidence -> prune cycle).
+    _, conn = _db(tmp_path)
+    partial = _old(conn, "part", "1.0", 1, stage="needs_adjudication", evidence=_EV)
+    store.record_verdict(conn, partial, _verdict("part", "benign"))
+    store.prune(conn, retention_days=90)
+    assert store.get_evidence(conn, partial) == _EV
+
+
 def test_retention_keeps_findings_queues_and_the_newest_release_of_each_package(tmp_path):
     _, conn = _db(tmp_path)
     old_plain = _old(conn, "lib", "1.0", 120)

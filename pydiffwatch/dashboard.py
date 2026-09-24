@@ -45,12 +45,20 @@ def _conf_pct(conf) -> str:
     return f"{int(round(c))}%"
 
 
+def is_flagged(row: dict) -> bool:
+    """A release needing a person's attention: a malicious/suspicious verdict, or a benign one still
+    sitting in `needs_adjudication` (spec U2: the model only reviewed part of the input)."""
+    cls = (row.get("classification") or "benign").lower()
+    return cls in _FLAGGED or row.get("stage") == "needs_adjudication"
+
+
 def _card(row: dict) -> str:
     cls = (row.get("classification") or "benign").lower()
     pkg = row.get("package") or ""
     ver = row.get("version") or ""
     e = html.escape
-    flagged = cls in _FLAGGED
+    flagged = is_flagged(row)
+    style_cls = cls if cls in _FLAGGED else ("suspicious" if flagged else cls)   # benign-but-flagged reads as suspicious
     attack = row.get("attack_type") or ""
     attack_html = (f'<span class="k">attack</span><span class="v">{e(attack)}</span>'
                    if attack and attack != "none" else "")
@@ -67,10 +75,10 @@ def _card(row: dict) -> str:
     triage = row.get("triage_score")
     triage_html = (f'<span class="k">triage</span><span class="v">{int(triage)}</span>'
                    if triage is not None else "")
-    return f"""<div class="card {e(cls)}">
+    return f"""<div class="card {e(style_cls)}">
   <div class="head">
     <div class="pkg">{e(pkg)} <span class="ver">{e(ver)}</span></div>
-    <div class="badge {e(cls)}">{e(cls)}</div>
+    <div class="badge {e(style_cls)}">{e(cls)}</div>
   </div>
   <div class="meta">
     {triage_html}
@@ -122,7 +130,11 @@ footer{color:var(--muted);font-size:12.5px;margin-top:28px;text-align:center}
 
 def _rank(row) -> int:
     cls = (row.get("classification") or "").lower()
-    return {"malicious": 0, "suspicious": 1}.get(cls, 2)
+    if cls == "malicious":
+        return 0
+    if cls == "suspicious" or is_flagged(row):
+        return 1
+    return 2
 
 
 def _status_strip(status: dict) -> str:
@@ -156,7 +168,7 @@ def _status_strip(status: dict) -> str:
 def render_dashboard(rows, status: dict = None, generated_at: str = "") -> str:
     # flagged-first, independent of caller ordering (stable within each class).
     rows = sorted((dict(r) for r in rows), key=_rank)
-    flagged = sum(1 for r in rows if (r.get("classification") or "").lower() in _FLAGGED)
+    flagged = sum(1 for r in rows if is_flagged(r))
     cards = "\n".join(_card(dict(r)) for r in rows) if rows else \
         '<div class="empty">No verdicts yet. Run <code>pydiffwatch run</code> first.</div>'
     gen = f" · generated {html.escape(generated_at)}" if generated_at else ""
