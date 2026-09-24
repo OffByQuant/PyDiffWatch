@@ -38,11 +38,19 @@ _BACKENDS_FORBIDDEN = _EXEC_INSTALL_UNPICKLE | {"socket", "ftplib", "requests", 
 _FETCHER_FORBIDDEN = _EXEC_INSTALL_UNPICKLE | {"socket", "ftplib", "requests", "httpx",
                                                "tempfile", "shutil"}
 
+# guard.py: decides whether/how much to send; it reaches the model only through the backend, so it gets
+# no egress of its own. hostmem.py: host memory via ctypes (macOS) and /proc (Linux) only — no subprocess
+# (no `vm_stat`/`sysctl` shell-outs) and no network; urllib.parse (hostname of the endpoint) is allowed,
+# checked separately by _urllib_beyond_parse.
+_GUARD_FORBIDDEN = _EXEC_INSTALL_UNPICKLE | _NETWORK
+_HOSTMEM_FORBIDDEN = _EXEC_INSTALL_UNPICKLE | (_NETWORK - {"urllib"})
+
 _FORBIDDEN_BUILTINS = {"exec", "eval", "compile", "__import__"}
 _FORBIDDEN_ATTRS = {"system", "popen", "Popen", "spawn"}  # os.system / os.popen / subprocess.Popen / pty.spawn
 
 
-def _violations(src: str, forbidden_imports: set) -> list[str]:
+def _violations(src: str, forbidden_imports: set, allowed_calls=frozenset()) -> list[str]:
+    """allowed_calls: exact `module.attr` calls exempt from _FORBIDDEN_ATTRS (e.g. platform.system)."""
     tree = ast.parse(src)
     bad: list[str] = []
     for node in ast.walk(tree):
@@ -56,7 +64,22 @@ def _violations(src: str, forbidden_imports: set) -> list[str]:
             if isinstance(f, ast.Name) and f.id in _FORBIDDEN_BUILTINS:
                 bad.append(f"{f.id}()")
             elif isinstance(f, ast.Attribute) and f.attr in _FORBIDDEN_ATTRS:
+                if isinstance(f.value, ast.Name) and f"{f.value.id}.{f.attr}" in allowed_calls:
+                    continue
                 bad.append(f".{f.attr}()")
+    return bad
+
+
+def _urllib_beyond_parse(src: str) -> list[str]:
+    """Any urllib import other than urllib.parse (which parses strings and cannot fetch)."""
+    bad: list[str] = []
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Import):
+            bad += [f"import {a.name}" for a in node.names
+                    if a.name.split(".")[0] == "urllib" and a.name != "urllib.parse"]
+        elif isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "urllib":
+            if node.module != "urllib.parse":
+                bad.append(f"from {node.module} import ...")
     return bad
 
 
@@ -123,3 +146,26 @@ def test_guard_actually_detects_a_violation():
     assert _disk_violations("tar.extractall('/tmp')\n")                       # never extract to disk
     assert _disk_violations("open('x', 'w')\n") and _disk_violations("open('x', mode='wb')\n")
     assert not _disk_violations("open('x')\n") and not _disk_violations("open('x', 'r')\n")
+
+
+def test_guard_and_hostmem_never_exec_or_open_their_own_egress():
+    # guard.py reaches the model only through the backend; hostmem.py reads memory via ctypes and /proc only
+    # (its one urllib import is urllib.parse, to read the endpoint's hostname — no fetch).
+    bad = _violations((_DIFFWATCH / "guard.py").read_text(), _GUARD_FORBIDDEN)
+    assert not bad, f"guard.py must never exec/install/unpickle or open its own egress (§6); found: {bad}"
+    src = (_DIFFWATCH / "hostmem.py").read_text()
+    bad = (_violations(src, _HOSTMEM_FORBIDDEN, allowed_calls={"platform.system"})   # the OS name, not os.system
+           + _urllib_beyond_parse(src) + _disk_violations(src))
+    assert not bad, f"hostmem.py must stay ctypes and /proc only, no subprocess or egress (§6); found: {bad}"
+
+
+def test_guard_and_hostmem_bans_detect_violations():
+    assert _violations("import subprocess\n", _GUARD_FORBIDDEN)
+    assert _violations("import urllib.request\n", _GUARD_FORBIDDEN)
+    assert _violations("import subprocess\n", _HOSTMEM_FORBIDDEN)
+    assert _violations("import socket\n", _HOSTMEM_FORBIDDEN)
+    assert _violations("import os\nos.popen('vm_stat')\n", _HOSTMEM_FORBIDDEN)
+    assert _violations("import os\nos.system('x')\n", _HOSTMEM_FORBIDDEN, allowed_calls={"platform.system"})
+    assert not _violations("import platform\nplatform.system()\n", _HOSTMEM_FORBIDDEN, allowed_calls={"platform.system"})
+    assert _urllib_beyond_parse("import urllib.request\n") and _urllib_beyond_parse("from urllib import request\n")
+    assert not _urllib_beyond_parse("from urllib.parse import urlsplit\nimport ctypes\n")
