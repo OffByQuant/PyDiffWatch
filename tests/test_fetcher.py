@@ -91,10 +91,10 @@ def test_foreign_source_recorded():
                        "app/login.php": b"<?php echo 'hi'; ?>", "pkg/__init__.py": b"x=1\n"})
     files, binaries = fetcher.extract_sdist(blob, Config())
     assert "setup.py" in files and "pkg/__init__.py" in files     # python still extracted
-    assert "app/login.php" not in files                            # foreign bytes never read
+    assert "app/login.php" not in files                            # foreign source never parsed/analyzed
     rec = next(b for b in binaries if b["path"] == "app/login.php")
     assert rec["reason"] == "foreign-language-source" and rec["ext"] == ".php"
-    assert "sha256" not in rec                                     # presence is the signal; no content read
+    assert "sha256" in rec                                         # fingerprinted, so unchanged reposts don't re-fire
 
 def test_legitimate_cext_and_assets_not_foreign():
     blob = make_sdist({"setup.py": b"x=1\n", "_speedups.c": b"int main(){}\n",

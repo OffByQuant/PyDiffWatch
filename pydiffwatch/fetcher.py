@@ -44,6 +44,13 @@ def _foreign_ext(name):
 def _strip_top(name): return name.split("/", 1)[1] if "/" in name else name
 def _unsafe(name): return name.startswith("/") or ".." in name.split("/")
 
+def _sha256_of(fileobj) -> str:
+    """Fingerprint a member without holding it in memory (an oversized source can be up to max_member_bytes)."""
+    h = hashlib.sha256()
+    while chunk := fileobj.read(1 << 20):
+        h.update(chunk)
+    return h.hexdigest()
+
 def extract_sdist(blob: bytes, cfg: Config):
     files: dict[str, bytes] = {}; binaries: list[dict] = []
     total = 0; count = 0; foreign = 0
@@ -69,16 +76,18 @@ def extract_sdist(blob: bytes, cfg: Config):
                 files[rel] = tar.extractfile(m).read(cfg.max_source_file_bytes + 1)
             elif _is_source(m.name):
                 # Oversized source: too big to analyze. Record as a signal, never drop silently (spec §8).
-                binaries.append({"path": rel, "size": m.size, "reason": "source-too-large"})
+                binaries.append({"path": rel, "size": m.size, "reason": "source-too-large",
+                                 "sha256": _sha256_of(tar.extractfile(m))})
             elif _is_binary(m.name):
                 data = tar.extractfile(m).read()
                 binaries.append({"path": rel, "sha256": hashlib.sha256(data).hexdigest(),
                                  "size": m.size})
             elif (fext := _foreign_ext(m.name)) and foreign < cfg.max_foreign_files:
-                # Foreign-language source: record presence (path/ext/size) as a signal — NEVER read the
-                # bytes (cheap, and we don't execute or analyze non-Python code). Cap-and-stop.
+                # Foreign-language source: record presence (path/ext/size) as a signal. We fingerprint
+                # the bytes (to drop unchanged files vs the prior release) but never parse or analyze
+                # them — this is not Python code we understand. Cap-and-stop.
                 binaries.append({"path": rel, "size": m.size, "ext": fext,
-                                 "reason": "foreign-language-source"})
+                                 "reason": "foreign-language-source", "sha256": _sha256_of(tar.extractfile(m))})
                 foreign += 1
     return files, binaries
 
@@ -238,6 +247,7 @@ def fetch_artifacts(cfg, rel: NewRelease) -> ArtifactSet | None:
 
     new_files, new_bins = extract_sdist(_download(new_sd["url"], cfg), cfg)
     prior_files: dict[str, bytes] = {}
+    prior_bins = None
     prior_ver = None
     prior_error = None
     dep_findings: list[dict] = []
@@ -249,9 +259,14 @@ def fetch_artifacts(cfg, rel: NewRelease) -> ArtifactSet | None:
     else:
         prior_ver, prior_url = pred
         try:
-            prior_files, _ = extract_sdist(_download(prior_url, cfg), cfg)
+            prior_files, prior_bins = extract_sdist(_download(prior_url, cfg), cfg)
         except Exception as e:     # as npm does: diff against nothing (every file reported), and say so
             prior_error = f"prior {prior_ver} sdist unavailable ({type(e).__name__}: {e}); diffed against nothing"
+        if prior_bins is not None:
+            # Only what this release adds or changes is a signal; an unchanged oversized/binary/foreign
+            # file republished release after release is not.
+            same = {(b["path"], b.get("sha256")) for b in prior_bins if b.get("sha256")}
+            new_bins = [b for b in new_bins if (b["path"], b.get("sha256")) not in same]
         # signal 5: flag suspicious newly-added dependencies vs the predecessor (update path only).
         dep_findings = _screen_added_deps(meta, rel.package, prior_ver, cfg)
     return ArtifactSet(rel.package, rel.version, prior_ver, "sdist",
