@@ -477,3 +477,23 @@ def test_a_finished_review_sends_no_extra_alert(tmp_path, capsys, reply, alerts)
     _escalating_release(conn, cfg, reviewer.Reviewer(cfg, backend=be))
     assert [k for (k,) in _alerts(conn, "pkg")] == alerts
     assert store.pending_reviews(conn) == []
+
+
+def test_a_first_park_over_the_cold_start_cap_does_not_claim_too_large_until_the_cap_is_measured(tmp_path,
+                                                                                                capsys):
+    # The cold-start cap is provisional: over it at first park, the release gets the heuristic alert every park
+    # gets, not the "too large, needs manual review" one. Once measured and still over the real cap, that one.
+    be = _Backend()
+    cfg, conn, rid, rvw = _setup(tmp_path, be)
+    gd = guard_mod.ReviewerGuard(cfg, be, conn, memory=None, out=lambda m: None)
+    assert gd.cap_is_provisional()
+    orchestrator._review_escalated(cfg, conn, rvw, _diff("x" * 60_000), _T, rid, guard=gd)
+    assert store.pending_reviews(conn)[0]["pending_reason"] == "too_large" and be.calls == []
+    assert [k for (k,) in _alerts(conn, "pkg")] == ["pkg|1.0.0|suspicious-heuristic"]
+    assert "UNREVIEWED" not in capsys.readouterr().out
+    gd.tok_s = 50.0                                          # measured: cap ~30,600 chars, still under 60,000
+    for _ in range(2):
+        orchestrator.drain_pending(cfg, conn, rvw, auto=True, guard=gd)
+    assert [k for (k,) in _alerts(conn, "pkg")] == ["pkg|1.0.0|suspicious-heuristic",
+                                                    "pkg|1.0.0|suspicious-heuristic|unscanned:too_large"]
+    assert [i["not_scanned"] for i in orchestrator.list_pending(cfg)] == ["too_large"] and be.calls == []

@@ -194,8 +194,14 @@ def _review_escalated(cfg, conn, rvw, d, tr, rid, *, offline=False, guard=None):
         text = rvw.prepare(d, tr, cap=guard.input_cap_chars() if guard is not None else None)
     except reviewer.InputTooLarge as e:
         detail = f"{e}; {guard.cap_explain()}" if guard is not None else str(e)
-        _park_too_large(cfg, conn, rid, d.package, d.version, tr.score, tr.fired_rules, detail, e.text)
-        return      # its one alert is the unscanned one, with the score and rules
+        # Over the provisional cold-start cap it may fit once the endpoint is measured: no "too large" claim
+        # yet (the auto-drain makes it then), only the heuristic alert any other park gets.
+        provisional = guard is not None and guard.cap_is_provisional()
+        _park_too_large(cfg, conn, rid, d.package, d.version, tr.score, tr.fired_rules, detail, e.text,
+                        alert=not provisional)
+        if provisional:
+            _alert_heuristic(cfg, conn, rid, d.package, d.version, tr.score, tr.fired_rules)
+        return      # one alert: the unscanned one (with the score and rules), or the heuristic one
     else:
         dropped = getattr(rvw, "dropped_files", ())   # spec U2: weighted files prepare()'s cap dropped
         if offline:
