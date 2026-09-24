@@ -56,8 +56,10 @@ def changes_since(cfg: Config, since_serial: int) -> list[NewRelease]:
         sdist = action.startswith(SDIST_UPLOAD_ACTION)
         if (action != "new release" and not sdist) or version is None:
             continue
-        ev = best.setdefault((name, version), [-1, False, False])
-        ev[0] = max(ev[0], serial)
+        ev = best.setdefault((name, version), [serial, False, False])
+        # The FIRST serial: the cursor never passes an event of an item not yet processed, even when the
+        # per-run cap cuts the list (a later event of the item is re-seen next tick, a cheap no-op).
+        ev[0] = min(ev[0], serial)
         ev[1 if not sdist else 2] = True
     items = [NewRelease(package=n, version=v, serial=s, new_release=nr, sdist_upload=sd)
              for (n, v), (s, nr, sd) in best.items()]

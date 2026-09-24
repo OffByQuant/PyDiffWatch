@@ -67,6 +67,7 @@ class Config:
     evidence_max_chars: int = 200_000
     retention_days: int = 90          # plain release rows older than this are pruned (0 = keep all)
     prune_every_hours: float = 24.0   # run/watch prune the database at most this often
+    wheel_only_grace_minutes: float = 60.0   # a switch to wheel-only is re-checked for a late sdist before it warns
     reviewer_enabled: bool = True
     rules_dir: Path = Path("rules/community")
     reviewer: ReviewerConfig = field(default_factory=ReviewerConfig)

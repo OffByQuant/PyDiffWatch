@@ -10,10 +10,11 @@ logger = logging.getLogger(__name__)
 # Stages that represent a completed analysis or permanent decision; skipped on future ticks.
 # pending_review is terminal for the cursor: the LLM-review queue retries it, not the scan. Likewise
 # metadata_retry: a release whose metadata or sdist download, or diff/triage, failed is retried from its
-# release row (bounded, then gave_up), not the changelog.
+# release row (bounded, then gave_up), not the changelog. So is no_sdist_wait: a wheel-only release re-checked
+# for a late sdist once wheel_only_grace_minutes are over.
 TERMINAL = {"triaged", "alerted", "reviewed", "new_package_skipped", "needs_adjudication",
             "refused_to_extract", "no_sdist", "refused_to_fetch", "pending_review",
-            "metadata_gone", "metadata_retry", "gave_up"}
+            "metadata_gone", "metadata_retry", "gave_up", "no_sdist_wait"}
 
 
 def _load_ruleset(cfg):
@@ -257,12 +258,14 @@ def _park_too_large(cfg, conn, rid, package, version, score, fired_rules, detail
 
 
 def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=None) -> bool:
-    """Main-thread half: record the release, map a completed fetch `result` (ArtifactSet | None |
-    Exception) to a stage, diff/triage/review, emit alerts. ALL sqlite + notifier work happens here.
+    """Main-thread half: record the release, map a completed fetch `result` (ArtifactSet | NoSdist |
+    Exception; None is read as NoSdist) to a stage, diff/triage/review, emit alerts. ALL sqlite + notifier
+    work happens here.
     Returns True iff the release reached a terminal stage; a failure is queued for retry (_retry_later),
     which is terminal for the cursor."""
     rid = store.record_release(conn, rel.package, rel.version, rel.serial, False, None, "sdist")
-    if store.get_stage(conn, rel.package, rel.version) == "no_sdist":
+    was = store.get_stage(conn, rel.package, rel.version)
+    if was == "no_sdist":
         store.clear_unscanned_verdict(conn, rid)   # re-scan after its sdist upload: drop the switch warning
     if isinstance(result, fetcher.RefusedToFetch):
         store.update_stage(conn, rid, "refused_to_fetch")
@@ -292,9 +295,19 @@ def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=
     if isinstance(result, Exception):   # metadata or sdist download failed (incl. a deadline expiry)
         return _retry_later(cfg, conn, rid, rel, result)
     if result is None or isinstance(result, fetcher.NoSdist):
+        # A switch from an sdist (PyPI's JSON, or our own record when the owner deleted that sdist since) can
+        # dodge an sdist-only scan; a package always wheel-only is silent. Wheels often upload before the sdist,
+        # so a switch (or an sdist upload event the JSON doesn't show yet) waits for wheel_only_grace_minutes
+        # and is re-fetched before it warns.
+        prev = getattr(result, "switched_from", None) or store.previous_sdist_release(conn, rel.package, rel.version)
+        now = time.time()
+        due = was == "no_sdist_wait" and (store.recheck_at(conn, rid) or 0) <= now
+        if (prev or rel.sdist_upload) and not due:
+            if was != "no_sdist_wait":
+                store.wait_for_sdist(conn, rid, now + cfg.wheel_only_grace_minutes * 60)
+            return True
         store.update_stage(conn, rid, "no_sdist")   # terminal, unless its sdist upload event arrives later
-        prev = getattr(result, "switched_from", None)
-        if prev:    # an sdist-only scan can be dodged by going wheel-only; a package always wheel-only is silent
+        if prev:
             _alert_unscanned(cfg, conn, rid, rel.package, rel.version,
                              f"UNREVIEWED: switched to wheel-only: the previous release {prev} shipped an sdist and "
                              f"this one ships only wheels, which pydiffwatch does not scan. Not scanned. Needs "
@@ -365,10 +378,10 @@ def seed_now(cfg: Config):
 
 def _to_fetch(conn, rel) -> bool:
     """Whether run_once fetches and processes this changelog item. A release not yet at a TERMINAL stage is
-    fetched. An sdist upload re-scans a release recorded no_sdist (its wheels uploaded first); on any other
+    fetched. An sdist upload re-scans a release left wheel-only (its wheels uploaded first); on any other
     release it is a no-op (one SELECT, no fetch), since that release's own `new release` event covers it."""
     stg = store.get_stage(conn, rel.package, rel.version)
-    if rel.sdist_upload and stg == "no_sdist":
+    if rel.sdist_upload and stg in ("no_sdist", "no_sdist_wait"):
         return True
     return rel.new_release and stg not in TERMINAL
 

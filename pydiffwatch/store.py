@@ -46,7 +46,7 @@ def migrate_schema(conn):
         conn.execute("ALTER TABLE releases ADD COLUMN evidence TEXT"); conn.commit()
     for col, typ in (("review_attempts", "INTEGER DEFAULT 0"), ("pending_reason", "TEXT"),
                      ("pending_detail", "TEXT"), ("review_input", "BLOB"),
-                     ("fetch_attempts", "INTEGER DEFAULT 0"), ("fetch_note", "TEXT")):
+                     ("fetch_attempts", "INTEGER DEFAULT 0"), ("fetch_note", "TEXT"), ("recheck_at", "REAL")):
         try:
             conn.execute(f"SELECT {col} FROM releases LIMIT 1")
         except sqlite3.OperationalError:
@@ -159,7 +159,7 @@ def prune(conn, retention_days: int = 0):
         # PyPI's predecessor skips versions without an sdist, which have no maintainer metadata.
         conn.execute("DELETE FROM releases WHERE processed_at < ? "
                      "AND stage NOT IN ('pending_review','needs_adjudication','refused_to_extract',"
-                     "'refused_to_fetch','metadata_retry','gave_up') "
+                     "'refused_to_fetch','metadata_retry','gave_up','no_sdist_wait') "
                      "AND id NOT IN (SELECT release_id FROM verdicts WHERE release_id IS NOT NULL) "
                      "AND id NOT IN (SELECT release_id FROM alerts WHERE release_id IS NOT NULL) "
                      "AND id NOT IN (SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY package, "
@@ -264,9 +264,33 @@ def set_fetch_note(conn, release_id, note):
     conn.execute("UPDATE releases SET fetch_note=? WHERE id=?", (note, release_id))
     conn.commit()
 
-def metadata_retries_due(conn, limit=20):
+def metadata_retries_due(conn, limit=20, now=None):
+    """Releases to re-fetch off the cursor: failed ones (metadata_retry), and wheel-only ones whose wait for a
+    late sdist (no_sdist_wait) is over by `now` (epoch seconds; default: now)."""
+    now = datetime.datetime.now(datetime.UTC).timestamp() if now is None else now
     return conn.execute("SELECT package, version, serial FROM releases WHERE stage='metadata_retry' "
-                        "ORDER BY serial LIMIT ?", (limit,)).fetchall()
+                        "OR (stage='no_sdist_wait' AND recheck_at <= ?) ORDER BY serial LIMIT ?",
+                        (now, limit)).fetchall()
+
+def wait_for_sdist(conn, release_id, recheck_at):
+    """Park a wheel-only release off the cursor until `recheck_at` (epoch seconds), when it is re-fetched."""
+    conn.execute("UPDATE releases SET stage='no_sdist_wait', recheck_at=? WHERE id=?", (recheck_at, release_id))
+    conn.commit()
+
+def recheck_at(conn, release_id):
+    return conn.execute("SELECT recheck_at FROM releases WHERE id=?", (release_id,)).fetchone()[0]
+
+# Stages a release reaches only after its sdist was downloaded: the store's own evidence that a package shipped one.
+SDIST_STAGES = ("triaged", "alerted", "reviewed", "needs_adjudication", "pending_review", "new_package_skipped",
+                "refused_to_extract")
+
+def previous_sdist_release(conn, package, version):
+    """The package's most recent release recorded before this (recorded) one, if it reached an sdist-scanned
+    stage. It catches a switch the PyPI JSON hides: the owner deleted that sdist after we scanned it."""
+    row = conn.execute("SELECT version, stage FROM releases WHERE package=:p AND version != :v AND serial < "
+                       "(SELECT serial FROM releases WHERE package=:p AND version=:v) "
+                       "ORDER BY serial DESC, id DESC LIMIT 1", {"p": package, "v": version}).fetchone()
+    return row[0] if row and row[1] in SDIST_STAGES else None
 
 def metadata_retry_counts(conn) -> dict:
     r = conn.execute("SELECT COALESCE(SUM(stage='metadata_retry'),0), COALESCE(SUM(stage='gave_up'),0) "
