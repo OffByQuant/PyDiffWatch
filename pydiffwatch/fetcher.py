@@ -178,15 +178,17 @@ def _corpus() -> set:
         _CORPUS = deps.load_corpus()
     return _CORPUS
 
-def _requires_dist(package: str, version: str, cfg: Config) -> list:
-    """`info.requires_dist` for an EXACT version (the package-level JSON only carries the latest's)."""
+def _requires_dist(package: str, version: str, cfg: Config) -> list | None:
+    """`info.requires_dist` for an EXACT version (the package-level JSON only carries the latest's); [] when it
+    declares none, None when the lookup failed. Never raises."""
     try:
         url = f"{cfg.pypi_base}/pypi/{package}/{version}/json"
         egress.assert_web_scheme(url)
         with urllib.request.urlopen(url, timeout=cfg.fetch_timeout_s) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
-            return (_read_json(r, cfg).get("info") or {}).get("requires_dist") or []
+            reqs = (_read_json(r, cfg).get("info") or {}).get("requires_dist") or []
+            return reqs if isinstance(reqs, list) else None    # a string would read as one dep per character
     except Exception:
-        return []   # can't resolve predecessor deps -> screen nothing rather than false-flag
+        return None   # unknown, not empty: the caller screens nothing rather than false-flag
 
 def _dep_json(name: str, cfg: Config):
     """A candidate dependency's PyPI JSON, or None if it does not exist (404 -> dependency-confusion)."""
@@ -211,13 +213,16 @@ def _screen_added_deps(meta: dict, package: str, pred_version: str | None, cfg: 
     `change`, when passed, receives the added and removed Requires-Dist lines as written (for the reviewer)."""
     info = meta.get("info") or {}
     if version is not None and info.get("version") not in (None, version):
-        new_lines = _requires_dist(package, version, cfg)     # [] on any failure: screen nothing
+        new_lines = _requires_dist(package, version, cfg) or []   # unknown or empty: screen nothing
     else:
         new_lines = info.get("requires_dist") or []
+        new_lines = new_lines if isinstance(new_lines, list) else []
     new_reqs = deps.parse_requires_dist(new_lines)
     if not new_reqs:
         return []
     prior_lines = _requires_dist(package, pred_version, cfg) if pred_version else []
+    if prior_lines is None:
+        return []           # the predecessor's list is unknown: every dep would read as "added"
     prior_reqs = deps.parse_requires_dist(prior_lines)
     added = new_reqs - prior_reqs
     if change is not None:

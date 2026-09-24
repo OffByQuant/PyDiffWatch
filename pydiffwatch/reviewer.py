@@ -171,18 +171,31 @@ def _zero_weight_rank(path, weight) -> int:
     return _BUILD_FILES.index(path) if weight == 0.0 and path in _BUILD_FILES else len(_BUILD_FILES)
 
 
-def _dep_pattern(name: str):
-    """A dependency name as a whole PEP 503 name, any case, any of -_. between its parts."""
-    parts = [re.escape(x) for x in re.split(r"[-_.]+", name) if x]
-    return re.compile(r"(?<![\w.-])" + r"[-_.]+".join(parts) + r"(?![\w-]|\.\w)", re.I) if parts else None
+def _dep_names_pattern(diff, triage):
+    """One compiled alternation of the dependency names a dep rule fired on (FiredRule.file of a rule on a
+    dependency finding), each as a whole PEP 503 name: any case, any of -_. between its parts, `name.sub` too.
+    Binary paths and owners are never matched (cost and noise). None when no dependency rule fired."""
+    deps = {f.get("name") for f in getattr(diff, "added_dep_findings", ()) if isinstance(f.get("name"), str)}
+    names = sorted({r.file for r in triage.fired_rules if r.lines == (0, 0) and r.file in deps})
+    alts = ["[-_.]+".join(re.escape(x) for x in parts)
+            for n in names if (parts := [x for x in re.split(r"[-_.]+", n) if x])]
+    return re.compile(r"(?<![\w.-])(?:" + "|".join(alts) + r")(?![\w-])", re.I) if alts else None
 
 
-def _names_a_dep(fd, triage) -> bool:
-    """Whether a file's added lines name what a metadata rule fired on (lines (0, 0): a dependency name, or a
-    binary path, e.g. a loader naming the new .so). Owner changes name no file."""
-    pats = [p for r in triage.fired_rules if r.lines == (0, 0) and r.file != "<ownership>"
-            and (p := _dep_pattern(r.file))]
-    return any(p.search(ln) for h in fd.hunks for ln in h.added for p in pats)
+_CODE_EXT = (".py", ".pyx", ".pyi")
+
+
+def _names_a_dep(fd, pattern) -> bool:
+    """Whether a changed CODE file's added lines name a flagged dependency: .py/.pyx/.pyi lines, or a .pth file's
+    `import` lines. Metadata (PKG-INFO, *.egg-info/*, configs) never counts: a Requires-Dist line alone is not
+    code, and showing only it would turn an unscanned alert into a silent benign verdict (I-1)."""
+    if fd.path.endswith(_CODE_EXT):
+        lines = (ln for h in fd.hunks for ln in h.added)
+    elif fd.path.endswith(".pth"):
+        lines = (ln for h in fd.hunks for ln in h.added if ln.startswith(("import ", "import\t")))
+    else:
+        return False
+    return any(pattern.search(ln) for ln in lines)
 
 
 def _rank_files(diff, triage):
@@ -194,12 +207,14 @@ def _rank_files(diff, triage):
         ranked_paths = ranked_paths[:_FIRST_RELEASE_TOP_FILES]
     else:
         flagged = [p for p in by_path if weights.get(p, 0.0) > 0.0]
+        pattern = None if flagged else _dep_names_pattern(diff, triage)
         # A fire on dependencies, binaries or owners only has no changed file to point at: show the changed
         # build files (where dependencies are declared), then files whose added lines name a flagged dependency
         # (PKG-INFO's Requires-Dist, a requirements helper setup.py reads). Never every changed file.
         ranked_paths = (sorted(flagged, key=lambda p: -weights[p])
                         or [p for p in _BUILD_FILES if p in by_path]
-                        + sorted(p for p in by_path if p not in _BUILD_FILES and _names_a_dep(by_path[p], triage)))
+                        + sorted(p for p in by_path if p not in _BUILD_FILES and pattern is not None
+                                 and _names_a_dep(by_path[p], pattern)))
     return ranked_paths, by_path
 
 

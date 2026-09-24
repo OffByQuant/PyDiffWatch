@@ -337,19 +337,63 @@ def test_a_non_latest_release_whose_own_list_is_unavailable_gets_no_findings(mon
     assert art.added_dep_findings == [] and art.requires_dist_change is None   # never "every dep removed"
 
 
-def test_a_dependency_only_fire_also_shows_files_naming_the_flagged_dependency():
+_REQ_FINDING = [{"name": "reqeusts", "reason": "typosquat", "target": "requests"}]
+
+
+def test_a_dependency_only_fire_also_shows_code_files_naming_the_flagged_dependency():
     changed = [_fd("a/core.py", "modified", "x = 2"), _fd("PKG-INFO", "modified", "Requires-Dist: reqeusts (>=0.1)"),
-               _fd("reqs.py", "modified", "DEPS = ['reqeusts_extra', 'Reqeusts']"), _fd("setup.py", "modified", "d")]
-    text = reviewer.build_review_input(Diff("p", "1.1", False, changed, []), _TYPO, max_chars=10_000)
+               _fd("reqs.py", "modified", "DEPS = ['reqeusts_extra', 'Reqeusts']"), _fd("setup.py", "modified", "d"),
+               _fd("b/load.py", "modified", "import reqeusts.sub")]
+    d = Diff("p", "1.1", False, changed, [], added_dep_findings=_REQ_FINDING)
+    text = reviewer.build_review_input(d, _TYPO, max_chars=10_000)
     heads = [ln for ln in text.split("\n") if ln.startswith("--- file: ")]
-    assert heads == ["--- file: setup.py (modified) ---", "--- file: PKG-INFO (modified) ---",
-                     "--- file: reqs.py (modified) ---"]                         # a/core.py never
+    assert heads == ["--- file: setup.py (modified) ---", "--- file: b/load.py (modified) ---",
+                     "--- file: reqs.py (modified) ---"]                         # a/core.py and PKG-INFO never
 
 
 def test_a_dependency_name_matches_only_as_a_whole_name():
     changed = [_fd("a/core.py", "modified", "import reqeustsx; my_reqeusts = 1")]
-    text = reviewer.build_review_input(Diff("p", "1.1", False, changed, []), _TYPO, max_chars=10_000)
+    d = Diff("p", "1.1", False, changed, [], added_dep_findings=_REQ_FINDING)
+    text = reviewer.build_review_input(d, _TYPO, max_chars=10_000)
     assert "--- file:" not in text and not reviewer._has_reviewable_content(text)
+
+
+@pytest.mark.parametrize("path, line", [
+    ("PKG-INFO", "Requires-Dist: reqeusts"), ("a.egg-info/requires.txt", "reqeusts"),
+    ("a.egg-info/PKG-INFO", "Requires-Dist: reqeusts"), ("pyproject.cfg", "reqeusts"), ("x.pth", "/opt/reqeusts"),
+])
+def test_a_dependency_named_only_in_metadata_stays_unscanned(path, line):
+    # I-1: a metadata line is not code. Shown alone, the model would call it benign and the alert would vanish.
+    d = Diff("p", "1.1", False, [_fd("a/core.py", "modified", "x = 2"), _fd(path, "modified", line)], [],
+             added_dep_findings=_REQ_FINDING, signals="dependency reqeusts: typosquat of requests")
+
+    class _Backend:
+        primary_model, escalation_model, calls = "m", None, 0
+
+        def complete(self, **kw):
+            self.calls += 1
+    be = _Backend()
+    v = reviewer.Reviewer(Config(), backend=be).review(d, _TYPO)
+    assert be.calls == 0 and v.model == "none" and v.classification == "suspicious"
+
+
+def test_a_pth_import_line_naming_the_dependency_is_shown():
+    d = Diff("p", "1.1", False, [_fd("x.pth", "added", "import reqeusts")], [], added_dep_findings=_REQ_FINDING)
+    assert "--- file: x.pth (added) ---" in reviewer.build_review_input(d, _TYPO, max_chars=10_000)
+
+
+def test_binary_rules_never_drive_name_matching_and_ranking_stays_fast():
+    # One pattern per binary rule was binaries x lines of regex work, attacker-triggered.
+    bins = [FiredRule("binary-new", 1.0, f"p/b{i}.so", (0, 0)) for i in range(2_000)]
+    bins.append(FiredRule("binary-source-too-large", 1.0, "setup.py", (0, 0)))
+    files = [FileDiff(f"m{i}.py", "modified", [Hunk((0, 0), (0, 500), [f"load('p/b{i}.so') # setup.py"] * 500, [])])
+             for i in range(200)]
+    tr = TriageResult(2_001.0, bins + list(_TYPO.fired_rules), True)
+    d = Diff("p", "1.1", False, files, [], added_dep_findings=_REQ_FINDING)
+    import time
+    t = time.perf_counter()
+    ranked, _ = reviewer._rank_files(d, tr)
+    assert time.perf_counter() - t < 1.0 and ranked == []
 
 
 def test_the_note_says_cap_only_when_the_cap_cut_something():
@@ -389,3 +433,31 @@ def test_a_first_release_past_the_top_40_says_so_without_cap():
     tr = TriageResult(60.0, [FiredRule("py-exec", 60.0, "m0.py", (1, 1))], True)
     text = reviewer.build_review_input(Diff("p", "1.0", True, files, []), tr, max_chars=100_000)
     assert text.endswith(reviewer.FIRST_RELEASE_NOTE) and "cap" not in reviewer.FIRST_RELEASE_NOTE
+
+
+# ---- fix round 2: a failed PRIOR lookup never false-flags ----
+
+def test_a_failed_prior_requires_dist_lookup_screens_nothing(monkeypatch):
+    _versions(monkeypatch, {"version": "1.1", "requires_dist": ["six", "reqeusts"]}, {})
+    monkeypatch.setattr(fetcher, "_requires_dist", lambda pkg, ver, cfg: None)       # the lookup failed
+    art = fetcher.fetch_artifacts(Config(), NewRelease("p", "1.1", 5))
+    assert art.added_dep_findings == [] and art.requires_dist_change is None
+
+
+def test_an_empty_prior_list_still_screens(monkeypatch):
+    _versions(monkeypatch, {"version": "1.1", "requires_dist": ["reqeusts"]}, {"1.0": []})
+    art = fetcher.fetch_artifacts(Config(), NewRelease("p", "1.1", 5))
+    assert [f["name"] for f in art.added_dep_findings] == ["reqeusts"]
+
+
+def test_requires_dist_tells_failed_from_empty(monkeypatch):
+    def boom(*a, **k):
+        raise OSError("down")
+    monkeypatch.setattr(fetcher.urllib.request, "urlopen", boom)                      # never the network
+    assert fetcher._requires_dist("p", "1.0", Config()) is None
+
+
+def test_a_string_requires_dist_is_not_one_dependency_per_character(monkeypatch):
+    _versions(monkeypatch, {"version": "1.1", "requires_dist": "reqeusts"}, {"1.0": ["six"]})
+    art = fetcher.fetch_artifacts(Config(), NewRelease("p", "1.1", 5))
+    assert art.added_dep_findings == [] and art.requires_dist_change is None
