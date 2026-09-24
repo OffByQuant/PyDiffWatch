@@ -370,6 +370,15 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
         setup_py = "present: its top level runs at build"
     else:
         setup_py = f"present: not run by {_clip(backend)} unless the backend calls it"
+    # a backend whose own config is not parsed here (another backend, or any in-tree one via backend-path) may
+    # declare entry points and generate files we cannot see: its empty fields are qualified, never a bare "none"
+    in_tree = bs.get("backend-path") not in (None, [], "")
+    ep_none = gen_none = none
+    if backend is not None and (in_tree or backend not in _PARSED_BACKENDS):
+        name = f"in-tree backend {_clip(backend)}" if in_tree else _clip(backend)
+        tail = f"; {NOT_LITERAL}" if "setup.py" in new_files else ""
+        ep_none = f"none in [project] ({name} may declare its own){tail}"
+        gen_none = f"none in scanned files ({name} may generate its own){tail}"
     cmdclass = []
     for v in (kw("cmdclass"), st.get("cmdclass")):
         cmdclass += [COMPUTED] if v == COMPUTED else [str(k) for k in _dict(v)]
@@ -390,7 +399,7 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
     pths = [_pth(p, b) for p, b in sorted(new_files.items()) if p.endswith(".pth")]
     pths += [f"unknown ({p} too large to scan)" for p in sorted(too_large) if p.endswith(".pth")]
     startup = ("startup (.pth files; an `import` line runs at every interpreter start if the file is installed "
-               f"into site-packages): {_join(pths, none)}")      # setup.py may write a .pth at build
+               f"into site-packages): {_join(pths, gen_none)}")  # setup.py or a backend may write a .pth
 
     # import
     def declared(setup_name, st_name, cfg_name):
@@ -411,8 +420,8 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
 
     src_unknown = unknown("pyproject.toml", "setup.py", "setup.cfg")
     pkgs = declared("packages", "packages", "packages") or ", ".join(
-        src_unknown + [f"auto-discovered: {_join(_discovered(new_files), none)}"])
-    mods = declared("py_modules", "py-modules", "py_modules") or _join(src_unknown, none)
+        src_unknown + [f"auto-discovered: {_join(_discovered(new_files), gen_none)}"])
+    mods = declared("py_modules", "py-modules", "py_modules") or _join(src_unknown, gen_none)
     tops = [ln for p in _egg_info(new_files, "top_level.txt")
             for ln in new_files[p].decode("utf-8", errors="replace").split()]
     import_line = (f"import (runs when a program imports the package): packages={pkgs}; py-modules={mods}; "
@@ -438,10 +447,6 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
     dynamic = project.get("dynamic")
     if isinstance(dynamic, list) and _DYNAMIC_EPS & {d for d in dynamic if isinstance(d, str)}:
         ep_unknown.append("unknown (pyproject.toml marks them dynamic)")   # the backend fills them in at build
-    ep_none = none
-    if backend is not None and backend not in _PARSED_BACKENDS:     # its own tables are not parsed here
-        ep_none = f"none in [project] ({_clip(backend)} may declare its own)" + (
-            f"; {NOT_LITERAL}" if "setup.py" in new_files else "")
     cmds, plugins = _entry_points_lines(eps, ep_unknown, ep_none)
 
     lines = [build_line, startup, import_line,

@@ -620,3 +620,26 @@ def test_without_setup_py_empty_discovery_and_startup_stay_none():
 ])
 def test_top_level_metadata_paths_never_raise(files, too_large):
     assert isinstance(execctx.build(files, too_large), str)
+
+
+# ---- fix round 5: unparsed or in-tree backends may generate their own files ----
+
+def test_an_unparsed_backend_without_setup_py_qualifies_startup_and_discovery():
+    ctx = execctx.build({"pyproject.toml": b"[build-system]\nbuild-backend = 'hatchling.build'\n[project]\nname = 'a'\n"})
+    g = "none in scanned files (hatchling.build may generate its own)"
+    assert _line(ctx, "startup").endswith(f": {g}")
+    assert f"packages=auto-discovered: {g};" in ctx and f"py-modules={g};" in ctx
+
+
+@pytest.mark.parametrize("backend", ["setuptools.build_meta", "poetry.core.masonry.api", "flit_core.buildapi"])
+def test_a_backend_path_makes_even_a_parsed_backend_name_in_tree(backend):
+    ctx = execctx.build({"pyproject.toml": f"[build-system]\nbuild-backend = '{backend}'\nbackend-path = ['.']\n".encode()})
+    d = f"none in [project] (in-tree backend {backend} may declare its own)"
+    g = f"none in scanned files (in-tree backend {backend} may generate its own)"
+    assert _line(ctx, "commands").endswith(f": {d}") and _line(ctx, "plugins").endswith(f": {d}")
+    assert _line(ctx, "startup").endswith(f": {g}")
+
+
+def test_an_empty_backend_path_is_not_in_tree():
+    ctx = execctx.build({"pyproject.toml": b"[build-system]\nbuild-backend = 'setuptools.build_meta'\nbackend-path = []\n"})
+    assert _line(ctx, "plugins").endswith(": none") and _line(ctx, "startup").endswith(": none")
