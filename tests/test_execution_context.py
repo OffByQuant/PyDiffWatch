@@ -168,8 +168,9 @@ def test_build_files_lead_the_zero_weight_fallback_of_an_update():
     fds = [FileDiff(p, "modified", [Hunk((0, 1), (0, 1), ["x"], ["y"])]) for p in ("a.py", "setup.cfg", "setup.py")]
     text = reviewer.build_review_input(Diff("p", "1.1", False, fds, []), TriageResult(0.0, [], True),
                                        max_chars=10_000)
+    # Task 11 (B2): a fire with no weighted changed file shows the build files only, never every changed file.
     assert [ln for ln in text.split("\n") if ln.startswith("--- file: ")] == [
-        "--- file: setup.py (modified) ---", "--- file: setup.cfg (modified) ---", "--- file: a.py (modified) ---"]
+        "--- file: setup.py (modified) ---", "--- file: setup.cfg (modified) ---"]
 
 
 def test_the_prompt_says_the_summary_is_best_effort():

@@ -21,6 +21,7 @@ class ArtifactSet:
     description: str | None = None   # this version's PyPI info.summary: the author's claim, context only
     too_large: tuple[str, ...] = ()  # this version's source members too large to scan (unfiltered by the prior)
     surface_omitted: int | None = None   # a first release under `surface`: source files the filter left out
+    requires_dist_change: dict | None = None   # {"added": [...], "removed": [...]} Requires-Dist lines, when known
 
 @dataclass(frozen=True)
 class Hunk:
@@ -41,6 +42,7 @@ class Diff:
     exec_context: str = ""         # how the new version's files run (build, startup, import, commands, plugins)
     baseline_unavailable: str = "" # the prior version whose sdist could not be fetched (diffed against nothing)
     surface_omitted: int | None = None   # a first release under `surface`: source files not shown
+    signals: str = ""              # dependency / binary / ownership signals, one per line (author strings escaped)
 
 @dataclass(frozen=True)
 class FiredRule:

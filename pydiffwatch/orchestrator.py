@@ -441,11 +441,12 @@ def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=
         store.update_stage(conn, rid, "new_package_skipped")
         return True   # terminal: new packages are ignored under the skip policy
     try:
-        d = differ.build_diff(result)
-        store.update_stage(conn, rid, "diffed")
         prior_meta = (store.get_release_metadata(conn, rel.package, result.prior_version)
                       if result.prior_version else None)
-        tr = engine.triage(d, cfg, ruleset, {"current": result.maintainer_metadata, "prior": prior_meta})
+        owners = {"current": result.maintainer_metadata, "prior": prior_meta}
+        d = differ.build_diff(result, owners)       # the reviewer is shown the owner change triage scores
+        store.update_stage(conn, rid, "diffed")
+        tr = engine.triage(d, cfg, ruleset, owners)
         store.update_stage(conn, rid, "triaged", tr.score,
                            json.dumps([r.__dict__ for r in tr.fired_rules]))
         # Persist the flagged payload code itself (not just file:line metadata) so the DB is a

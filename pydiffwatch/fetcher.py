@@ -202,15 +202,22 @@ def _dep_json(name: str, cfg: Config):
     except Exception:
         return {}
 
-def _screen_added_deps(meta: dict, package: str, pred_version: str | None, cfg: Config) -> list[dict]:
+def _screen_added_deps(meta: dict, package: str, pred_version: str | None, cfg: Config,
+                       change: dict | None = None) -> list[dict]:
     """Diff the new version's declared deps against the predecessor's and flag suspicious additions.
     new-side deps come free from the package-level `info` (the firehose release is normally the latest;
-    a rare lag mis-reads them, an accepted v1 approximation). Empty additions -> zero network."""
-    new_reqs = deps.parse_requires_dist((meta.get("info") or {}).get("requires_dist") or [])
+    a rare lag mis-reads them, an accepted v1 approximation). Empty additions -> zero network.
+    `change`, when passed, receives the added and removed Requires-Dist lines as written (for the reviewer)."""
+    new_lines = (meta.get("info") or {}).get("requires_dist") or []
+    new_reqs = deps.parse_requires_dist(new_lines)
     if not new_reqs:
         return []
-    prior_reqs = deps.parse_requires_dist(_requires_dist(package, pred_version, cfg)) if pred_version else set()
+    prior_lines = _requires_dist(package, pred_version, cfg) if pred_version else []
+    prior_reqs = deps.parse_requires_dist(prior_lines)
     added = new_reqs - prior_reqs
+    if change is not None:
+        change["added"] = [ln for ln in new_lines if deps.parse_requires_dist([ln]) & added]
+        change["removed"] = [ln for ln in prior_lines if deps.parse_requires_dist([ln]) & (prior_reqs - new_reqs)]
     if not added:
         return []
     return deps.screen_added_deps(added, _corpus(), fetch_json=lambda n: _dep_json(n, cfg),
@@ -314,6 +321,7 @@ def fetch_artifacts(cfg, rel: NewRelease, attempt: int = 1) -> ArtifactSet | NoS
     prior_error = None
     dep_findings: list[dict] = []
     surface_omitted = None
+    req_change: dict = {}
     if is_new:
         if cfg.new_package_policy == "surface":
             # Scan only the install/import-time surface — small, never truncated, high-value.
@@ -333,9 +341,11 @@ def fetch_artifacts(cfg, rel: NewRelease, attempt: int = 1) -> ArtifactSet | NoS
             same = {(b["path"], b.get("sha256")) for b in prior_bins if b.get("sha256")}
             new_bins = [b for b in new_bins if (b["path"], b.get("sha256")) not in same]
         # signal 5: flag suspicious newly-added dependencies vs the predecessor (update path only).
-        dep_findings = _screen_added_deps(meta, rel.package, prior_ver, cfg)
+        dep_findings = _screen_added_deps(meta, rel.package, prior_ver, cfg, change=req_change)
     return ArtifactSet(rel.package, rel.version, prior_ver, "sdist",
                        new_files, prior_files, {}, _cap_foreign(new_bins, cfg),
                        is_new_package=is_new, maintainer_metadata=mtmeta,
                        added_dep_findings=dep_findings, prior_error=prior_error, description=summary,
-                       too_large=too_large, surface_omitted=surface_omitted)
+                       too_large=too_large, surface_omitted=surface_omitted,
+                       # only this version's own list: the package-level info is the latest version's
+                       requires_dist_change=req_change if req_change and info.get("version") == rel.version else None)

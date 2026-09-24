@@ -285,7 +285,7 @@ def test_lowering_max_review_attempts_still_warns_once(tmp_path, capsys):
 
 
 def _escalating(monkeypatch):
-    monkeypatch.setattr(differ, "build_diff", lambda art: _diff())
+    monkeypatch.setattr(differ, "build_diff", lambda art, *_: _diff())
     monkeypatch.setattr(engine, "triage", lambda *a, **k: _T)
     return ArtifactSet("pkg", "1.0.0", "0.9", "sdist", {}, {}, {})
 

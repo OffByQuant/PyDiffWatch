@@ -303,11 +303,15 @@ def _roles_set(meta) -> set:
     return {r.lower() for r in (meta or {}).get("roles") or [] if r}
 
 
+def roles_change(maintainer_context) -> tuple[list, list] | None:
+    """(prior owners, current owners), sorted, when both are known and differ; else None."""
+    if not maintainer_context:
+        return None
+    cur, prior = _roles_set(maintainer_context.get("current")), _roles_set(maintainer_context.get("prior"))
+    return (sorted(prior), sorted(cur)) if cur and prior and cur != prior else None
+
+
 def build_facts(diff, maintainer_context=None) -> DiffFacts:
     files = tuple(_file_facts(fd) for fd in diff.changed if any(h.added for h in fd.hunks))
-    maint = False
-    if maintainer_context:
-        cur, prior = _roles_set(maintainer_context.get("current")), _roles_set(maintainer_context.get("prior"))
-        maint = bool(cur and prior and cur != prior)
     return DiffFacts(files, _normalize_binaries(diff.added_binaries),
-                     tuple(diff.added_dep_findings), maint)
+                     tuple(diff.added_dep_findings), roles_change(maintainer_context) is not None)

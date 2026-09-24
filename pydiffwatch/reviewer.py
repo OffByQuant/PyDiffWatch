@@ -171,8 +171,10 @@ def _rank_files(diff, triage):
         ranked_paths = ranked_paths[:_FIRST_RELEASE_TOP_FILES]
     else:
         flagged = [p for p in by_path if weights.get(p, 0.0) > 0.0]
+        # A fire on dependencies, binaries or owners only has no changed file to point at: show the changed
+        # build files (where dependencies are declared), never every changed file.
         ranked_paths = (sorted(flagged, key=lambda p: -weights[p])
-                        or sorted(by_path, key=lambda p: (_zero_weight_rank(p, 0.0), p)))  # fallback: all
+                        or [p for p in _BUILD_FILES if p in by_path])
     return ranked_paths, by_path
 
 
@@ -180,6 +182,9 @@ _DESC_HEADING = "--- package description (the author's claim; context, not evide
 _LOC_HEADING = "flagged_locations:"
 _EXEC_HEADING = ("--- execution context (from pyproject/setup.cfg/setup.py/entry_points.txt/.pth; "
                  "how this version's files run) ---")
+_SIG_HEADING = ("--- dependency / binary / ownership signals (PyPI metadata and the sdist's file list; "
+                "context, not code) ---")
+_CONTEXT_HEADINGS = (_EXEC_HEADING, _SIG_HEADING)
 
 
 def _one_line(s: str) -> str:
@@ -188,22 +193,23 @@ def _one_line(s: str) -> str:
 
 
 _EXEC_MAX_CHARS = 4_000
+_SIG_MAX_CHARS = 3_000
 _EXEC_TRUNCATED = "… (context truncated)"
 
 
-def _render_exec(ctx: str) -> str:
-    """The execution-context block, capped at _EXEC_MAX_CHARS AFTER escaping (an escaped non-printable is up
-    to 10x its length), so author-written metadata can never crowd the hunks out of the input. Short lines
+def _render_block(heading: str, ctx: str, cap: int) -> str:
+    """A context block (execution context, signals), capped at `cap` AFTER escaping (an escaped non-printable is
+    up to 10x its length), so author-written metadata can never crowd the hunks out of the input. Short lines
     keep their full length; the rest share what is left, and a cut line says so."""
     lines = ["  " + _one_line(x) for x in ctx.split("\n")]
-    budget = _EXEC_MAX_CHARS - len(_EXEC_HEADING) - len(lines)            # one newline before each line
+    budget = cap - len(heading) - len(lines)                              # one newline before each line
     share = {}
     for n, i in enumerate(sorted(range(len(lines)), key=lambda i: len(lines[i]))):
         share[i] = min(len(lines[i]), budget // (len(lines) - n))
         budget -= share[i]
     out = [ln if len(ln) <= share[i] else ln[:max(0, share[i] - len(_EXEC_TRUNCATED))] + _EXEC_TRUNCATED
            for i, ln in enumerate(lines)]
-    return f"{_EXEC_HEADING}\n" + "\n".join(out)
+    return f"{heading}\n" + "\n".join(out)
 
 
 def build_review_input(diff, triage, *, max_chars: int, dropped: list | None = None) -> str:
@@ -251,12 +257,15 @@ def build_review_input(diff, triage, *, max_chars: int, dropped: list | None = N
     loc_text = f"{_LOC_HEADING} {', '.join(seen)}" if seen else ""
     # info.summary is author-written: it goes inside the markers, flattened to one line by the differ.
     desc = getattr(diff, "description", "")
-    desc_text = f"{_DESC_HEADING}\n  {desc}" if desc else ""
+    desc_text = f"{_DESC_HEADING}\n  {_one_line(desc)}" if desc else ""
     # Built by execctx from author-written metadata: fenced, and each line indented and escaped to one line so
     # none can pose as a file heading (dropped_from_text) or be taken for code (_has_reviewable_content).
     ctx = getattr(diff, "exec_context", "")
-    exec_text = _render_exec(ctx) if ctx else ""
-    body_parts = [t for t in (loc_text, desc_text, exec_text) if t]
+    exec_text = _render_block(_EXEC_HEADING, ctx, _EXEC_MAX_CHARS) if ctx else ""
+    # Dependency / binary / ownership signals (B2): context the model can weigh, never content on its own.
+    sig = getattr(diff, "signals", "")
+    sig_text = _render_block(_SIG_HEADING, sig, _SIG_MAX_CHARS) if sig else ""
+    body_parts = [t for t in (loc_text, desc_text, exec_text, sig_text) if t]
     used, truncated = len(header) + len(marker) + len(TRUNCATION_NOTE) + len("\n".join(body_parts)), False
     rendered_paths = []
     for path in ranked_paths:
@@ -367,18 +376,19 @@ def refresh_marker(review_input: str) -> str:
 
 def _has_reviewable_content(review_input: str) -> bool:
     """True if any file content was rendered between the injection markers. The flagged-locations line
-    (where triage looked), the description (the author's claim) and the execution context (how files run)
-    are not content."""
+    (where triage looked), the description (the author's claim), the execution context (how files run) and the
+    dependency / binary / ownership signals are not content."""
     body = review_input.split(_marker_of(review_input), 3)[2].lstrip()
     if body.startswith(_LOC_HEADING):                # one line, control characters escaped
         body = body.split("\n", 1)[1].lstrip() if "\n" in body else ""
     if body.startswith(_DESC_HEADING):               # heading line + one flattened description line
         body = body.split("\n", 2)[2] if body.count("\n") >= 2 else ""
-    if body.lstrip().startswith(_EXEC_HEADING):      # heading line + indented context lines
-        rest = body.lstrip().split("\n")[1:]
-        while rest and rest[0].startswith("  "):
-            rest.pop(0)
-        body = "\n".join(rest)
+    for heading in _CONTEXT_HEADINGS:                # in render order: heading line + indented lines
+        if body.lstrip().startswith(heading):
+            rest = body.lstrip().split("\n")[1:]
+            while rest and rest[0].startswith("  "):
+                rest.pop(0)
+            body = "\n".join(rest)
     return bool(body.strip())
 
 
