@@ -151,7 +151,8 @@ def _is_surface(path: str) -> bool:
     parts = path.split("/")
     egg_info = (parts[-1] in _SURFACE_METADATA and parts[-2:-1] and parts[-2].endswith(".egg-info")
                 and (len(parts) == 2 or (len(parts) == 3 and parts[0] == "src")))
-    return posixpath.basename(path) in _SURFACE_NAMES or path.endswith(".pth") or bool(egg_info)
+    return (posixpath.basename(path) in _SURFACE_NAMES or path.endswith(".pth") or bool(egg_info)
+            or path == "entry_points.txt")          # old-style flit's entry-points-file default, read by execctx
 
 def _package_json(package: str, cfg: Config) -> dict:
     url = f"{cfg.pypi_base}/pypi/{package}/json"

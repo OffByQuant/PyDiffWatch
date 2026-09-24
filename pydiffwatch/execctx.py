@@ -297,6 +297,7 @@ def _pth(path, data) -> str:
 _BUILD_FILES = ("setup.py", "pyproject.toml", "setup.cfg")
 NOT_LITERAL = "none declared literally in setup.py (setup.py runs arbitrary code at build)"
 _DYNAMIC_EPS = {"scripts", "gui-scripts", "entry-points"}
+_FLIT_BACKENDS = ("flit_core.buildapi", "flit.buildapi")
 
 
 def build(new_files: dict[str, bytes], too_large=()) -> str:
@@ -443,7 +444,24 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
         _add_groups(eps, cfg_eps.strip() or None)               # INI text inline in [options]
     for p in _egg_info(new_files, "entry_points.txt"):
         _add_groups(eps, parsed(p, "entry_points"))
-    ep_unknown = unknown("pyproject.toml", "setup.py", "setup.cfg", "entry_points.txt") + ep_unknown_cfg
+    flit_paths = []                                     # flit's [tool.flit.metadata] entry-points-file, INI format
+    if backend in _FLIT_BACKENDS:
+        epf = _dict(_dict(_dict(pp.get("tool")).get("flit")).get("metadata")).get("entry-points-file")
+        if epf is None and ("entry_points.txt" in new_files or "entry_points.txt" in too_large):
+            epf = "entry_points.txt"                    # old-style flit's default
+        if epf is not None and not isinstance(epf, str):
+            ep_unknown_cfg.append(f"unknown (flit entry-points-file {COMPUTED})")
+        elif epf is not None:
+            path = epf.strip().removeprefix("./")
+            flit_paths.append(path)
+            if path in new_files:
+                _add_groups(eps, parsed(path, "entry_points"))
+            elif path in too_large:
+                why[path] = "too large"
+            else:
+                ep_unknown_cfg.append(f"unknown (flit entry-points-file {_clip(path)} not in scanned files)")
+    ep_unknown = (unknown("pyproject.toml", "setup.py", "setup.cfg", "entry_points.txt", *flit_paths)
+                  + ep_unknown_cfg)
     dynamic = project.get("dynamic")
     if isinstance(dynamic, list) and _DYNAMIC_EPS & {d for d in dynamic if isinstance(d, str)}:
         ep_unknown.append("unknown (pyproject.toml marks them dynamic)")   # the backend fills them in at build

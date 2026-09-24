@@ -328,3 +328,15 @@ def test_a_top_level_entry_points_txt_never_breaks_build_diff(ep):
     too_large = tuple(b["path"] for b in bins if b.get("reason") == "source-too-large")
     d = differ.build_diff(ArtifactSet("acme", "1.1", "1.0", "sdist", nf, {}, {}, [], too_large=too_large))
     assert "plugins" in d.exec_context
+
+
+def test_a_first_flit_release_keeps_its_top_level_entry_points_txt(monkeypatch):
+    # old-style flit reads entry_points.txt at the sdist root; the surface filter must not turn it into "none"
+    from pydiffwatch import differ
+    monkeypatch.setattr(fetcher, "_package_json", lambda p, cfg: _meta("brandnew", [("1.0", "2026-01-01T00:00:00Z")]))
+    monkeypatch.setattr(fetcher, "_download", lambda url, cfg: make_sdist({
+        "pyproject.toml": b"[build-system]\nbuild-backend = 'flit_core.buildapi'\n[tool.flit.metadata]\nmodule = 'a'\n",
+        "a/__init__.py": b"", "entry_points.txt": b"[pytest11]\np = evil:hook\n"}))
+    art = fetcher.fetch_artifacts(Config(), NewRelease("brandnew", "1.0", 5))   # default policy=surface
+    assert "entry_points.txt" in art.new_files
+    assert "pytest11: p -> evil:hook" in differ.build_diff(art).exec_context

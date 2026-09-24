@@ -643,3 +643,35 @@ def test_a_backend_path_makes_even_a_parsed_backend_name_in_tree(backend):
 def test_an_empty_backend_path_is_not_in_tree():
     ctx = execctx.build({"pyproject.toml": b"[build-system]\nbuild-backend = 'setuptools.build_meta'\nbackend-path = []\n"})
     assert _line(ctx, "plugins").endswith(": none") and _line(ctx, "startup").endswith(": none")
+
+
+# ---- fix round 5: flit's entry-points-file ----
+
+_FLIT_OLD = "[build-system]\nbuild-backend = 'flit_core.buildapi'\n[tool.flit.metadata]\nmodule = 'a'\n"
+
+
+def test_flit_reads_its_default_top_level_entry_points_txt():
+    ctx = execctx.build({"pyproject.toml": _FLIT_OLD.encode(), "entry_points.txt": b"[pytest11]\np = e:h\n"})
+    assert _line(ctx, "plugins").endswith(": pytest11: p -> e:h")
+
+
+def test_flit_reads_a_named_entry_points_file():
+    ctx = execctx.build({"pyproject.toml": (_FLIT_OLD + "entry-points-file = 'eps/ep.txt'\n").encode(),
+                         "eps/ep.txt": b"[console_scripts]\nfoo = a:main\n"})
+    assert _line(ctx, "commands").endswith(": foo -> a:main")
+
+
+@pytest.mark.parametrize("extra, files, too_large, expect", [
+    ("entry-points-file = 'eps.cfg'\n", {}, (), "unknown (flit entry-points-file eps.cfg not in scanned files)"),
+    ("entry-points-file = 5\n", {}, (), "unknown (flit entry-points-file <computed>)"),
+    ("", {}, ("entry_points.txt",), "unknown (entry_points.txt too large)"),
+    ("", {"entry_points.txt": b"[x"}, (), "unknown (entry_points.txt unparseable)"),
+])
+def test_an_unread_flit_entry_points_file_is_unknown(extra, files, too_large, expect):
+    ctx = execctx.build({"pyproject.toml": (_FLIT_OLD + extra).encode(), **files}, too_large)
+    assert _line(ctx, "plugins").endswith(f": {expect}") and _line(ctx, "commands").endswith(f": {expect}")
+
+
+def test_a_top_level_entry_points_txt_is_not_flit_s_under_another_backend():
+    ctx = execctx.build({"pyproject.toml": b"[project]\nname = 'a'\n", "entry_points.txt": b"[pytest11]\np = e:h\n"})
+    assert "p -> e:h" not in ctx
