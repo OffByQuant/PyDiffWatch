@@ -267,3 +267,37 @@ def test_a_rescan_keeps_a_persons_label_on_the_switch_warning(tmp_cfg, monkeypat
     orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
     assert store.get_stage(conn, "race", "1.1") == "triaged"
     assert conn.execute("SELECT human_label FROM verdicts WHERE release_id=?", (rid,)).fetchone()[0] == "malicious"
+
+
+# --- Task 8 ----------------------------------------------------------------------------------------------
+
+def test_parking_in_the_wait_logs_once_with_the_due_time(tmp_cfg, caplog):
+    # (e): an operator can see why a release went quiet, and when it will be decided.
+    import datetime, logging
+    conn = store.connect(tmp_cfg); store.init_schema(conn)
+    rel = NewRelease("sw", "1.1", 10)
+    with caplog.at_level(logging.INFO, logger="pydiffwatch.orchestrator"):
+        orchestrator._process_fetched(tmp_cfg, conn, None, None, rel, fetcher.NoSdist(switched_from="1.0"))
+        orchestrator._process_fetched(tmp_cfg, conn, None, None, rel, fetcher.NoSdist(switched_from="1.0"))
+    [rec] = [r for r in caplog.records if "no_sdist_wait" in r.getMessage()]
+    assert rec.levelno == logging.INFO
+    due = datetime.datetime.fromtimestamp(store.recheck_at(conn, 1), datetime.UTC).isoformat(timespec="seconds")
+    assert "sw==1.1" in rec.getMessage() and due in rec.getMessage()
+
+
+def test_a_due_wait_row_is_not_starved_by_a_backlog_of_failing_retries(tmp_cfg, monkeypatch):
+    # (f): 45 older releases keep failing; they used to fill LIMIT 20 (ordered by serial) every tick.
+    conn = store.connect(tmp_cfg); store.init_schema(conn)
+    for i in range(45):
+        rid = store.record_release(conn, f"bad{i}", "1.0", i + 1, False, None, "sdist")
+        store.update_stage(conn, rid, "metadata_retry")
+    rid = store.record_release(conn, "sw", "1.1", 100, False, None, "sdist")
+    store.wait_for_sdist(conn, rid, 0)
+
+    def fetch(cfg, rel):
+        if rel.package == "sw":
+            return fetcher.NoSdist(switched_from="1.0")
+        raise TimeoutError("still down")
+    monkeypatch.setattr(fetcher, "fetch_artifacts", fetch)
+    orchestrator._retry_metadata(tmp_cfg, conn, None, None, False, None)
+    assert store.get_stage(conn, "sw", "1.1") == "no_sdist"       # decided on the first tick

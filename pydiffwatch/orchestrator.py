@@ -324,7 +324,11 @@ def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=
         due = was in ("no_sdist_wait", "metadata_retry") and recheck is not None and recheck <= now
         if (prev or rel.sdist_upload) and not due:
             if was != "no_sdist_wait":
-                store.wait_for_sdist(conn, rid, now + cfg.wheel_only_grace_minutes * 60)
+                due_at = now + cfg.wheel_only_grace_minutes * 60
+                store.wait_for_sdist(conn, rid, due_at)
+                logger.info("%s==%s has no sdist yet; parked in no_sdist_wait until %s, then re-checked",
+                            rel.package, rel.version,
+                            datetime.datetime.fromtimestamp(due_at, datetime.UTC).isoformat(timespec="seconds"))
             return True
         store.update_stage(conn, rid, "no_sdist")   # terminal, unless its sdist upload event arrives later
         if prev:

@@ -271,12 +271,14 @@ def set_fetch_note(conn, release_id, note):
     conn.commit()
 
 def metadata_retries_due(conn, limit=20, now=None):
-    """Releases to re-fetch off the cursor: failed ones (metadata_retry), and wheel-only ones whose wait for a
-    late sdist (no_sdist_wait) is over by `now` (epoch seconds; default: now)."""
+    """Releases to re-fetch off the cursor: wheel-only ones whose wait for a late sdist (no_sdist_wait) is over
+    by `now` (epoch seconds; default: now), soonest due first, then failed ones (metadata_retry) by serial. Each
+    kind gets its own `limit`, so a backlog of failing retries can't starve a due re-check."""
     now = datetime.datetime.now(datetime.UTC).timestamp() if now is None else now
-    return conn.execute("SELECT package, version, serial FROM releases WHERE stage='metadata_retry' "
-                        "OR (stage='no_sdist_wait' AND recheck_at <= ?) ORDER BY serial LIMIT ?",
-                        (now, limit)).fetchall()
+    waits = conn.execute("SELECT package, version, serial FROM releases WHERE stage='no_sdist_wait' "
+                         "AND recheck_at <= ? ORDER BY recheck_at, serial LIMIT ?", (now, limit)).fetchall()
+    return waits + conn.execute("SELECT package, version, serial FROM releases WHERE stage='metadata_retry' "
+                                "ORDER BY serial LIMIT ?", (limit,)).fetchall()
 
 def wait_for_sdist(conn, release_id, recheck_at):
     """Park a wheel-only release off the cursor until `recheck_at` (epoch seconds), when it is re-fetched."""

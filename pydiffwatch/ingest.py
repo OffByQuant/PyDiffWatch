@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 
 # The changelog action logged when a release's sdist is uploaded; Warehouse logs `add <python_version> file
 # <filename>`, and an sdist's python_version is "source". `new release` fires on a release's FIRST file, so when
-# the wheels upload first the release is recorded no_sdist; this later event re-scans it (spec U4).
+# the wheels upload first the release waits in no_sdist_wait (or, once decided, is no_sdist); this later event
+# re-scans it at once (spec U4).
 # LIVE-RUN VERIFY: the exact string is unverified offline. Check a live changelog_since_serial batch.
 SDIST_UPLOAD_ACTION = "add source file "
 

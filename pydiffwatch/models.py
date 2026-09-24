@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 class NewRelease:
     package: str; version: str; serial: int
     new_release: bool = True     # the changelog's `new release` event (the release's first file upload)
-    sdist_upload: bool = False   # its sdist upload event; re-scans a release recorded no_sdist (wheels first)
+    sdist_upload: bool = False   # its sdist upload event; re-scans a release left no_sdist_wait/no_sdist (wheels first)
 
 @dataclass(frozen=True)
 class ArtifactSet:
