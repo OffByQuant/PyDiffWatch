@@ -173,6 +173,25 @@ def _one_line(s: str) -> str:
     return "".join(c if c.isprintable() else repr(c)[1:-1] for c in s)
 
 
+_EXEC_MAX_CHARS = 4_000
+_EXEC_TRUNCATED = "… (context truncated)"
+
+
+def _render_exec(ctx: str) -> str:
+    """The execution-context block, capped at _EXEC_MAX_CHARS AFTER escaping (an escaped non-printable is up
+    to 10x its length), so author-written metadata can never crowd the hunks out of the input. Short lines
+    keep their full length; the rest share what is left, and a cut line says so."""
+    lines = ["  " + _one_line(x) for x in ctx.split("\n")]
+    budget = _EXEC_MAX_CHARS - len(_EXEC_HEADING) - len(lines)            # one newline before each line
+    share = {}
+    for n, i in enumerate(sorted(range(len(lines)), key=lambda i: len(lines[i]))):
+        share[i] = min(len(lines[i]), budget // (len(lines) - n))
+        budget -= share[i]
+    out = [ln if len(ln) <= share[i] else ln[:max(0, share[i] - len(_EXEC_TRUNCATED))] + _EXEC_TRUNCATED
+           for i, ln in enumerate(lines)]
+    return f"{_EXEC_HEADING}\n" + "\n".join(out)
+
+
 def build_review_input(diff, triage, *, max_chars: int, dropped: list | None = None) -> str:
     """Assemble the user-message text for the reviewer. Pure and deterministic.
 
@@ -215,7 +234,7 @@ def build_review_input(diff, triage, *, max_chars: int, dropped: list | None = N
     # Built by execctx from author-written metadata: fenced, and each line indented and escaped to one line so
     # none can pose as a file heading (dropped_from_text) or be taken for code (_has_reviewable_content).
     ctx = getattr(diff, "exec_context", "")
-    exec_text = f"{_EXEC_HEADING}\n" + "\n".join("  " + _one_line(x) for x in ctx.split("\n")) if ctx else ""
+    exec_text = _render_exec(ctx) if ctx else ""
     body_parts = [t for t in (loc_text, desc_text, exec_text) if t]
     used, truncated = len(header) + len(marker) + len(TRUNCATION_NOTE) + len("\n".join(body_parts)), False
     rendered_paths = []

@@ -105,3 +105,36 @@ def test_pth_is_not_called_install_time():
     sp = reviewer.SYSTEM_PROMPT
     assert "runs at install time (setup.py, a custom pyproject build backend, a .pth" not in sp
     assert "a .pth import line, which runs at every interpreter start" in sp
+
+
+# ---- fix round 1: the block is bounded after escaping, so it can never starve the hunks ----
+
+_ASTRAL = "\U000e0001"                                  # non-printable: _one_line escapes it to 10 characters
+
+
+def _block(text):
+    body = text.split(reviewer._EXEC_HEADING, 1)[1]
+    return reviewer._EXEC_HEADING + body.split("\n--- file: ", 1)[0]
+
+
+def test_a_hostile_block_is_capped_after_escaping_and_the_hunk_still_renders():
+    names = [f"{i}{_ASTRAL * 200}" for i in range(25)]
+    pp = ("[build-system]\nrequires=[]\nbuild-backend='" + _ASTRAL * 300 + "'\n[project]\nname='a'\n"
+          "[project.scripts]\n" + "".join(f"'{n}'='{n}'\n" for n in names)
+          + "[project.entry-points.g]\n" + "".join(f"'{n}'='{n}'\n" for n in names)).encode()
+    files = {"pyproject.toml": pp, **{f"{'e' * 190}{i:04d}.egg-info/entry_points.txt": b"no section\n"
+                                      for i in range(1990)}}
+    d = _update({**files, **{k: v for k, v in _files().items() if k != "pyproject.toml"}})
+    tr = TriageResult(50.0, [FiredRule("py-fs-write", 50.0, "src/acme_tools/hooks.py", (1, 1))], True)
+    text = reviewer.build_review_input(d, tr, max_chars=200_000)
+    block = _block(text)
+    assert len(block) <= 4_000 and "(context truncated)" in block
+    assert "--- file: src/acme_tools/hooks.py (modified) ---" in text.split("\n")
+    rv = reviewer.Reviewer.__new__(reviewer.Reviewer)
+    rv.cfg = type("C", (), {"reviewer": type("R", (), {"max_input_chars": 200_000})})()
+    assert reviewer._has_reviewable_content(rv.prepare(d, tr))          # no InputTooLarge, the hunk is there
+
+
+def test_an_ordinary_block_is_not_marked_truncated():
+    text = reviewer.build_review_input(_update(_files()), TriageResult(50.0, [], True), max_chars=20_000)
+    assert "(context truncated)" not in text
