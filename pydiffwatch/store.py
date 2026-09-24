@@ -113,8 +113,12 @@ def update_evidence(conn, release_id, evidence_text):
     conn.execute("UPDATE releases SET evidence=? WHERE id=?", (zlib.compress(evidence_text.encode()), release_id))
     conn.commit()
 
+# A release a person has adjudicated is theirs: no drain re-reviews it, and a later model verdict never drops its
+# evidence.
+_UNLABELLED = "NOT EXISTS(SELECT 1 FROM verdicts v WHERE v.release_id = releases.id AND v.human_label IS NOT NULL)"
+
 def clear_evidence(conn, release_id):
-    conn.execute("UPDATE releases SET evidence=NULL WHERE id=?", (release_id,))
+    conn.execute(f"UPDATE releases SET evidence=NULL WHERE id=? AND {_UNLABELLED}", (release_id,))
     conn.commit()
 
 def evidence_text(value):
@@ -237,13 +241,13 @@ def clear_pending(conn, release_id):
     conn.commit()
 
 def pending_reviews(conn, reasons=None, max_chars=None, over_chars=None, without_verdict=False):
-    """Rows parked for review, optionally only those with `reasons`, input at most `max_chars` or over
-    `over_chars`, or `without_verdict` (never given the UNREVIEWED verdict, nor labelled by a person).
+    """Rows parked for review and not labelled by a person, optionally only those with `reasons`, input at most
+    `max_chars` or over `over_chars`, or `without_verdict` (never given the UNREVIEWED verdict).
     `has_verdict` says whether a row has a verdict."""
     sql = ("SELECT id AS release_id, package, version, triage_score, triage_rules, pending_reason, "
            "pending_detail, COALESCE(review_attempts,0) AS review_attempts, review_input, "
            "EXISTS(SELECT 1 FROM verdicts v WHERE v.release_id = releases.id) AS has_verdict "
-           "FROM releases WHERE stage='pending_review'")
+           f"FROM releases WHERE stage='pending_review' AND {_UNLABELLED}")
     params = list(reasons or [])
     if params:
         sql += f" AND pending_reason IN ({','.join('?' * len(params))})"
@@ -345,7 +349,7 @@ def save_reviewer_stats(conn, endpoint, model, *, tok_s, chars_per_token, sample
 
 def pending_review_counts(conn) -> dict:
     return dict(conn.execute("SELECT pending_reason, count(*) FROM releases WHERE stage='pending_review' "
-                             "GROUP BY pending_reason").fetchall())
+                             f"AND {_UNLABELLED} GROUP BY pending_reason").fetchall())
 
 def update_stage(conn, release_id, stage, score=None, rules=None):
     sets = ["stage=?"]; params = [stage]

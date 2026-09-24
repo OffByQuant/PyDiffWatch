@@ -166,3 +166,39 @@ def test_drain_limit_counts_attempts_not_successes(tmp_path):
     be.calls.clear()
     orchestrator.drain_pending(cfg, conn, rvw, auto=True, limit=1)
     assert len(be.calls) == 1
+
+
+def _adjudicated_too_large(tmp_path, be):
+    cfg, conn, rid, rvw = _setup(tmp_path, be, max_input_chars=10_000)
+    store.update_evidence(conn, rid, "payload code")
+    orchestrator._review_escalated(cfg, conn, rvw, _diff("x" * 50_000), _T, rid)
+    store.adjudicate(conn, rid, "malicious", "confirmed by hand")
+    big = dataclasses.replace(cfg, reviewer=dataclasses.replace(cfg.reviewer, max_input_chars=200_000))
+    return big, conn, rid
+
+
+def _row(conn, rid):
+    return tuple(conn.execute("SELECT r.stage, r.evidence IS NOT NULL, v.classification, v.human_label "
+                              "FROM releases r JOIN verdicts v ON v.release_id=r.id WHERE r.id=?", (rid,)).fetchone())
+
+
+def test_a_row_a_person_adjudicated_is_never_re_reviewed_by_either_drain(tmp_path):
+    be = _Backend()
+    big, conn, rid = _adjudicated_too_large(tmp_path, be)
+    rvw = reviewer.Reviewer(big, backend=be)
+    orchestrator.drain_pending(big, conn, rvw, auto=True)               # the cap grew: it fits now
+    orchestrator.drain_pending(big, conn, rvw, auto=False)
+    assert be.calls == []
+    assert _row(conn, rid) == ("pending_review", 1, "suspicious", "malicious")
+    assert store.pending_reviews(conn) == [] and store.pending_review_counts(conn) == {}
+
+
+def test_a_benign_model_verdict_never_drops_the_evidence_of_a_labelled_release(tmp_path):
+    cfg, conn, rid, rvw = _setup(tmp_path, _Backend())
+    store.update_evidence(conn, rid, "payload code")
+    orchestrator._review_escalated(cfg, conn, rvw, _diff(), _T, rid, offline=True)
+    store.record_verdict(conn, rid, orchestrator.Verdict("pkg", "1.0.0", "suspicious", 60.0, [], False, model="none"))
+    store.adjudicate(conn, rid, "malicious", "confirmed by hand")
+    benign = orchestrator.Verdict("pkg", "1.0.0", "benign", 60.0, [], False, model="m", reasoning="fine")
+    orchestrator._record(cfg, conn, rid, benign, 60.0)
+    assert store.get_evidence(conn, rid) == "payload code"
