@@ -61,6 +61,33 @@ def test_is_flagged():
     assert dashboard.is_flagged({"classification": "benign", "stage": "reviewed"}) is False
 
 
+def test_is_flagged_honors_a_human_adjudication():
+    # store.adjudicate never moves the release off its stage, so a human "benign" on a partial-review
+    # release (still stage='needs_adjudication') must clear the flag -- and a human override the other
+    # way (model said benign, human found it malicious) must keep it flagged.
+    still_queued_but_cleared = {"classification": "benign", "stage": "needs_adjudication",
+                                "human_label": "benign"}
+    assert dashboard.is_flagged(still_queued_but_cleared) is False
+    overridden_to_malicious = {"classification": "benign", "stage": "needs_adjudication",
+                               "human_label": "malicious"}
+    assert dashboard.is_flagged(overridden_to_malicious) is True
+
+
+def test_render_after_human_adjudication_matches_the_human_label():
+    # The badge must never contradict is_flagged's report-button/styling decision.
+    cleared = dashboard.render_dashboard([{"package": "partpkg", "version": "1.0.0",
+                                           "classification": "benign", "stage": "needs_adjudication",
+                                           "human_label": "benign"}])
+    assert "Report malware on PyPI" not in cleared
+    assert 'class="card benign"' in cleared and ">benign<" in cleared
+
+    overridden = dashboard.render_dashboard([{"package": "partpkg", "version": "1.0.0",
+                                              "classification": "benign", "stage": "needs_adjudication",
+                                              "human_label": "malicious"}])
+    assert "Report malware on PyPI" in overridden
+    assert 'class="card malicious"' in overridden and ">malicious<" in overridden
+
+
 def test_render_orders_flagged_first():
     out = dashboard.render_dashboard([
         {"package": "benignpkg", "version": "1.0.0", "classification": "benign"},

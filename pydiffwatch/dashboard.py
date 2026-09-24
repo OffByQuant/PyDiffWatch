@@ -47,13 +47,22 @@ def _conf_pct(conf) -> str:
 
 def is_flagged(row: dict) -> bool:
     """A release needing a person's attention: a malicious/suspicious verdict, or a benign one still
-    sitting in `needs_adjudication` (spec U2: the model only reviewed part of the input)."""
+    sitting in `needs_adjudication` (spec U2: the model only reviewed part of the input). A human
+    adjudication (`human_label`) is the final word when present: 'benign' clears the flag for good
+    (store.adjudicate never moves the release off its stage, so `stage` alone can't tell it's settled);
+    any other label keeps it flagged even if the model's own classification was 'benign'."""
+    human = row.get("human_label")
+    if human is not None:
+        return human.lower() != "benign"
     cls = (row.get("classification") or "benign").lower()
     return cls in _FLAGGED or row.get("stage") == "needs_adjudication"
 
 
 def _card(row: dict) -> str:
-    cls = (row.get("classification") or "benign").lower()
+    # A human adjudication overrides the model's classification for display too, so the badge text
+    # never contradicts is_flagged's styling/report-button decision above.
+    human = row.get("human_label")
+    cls = human.lower() if human is not None else (row.get("classification") or "benign").lower()
     pkg = row.get("package") or ""
     ver = row.get("version") or ""
     e = html.escape

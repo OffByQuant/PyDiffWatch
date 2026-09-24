@@ -236,6 +236,11 @@ def dropped_from_text(fired_rules, text: str) -> list[str]:
     original Diff/TriageResult to hand to build_review_input directly. Weighted files (summed
     fired-rule weight > 0) whose file-heading line is absent from `text`, highest weight first.
 
+    Only CODE rules (lines != (0, 0)) are candidates — same convention build_evidence already uses.
+    Binary/foreign-source/too-large-source rules fire on a path that is never in diff.changed, and
+    dep/maintainer rules fire on a dependency name or "<ownership>"; none of those ever has (or is
+    meant to have) a file heading, so counting them as "dropped" would be a false positive.
+
     Matched as a WHOLE text line (`p` escaped with `_one_line`, exactly as `_render_file` escapes it),
     never a substring: every rendered diff line carries a leading '+ '/'- ' (see _render_file), the
     description/flagged_locations lines carry their own fixed prefixes, and `_one_line` means a path
@@ -244,6 +249,8 @@ def dropped_from_text(fired_rules, text: str) -> list[str]:
     """
     weights: dict[str, float] = {}
     for r in fired_rules:
+        if r.lines == (0, 0):
+            continue
         weights[r.file] = weights.get(r.file, 0.0) + r.weight
     lines = set(text.split("\n"))
     return [p for p, w in sorted(weights.items(), key=lambda kv: -kv[1])

@@ -168,6 +168,53 @@ def test_too_large_park_then_review_pending_still_adjudicates_partial_review(tmp
     assert _alert_count(conn) == 2 and _partial_review_alert_count(conn) == 1
 
 
+def test_dropped_from_text_ignores_non_file_rules():
+    # binary/foreign-source/too-large-source rules fire on a path never in diff.changed; dep rules fire
+    # on the dependency name; maintainer rules fire on "<ownership>" (engine.py). None of them is ever
+    # rendered as a file heading, and none should ever, so lines==(0,0) rules (build_evidence's own
+    # convention for "not a code rule") are excluded from dropped-file candidates.
+    text = ("package: p\nversion: 1.0\nis_first_release: False\ntriage_score: 50\n"
+           "untrusted_content_marker: ===M===\n\n===M===\n"
+           "--- file: setup.py (modified) ---\n+ os.system('id')\n===M===")
+    fired = [FiredRule("autoexec", 50.0, "setup.py", (1, 1)),
+             FiredRule("binary", 30.0, "lib/x.so", (0, 0)),
+             FiredRule("dep-typosquat", 20.0, "evil-dep", (0, 0)),
+             FiredRule("maintainer-change", 10.0, "<ownership>", (0, 0))]
+    assert reviewer.dropped_from_text(fired, text) == []
+
+
+def test_drain_path_does_not_flag_non_file_rules_as_dropped(tmp_path):
+    # Integration reproduction of the same bug through drain_pending: a benign verdict with binary/dep/
+    # maintainer rules must stay `reviewed`, matching what the fresh (non-drain) build already gives.
+    code = FileDiff("setup.py", "modified", [Hunk((0, 0), (0, 1), ["os.system('id')"], [])])
+    d = Diff("p", "1.0", False, [code], [])
+    tr = TriageResult(50.0, [
+        FiredRule("autoexec", 50.0, "setup.py", (1, 1)),
+        FiredRule("binary", 30.0, "lib/x.so", (0, 0)),
+        FiredRule("dep-typosquat", 20.0, "evil-dep", (0, 0)),
+        FiredRule("maintainer-change", 10.0, "<ownership>", (0, 0)),
+    ], True)
+    cfg, conn, rid = _setup(tmp_path, max_input_chars=10_000)   # everything fits comfortably
+    store.update_stage(conn, rid, "triaged", tr.score, json.dumps([r.__dict__ for r in tr.fired_rules]))
+
+    # The fresh build (build_review_input's own dropped= tracking) is the baseline the drain path must
+    # match: nothing is actually dropped here.
+    fresh_dropped = []
+    reviewer.build_review_input(d, tr, max_chars=10_000, dropped=fresh_dropped)
+    assert fresh_dropped == []
+
+    rvw = reviewer.Reviewer(cfg, backend=_FakeBackend([]))
+    orchestrator._review_escalated(cfg, conn, rvw, d, tr, rid, offline=True)
+    assert store.pending_reviews(conn)[0]["pending_reason"] == "endpoint_unreachable"
+
+    be2 = _FakeBackend([_benign_json()])
+    orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=be2), auto=True)
+
+    assert store.get_stage(conn, "p", "1.0") == "reviewed"     # not needs_adjudication
+    row = conn.execute("SELECT reasoning FROM verdicts WHERE release_id=?", (rid,)).fetchone()
+    assert "reviewed partially" not in (row["reasoning"] or "")
+
+
 def test_dropped_from_text_resists_a_forged_heading_via_embedded_newline():
     # A dropped, weighted "victim.py" must still be reported even when a RENDERED file's own path (a
     # sdist member name — author-chosen) contains a literal newline shaped to forge victim.py's own
