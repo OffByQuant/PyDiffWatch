@@ -21,6 +21,14 @@ def _cfg(args):
     return cfg
 
 
+def _non_negative(text):
+    """argparse type for --recent: a count of changelog events; 0 means start now, as with no --recent."""
+    n = int(text)
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or more, got {n}")
+    return n
+
+
 def _reach(host):
     """Human note about who can reach a given bind address."""
     if host in ("127.0.0.1", "localhost"):
@@ -52,7 +60,7 @@ def main():
     runp.add_argument("--backfill", action="store_true",
                       help="process from the cursor as-is (PyPI genesis on a fresh DB) instead of "
                            "seeding a fresh cursor to now")
-    runp.add_argument("--recent", type=int, default=None, metavar="N",
+    runp.add_argument("--recent", type=_non_negative, default=None, metavar="N",
                       help="on a fresh database, start N PyPI changelog events back instead of now (one "
                            "release is several events: the release plus one per uploaded file)")
     sub.add_parser("seed-now",
@@ -99,7 +107,7 @@ def main():
     wp.add_argument("--interval", type=int, default=300,
                     help="seconds between scans once caught up (default: 300)")
     wp.add_argument("--out", default=None, help="dashboard HTML path (default: <db dir>/dashboard.html)")
-    wp.add_argument("--recent", type=int, default=None, metavar="N",
+    wp.add_argument("--recent", type=_non_negative, default=None, metavar="N",
                     help="on a fresh database, start N PyPI changelog events back instead of now (one "
                          "release is several events), so the dashboard fills within minutes (ignored once "
                          "scanning has started)")

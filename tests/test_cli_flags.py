@@ -74,3 +74,32 @@ def test_endpoint_equal_to_the_configs_keeps_its_api_key(tmp_path):
 
 def test_model_alone_keeps_the_configs_api_key(tmp_path):
     assert cli._cfg(_args(config=_keyed(tmp_path), model="m")).reviewer.api_key_env == "OPENAI_API_KEY"
+
+
+def _no_scan(monkeypatch, seen=None):
+    """Stub everything main() would reach for, so a test can never scan PyPI or touch a real database."""
+    seen = {} if seen is None else seen
+    monkeypatch.setattr(cli, "_cfg", lambda args: cli.Config())
+    monkeypatch.setattr(cli.egress, "install_guard", lambda cfg: None)
+    monkeypatch.setattr(cli, "run_once", lambda cfg, **k: seen.setdefault("recent", k["recent"]) and 0)
+    monkeypatch.setattr(cli, "watch", lambda cfg, **k: seen.setdefault("recent", k["recent"]) and 0)
+    monkeypatch.setattr(cli, "export_dashboard", lambda cfg, **k: cli.Config().db_path)
+    return seen
+
+
+@pytest.mark.parametrize("cmd", ["run", "watch"])
+def test_negative_recent_is_rejected(cmd, monkeypatch, capsys):
+    _no_scan(monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["pydiffwatch", cmd, "--recent", "-5"])
+    with pytest.raises(SystemExit) as e:
+        cli.main()
+    assert e.value.code == 2 and "--recent" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("cmd", ["run", "watch"])
+def test_recent_zero_is_allowed_and_means_start_now(cmd, monkeypatch):
+    # As npmDiffWatch: 0 is accepted, and run_once treats it like no --recent (seed the cursor to now).
+    seen = _no_scan(monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["pydiffwatch", cmd, "--recent", "0"])
+    cli.main()
+    assert seen["recent"] == 0
