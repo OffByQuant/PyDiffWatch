@@ -682,3 +682,28 @@ def test_an_unknown_backend_qualifies_like_an_unparsed_one():
     assert "backend=unknown" in ctx
     assert _line(ctx, "plugins").endswith(": none in [project] (unknown backend may declare its own)")
     assert _line(ctx, "startup").endswith(": none in scanned files (unknown backend may generate its own)")
+
+
+# ---- task 11: each file is parsed under exactly one kind (its status never contradicts itself) ----
+
+@pytest.mark.parametrize("epf, files", [
+    ("setup.cfg", {"setup.cfg": b"[metadata]\nname: a\n[options]\ncmdclass =\n    build = b:B\n"}),
+    ("pyproject.toml", {}),
+    ("PKG-INFO", {"PKG-INFO": b"Metadata-Version: 2.1\nName: a\nSummary: s\n"}),
+])
+def test_a_flit_entry_points_file_that_is_another_metadata_file_is_unknown_not_reparsed(epf, files):
+    # setup.cfg parses as INI (`name: a`) but not as entry points (`=` only): reading it under both kinds made
+    # the block call setup.cfg unparseable while showing what it declared. pyproject.toml read as INI yields
+    # its tables as plugin groups. Each file has one kind; a flit entry-points-file naming another is unknown.
+    ctx = execctx.build({"pyproject.toml": (_FLIT_OLD + f"entry-points-file = '{epf}'\n").encode(), **files})
+    expect = f"unknown (flit entry-points-file {epf} is not an entry-points file)"
+    assert _line(ctx, "plugins").endswith(f": {expect}") and _line(ctx, "commands").endswith(f": {expect}")
+    assert "unparseable" not in ctx and "build-system:" not in ctx
+    if epf == "setup.cfg":
+        assert "cmdclass=build;" in ctx
+
+
+def test_an_entry_points_file_read_twice_under_one_kind_is_named_once():
+    egg = "a.egg-info/entry_points.txt"
+    ctx = execctx.build({"pyproject.toml": (_FLIT_OLD + f"entry-points-file = '{egg}'\n").encode(), egg: b"[x"})
+    assert _line(ctx, "unparseable") == f"unparseable: {egg}"

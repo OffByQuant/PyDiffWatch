@@ -23,6 +23,9 @@ _SETUPTOOLS_BACKENDS = ("setuptools.build_meta", "setuptools.build_meta:__legacy
 # backends whose own entry-point tables are parsed here: [tool.poetry.scripts/plugins], [tool.flit.scripts/entrypoints]
 _PARSED_BACKENDS = _SETUPTOOLS_BACKENDS + ("poetry.core.masonry.api", "poetry.masonry.api",
                                           "flit_core.buildapi", "flit.buildapi")
+# The one kind each top-level metadata file is parsed as, here and in the fetcher (PKG-INFO's Summary). A file is
+# never parsed under a second kind: its parsed/unparseable status would contradict itself.
+KINDS = {"pyproject.toml": "toml", "setup.cfg": "ini", "PKG-INFO": "pkginfo"}
 
 
 def _ini(text: str, delimiters=("=", ":")) -> dict:
@@ -455,7 +458,9 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
         elif epf is not None:
             path = epf.strip().removeprefix("./")
             flit_paths.append(path)
-            if path in new_files:
+            if path in KINDS:
+                ep_unknown_cfg.append(f"unknown (flit entry-points-file {path} is not an entry-points file)")
+            elif path in new_files:
                 _add_groups(eps, parsed(path, "entry_points"))
             elif path in too_large:
                 why[path] = "too large"
