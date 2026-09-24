@@ -20,6 +20,9 @@ _MAX_LINE = 2_000
 _LIT_DEPTH = 4          # deeper literals in setup() are shown as "<computed>"
 COMPUTED = "<computed>"
 _SETUPTOOLS_BACKENDS = ("setuptools.build_meta", "setuptools.build_meta:__legacy__")
+# backends whose own entry-point tables are parsed here: [tool.poetry.scripts/plugins], [tool.flit.scripts/entrypoints]
+_PARSED_BACKENDS = _SETUPTOOLS_BACKENDS + ("poetry.core.masonry.api", "poetry.masonry.api",
+                                          "flit_core.buildapi", "flit.buildapi")
 
 
 def _ini(text: str, delimiters=("=", ":")) -> dict:
@@ -213,6 +216,11 @@ def _ep_lines(v) -> list[tuple[str, str]]:
     return out
 
 
+def _table(v):
+    """A TOML entry-point table as written, None when absent, else "<computed>" (never parsed as INI text)."""
+    return v if v is None or isinstance(v, dict) else COMPUTED
+
+
 def _add_groups(eps: dict, groups) -> None:
     """Merge one source's {group: entries} into eps. None means the source has no entry points; anything
     that is not statically a table (computed, wrong type, unparseable INI text) is unknown."""
@@ -310,8 +318,8 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
         except _PARSE_ERRORS:
             unparseable.append("setup.py")
             why["setup.py"] = "unparseable"
-    if any(k in pp and not isinstance(pp[k], dict) for k in ("build-system", "project", "tool")) or (
-            "setuptools" in _dict(pp.get("tool")) and not isinstance(pp["tool"]["setuptools"], dict)):
+    if any(k in pp and not isinstance(pp[k], dict) for k in ("build-system", "project", "tool")) or any(
+            k in _dict(pp.get("tool")) and not isinstance(pp["tool"][k], dict) for k in ("setuptools", "poetry", "flit")):
         why["pyproject.toml"] = "malformed"
 
     def kw(name):
@@ -399,6 +407,10 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
     eps: dict = {}
     _add_groups(eps, {"console_scripts": project.get("scripts"), "gui_scripts": project.get("gui-scripts")})
     _add_groups(eps, project.get("entry-points"))
+    for tool, scripts, groups in (("poetry", "scripts", "plugins"), ("flit", "scripts", "entrypoints")):
+        t = _dict(_dict(pp.get("tool")).get(tool))
+        _add_groups(eps, {"console_scripts": t.get(scripts)})
+        _add_groups(eps, _table(t.get(groups)))
     _add_groups(eps, kw("entry_points"))
     _add_groups(eps, cfg.get("options.entry_points"))
     for p in _egg_info(new_files, "entry_points.txt"):
@@ -407,7 +419,11 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
     dynamic = project.get("dynamic")
     if isinstance(dynamic, list) and _DYNAMIC_EPS & {d for d in dynamic if isinstance(d, str)}:
         ep_unknown.append("unknown (pyproject.toml marks them dynamic)")   # the backend fills them in at build
-    cmds, plugins = _entry_points_lines(eps, ep_unknown, none)
+    ep_none = none
+    if backend is not None and backend not in _PARSED_BACKENDS:     # its own tables are not parsed here
+        ep_none = f"none in [project] ({_clip(backend)} may declare its own)" + (
+            f"; {NOT_LITERAL}" if "setup.py" in new_files else "")
+    cmds, plugins = _entry_points_lines(eps, ep_unknown, ep_none)
 
     lines = [build_line, startup, import_line,
              f"commands (console_scripts/gui_scripts; run only when the user types them): {cmds}",

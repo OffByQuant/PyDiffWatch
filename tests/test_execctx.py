@@ -466,3 +466,80 @@ def test_dynamic_entry_points_are_unknown():
     ctx = execctx.build({"pyproject.toml": b"[project]\nname = 'a'\ndynamic = ['entry-points', 'version']\n"})
     assert _line(ctx, "plugins").endswith("unknown (pyproject.toml marks them dynamic)")
     assert _line(ctx, "commands").endswith("unknown (pyproject.toml marks them dynamic)")
+
+
+# ---- fix round 4: poetry / flit entry points, other backends ----
+
+POETRY = b"""\
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+[tool.poetry]
+name = "a"
+[tool.poetry.scripts]
+foo = "a:main"
+[tool.poetry.plugins.pytest11]
+p = "evil:hook"
+[tool.poetry.plugins.console_scripts]
+bar = "a:bar"
+"""
+
+FLIT = b"""\
+[build-system]
+requires = ["flit_core"]
+build-backend = "flit_core.buildapi"
+[tool.flit.metadata]
+module = "a"
+[tool.flit.scripts]
+foo = "a:main"
+[tool.flit.entrypoints.pytest11]
+p = "evil:hook"
+"""
+
+
+def test_poetry_scripts_and_plugins_are_read():
+    ctx = execctx.build({"pyproject.toml": POETRY})
+    assert _line(ctx, "commands").endswith(": foo -> a:main, bar -> a:bar")      # console_scripts plugin = command
+    assert _line(ctx, "plugins").endswith(": pytest11: p -> evil:hook")
+
+
+def test_flit_scripts_and_entrypoints_are_read():
+    ctx = execctx.build({"pyproject.toml": FLIT})
+    assert _line(ctx, "commands").endswith(": foo -> a:main")
+    assert _line(ctx, "plugins").endswith(": pytest11: p -> evil:hook")
+
+
+@pytest.mark.parametrize("pp", [
+    b"[tool.poetry]\nscripts = 5\n",
+    b"[tool.poetry]\nplugins = 5\n",
+    b"[tool.poetry.plugins]\npytest11 = 5\n",
+    b"[tool.poetry.scripts]\nfoo = {reference = 'a:main', type = 'console'}\n",
+    b"[tool.poetry.scripts]\nfoo = 5\n",
+    b"[tool.flit]\nscripts = ['x']\n",
+    b"[tool.flit]\nentrypoints = 'x'\n",
+    b"[tool.flit.entrypoints]\npytest11 = [1]\n",
+])
+def test_wrong_typed_poetry_or_flit_entry_points_are_computed(pp):
+    ctx = execctx.build({"pyproject.toml": pp})
+    assert "<computed>" in _line(ctx, "commands") + _line(ctx, "plugins"), pp
+
+
+@pytest.mark.parametrize("pp", [b"tool = {poetry = 5}\n", b"tool = {flit = 'x'}\n"])
+def test_a_wrong_typed_poetry_or_flit_table_is_malformed(pp):
+    ctx = execctx.build({"pyproject.toml": pp})
+    assert _line(ctx, "plugins").endswith("unknown (pyproject.toml malformed)")
+
+
+def test_an_unparsed_backend_says_it_may_declare_its_own_entry_points():
+    ctx = execctx.build({"pyproject.toml": b"[build-system]\nbuild-backend = 'hatchling.build'\n[project]\nname = 'a'\n"})
+    u = "none in [project] (hatchling.build may declare its own)"
+    assert _line(ctx, "commands").endswith(f": {u}") and _line(ctx, "plugins").endswith(f": {u}")
+    ctx = execctx.build({"pyproject.toml": b"[build-system]\nbuild-backend = 'hatchling.build'\n",
+                         "setup.py": b"from setuptools import setup\nsetup()\n"})
+    assert _line(ctx, "plugins").endswith(f": {u}; {NOT_LITERAL}")
+
+
+@pytest.mark.parametrize("backend", ["setuptools.build_meta", "poetry.core.masonry.api", "flit_core.buildapi"])
+def test_parsed_backends_keep_the_plain_none(backend):
+    ctx = execctx.build({"pyproject.toml": f"[build-system]\nbuild-backend = '{backend}'\n".encode()})
+    assert _line(ctx, "plugins").endswith(": none"), backend
