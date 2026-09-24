@@ -53,7 +53,7 @@ def _sha256_of(fileobj) -> str:
 
 def extract_sdist(blob: bytes, cfg: Config):
     files: dict[str, bytes] = {}; binaries: list[dict] = []
-    total = 0; count = 0; foreign = 0
+    total = 0; count = 0
     # Decompress through a byte-ceiling and read the tar as a forward-only STREAM ("r|"): both
     # bound peak RAM so a malicious sdist cannot expand to gigabytes in memory during extraction.
     stream = _BoundedReader(gzip.GzipFile(fileobj=io.BytesIO(blob)), cfg.max_decompressed_bytes)
@@ -82,14 +82,26 @@ def extract_sdist(blob: bytes, cfg: Config):
                 data = tar.extractfile(m).read()
                 binaries.append({"path": rel, "sha256": hashlib.sha256(data).hexdigest(),
                                  "size": m.size})
-            elif (fext := _foreign_ext(m.name)) and foreign < cfg.max_foreign_files:
+            elif fext := _foreign_ext(m.name):
                 # Foreign-language source: record presence (path/ext/size) as a signal. We fingerprint
                 # the bytes (to drop unchanged files vs the prior release) but never parse or analyze
-                # them — this is not Python code we understand. Cap-and-stop.
+                # them — this is not Python code we understand. Every one is hashed (streamed); the
+                # max_foreign_files cap applies after the prior comparison (_cap_foreign), so unchanged
+                # files cannot use it up.
                 binaries.append({"path": rel, "size": m.size, "ext": fext,
                                  "reason": "foreign-language-source", "sha256": _sha256_of(tar.extractfile(m))})
-                foreign += 1
     return files, binaries
+
+def _cap_foreign(bins: list[dict], cfg: Config) -> list[dict]:
+    """Keep at most max_foreign_files foreign-language records; other records are untouched."""
+    out, n = [], 0
+    for b in bins:
+        if b.get("reason") == "foreign-language-source":
+            n += 1
+            if n > cfg.max_foreign_files:
+                continue
+        out.append(b)
+    return out
 
 def read_body(r, cfg: Config, limit: int | None = None, deadline: float | None = None) -> bytes:
     """A response body within a total deadline (seconds; default fetch_deadline_s) and an optional size cap.
@@ -273,6 +285,6 @@ def fetch_artifacts(cfg, rel: NewRelease) -> ArtifactSet | None:
         # signal 5: flag suspicious newly-added dependencies vs the predecessor (update path only).
         dep_findings = _screen_added_deps(meta, rel.package, prior_ver, cfg)
     return ArtifactSet(rel.package, rel.version, prior_ver, "sdist",
-                       new_files, prior_files, {}, new_bins,
+                       new_files, prior_files, {}, _cap_foreign(new_bins, cfg),
                        is_new_package=is_new, maintainer_metadata=mtmeta,
                        added_dep_findings=dep_findings, prior_error=prior_error, description=summary)

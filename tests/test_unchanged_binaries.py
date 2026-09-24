@@ -55,3 +55,20 @@ def test_changed_binary_is_still_reported(monkeypatch):
 
 def test_everything_is_reported_when_the_prior_version_cannot_be_read(monkeypatch):
     assert _fetch(monkeypatch, {"evil.py": _BIG}, {"evil.py": _BIG}, prior_fails=True) == ["evil.py"]
+
+
+def test_changed_foreign_file_is_still_reported(monkeypatch):
+    assert _fetch(monkeypatch, {"tool.php": b"<?php echo 1; ?>\n"},
+                               {"tool.php": b"<?php system($_GET['c']); ?>\n"}) == ["tool.php"]
+
+
+def test_a_new_foreign_file_after_many_unchanged_ones_is_reported(monkeypatch):
+    # Final review: the 25-file cap ran during extraction, before the comparison with the prior release,
+    # so 25 unchanged foreign files used up the cap and a new .php after them was never recorded.
+    old = {f"x{i:02}.php": b"<?php ?>" for i in range(25)}
+    assert _fetch(monkeypatch, old, old | {"zz_new.php": b"<?php system($_GET['c']); ?>"}) == ["zz_new.php"]
+
+
+def test_the_foreign_file_cap_applies_to_what_is_reported(monkeypatch):
+    new = {f"x{i:02}.php": b"<?php ?>" for i in range(30)}
+    assert len(_fetch(monkeypatch, {"a.py": b"x=1\n"}, new)) == Config().max_foreign_files

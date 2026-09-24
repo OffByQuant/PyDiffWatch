@@ -110,10 +110,14 @@ def test_foreign_case_insensitive_and_double_extension():
     assert foreign == {"A.PHP", "setup.py.php"}
 
 def test_foreign_per_package_cap():
+    # Extraction hashes every foreign file (so unchanged ones can be dropped vs the prior release); the cap
+    # applies afterwards, to what is reported (tests/test_unchanged_binaries.py).
     members = {"setup.py": b"x=1\n"} | {f"x{i}.php": b"<?php ?>" for i in range(30)}
     blob = make_sdist(members)
     _, binaries = fetcher.extract_sdist(blob, Config(max_foreign_files=25))
-    assert sum(1 for b in binaries if b.get("reason") == "foreign-language-source") == 25
+    assert sum(1 for b in binaries if b.get("reason") == "foreign-language-source") == 30
+    capped = fetcher._cap_foreign(binaries, Config(max_foreign_files=25))
+    assert sum(1 for b in capped if b.get("reason") == "foreign-language-source") == 25
 
 
 # ---- fetch_artifacts: PyPI-baseline resolution + new-package policy ----
