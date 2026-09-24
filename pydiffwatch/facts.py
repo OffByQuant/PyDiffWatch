@@ -181,7 +181,7 @@ def _file_facts(fd) -> FileFacts:
         return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, False, added_strs)
     try:
         tree = ast.parse(fd.new_text)
-    except SyntaxError:
+    except (SyntaxError, RecursionError, MemoryError, ValueError):   # deep nesting crashes the parser itself
         return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, True, added_strs)
     table = _build_import_table(tree)
     importtime_ids = _importtime_call_ids(tree)

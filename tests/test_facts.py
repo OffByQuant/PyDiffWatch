@@ -84,3 +84,19 @@ def test_maintainer_changed():
     ctx = {"current": {"roles": ["a", "b"]}, "prior": {"roles": ["a"]}}
     assert build_facts(d, ctx).maintainer_changed is True
     assert build_facts(d, {"current": {"roles": ["a"]}, "prior": {"roles": ["a"]}}).maintainer_changed is False
+
+
+def test_source_that_crashes_the_parser_is_unparseable_not_a_crash():
+    # Final review: ast.parse raises RecursionError on a long attribute chain (~400 KB, under the source cap),
+    # which escaped the SyntaxError handler and failed the release deterministically, pinning the cursor.
+    f = build_facts(_wholefile("m/x.py", "a" + ".b" * 200_000)).files[0]
+    assert f.syntax_error is True
+
+
+def test_parser_memory_and_value_errors_are_unparseable(monkeypatch):
+    from pydiffwatch import facts
+    for exc in (MemoryError(), ValueError("source code string cannot contain null bytes")):
+        def boom(*a, exc=exc, **k):
+            raise exc
+        monkeypatch.setattr(facts.ast, "parse", boom)
+        assert build_facts(_wholefile("m/x.py", "x = 1")).files[0].syntax_error is True
