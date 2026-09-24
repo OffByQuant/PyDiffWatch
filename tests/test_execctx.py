@@ -389,8 +389,9 @@ def _plugins(src: str) -> str:
 
 def test_with_setup_py_an_undeclared_field_is_never_a_bare_none():
     ctx = execctx.build({"setup.py": b"from setuptools import setup\nsetup(name='a')\n"})
-    for field in ("cmdclass", "setup_requires", "py-modules"):
+    for field in ("cmdclass", "setup_requires"):
         assert f"{field}={NOT_LITERAL}" in ctx, field
+    assert f"py-modules=auto-discovered: {NOT_LITERAL}" in ctx
     assert _line(ctx, "commands").endswith(f": {NOT_LITERAL}") and _line(ctx, "plugins").endswith(f": {NOT_LITERAL}")
 
 
@@ -607,9 +608,9 @@ def test_with_setup_py_a_literal_empty_list_is_never_a_bare_none(src, field):
     assert f"{field}={NOT_LITERAL}" in execctx.build({"setup.py": src.encode()})
 
 
-def test_without_setup_py_empty_discovery_and_startup_stay_none():
+def test_without_setup_py_empty_startup_stays_none_and_discovery_is_qualified():
     ctx = execctx.build({"pyproject.toml": b"[project]\nname = 'a'\n"})
-    assert "packages=auto-discovered: none;" in ctx and _line(ctx, "startup").endswith(": none")
+    assert f"packages=auto-discovered: {execctx.AUTO_NONE};" in ctx and _line(ctx, "startup").endswith(": none")
 
 
 # ---- fix round 5: top-level metadata paths never raise ----
@@ -754,3 +755,46 @@ def test_plugin_groups_count_their_uncollected_entries():
     execctx._add_groups(eps, {"pytest11": [f"p{i} = m" for i in range(100)], "x": ["a = b"]})
     _, plugins = execctx._entry_points_lines(eps, [], "none")
     assert plugins.startswith("pytest11: p0 -> m, ") and plugins.endswith(", … (+81 more)")
+
+
+# ---- final review I2: setuptools auto-discovery is never reported as a bare "none" ----
+
+_ST = b"[build-system]\nbuild-backend = 'setuptools.build_meta'\n[project]\nname = 'a'\n"
+_AUTO_NONE = "none found by DiffWatch (setuptools auto-discovery may also find modules and namespace packages)"
+
+
+def _field(ctx, name):
+    return _line(ctx, "import").split(f"{name}=", 1)[1].split(";", 1)[0]
+
+
+def test_a_flat_layout_top_level_module_is_listed_as_auto_discovered():
+    ctx = execctx.build({"pyproject.toml": _ST, "foo.py": b"import os\n"})
+    assert _field(ctx, "py-modules") == "auto-discovered: foo"
+    assert _field(ctx, "packages") == f"auto-discovered: {_AUTO_NONE}"
+
+
+def test_a_src_layout_namespace_package_is_qualified_never_a_bare_none():
+    ctx = execctx.build({"pyproject.toml": _ST, "src/ns/mod.py": b"x = 1\n"})
+    assert _field(ctx, "packages") == f"auto-discovered: {_AUTO_NONE}"
+    assert _field(ctx, "py-modules") == f"auto-discovered: {_AUTO_NONE}"
+
+
+def test_a_src_layout_module_is_listed_as_auto_discovered():
+    ctx = execctx.build({"pyproject.toml": _ST, "src/bar.py": b"", "src/conftest.py": b""})
+    assert _field(ctx, "py-modules") == "auto-discovered: bar"
+
+
+def test_setup_py_and_conftest_py_are_never_listed_as_modules():
+    ctx = execctx.build({"setup.py": b"from setuptools import setup\nsetup(name='a')\n", "conftest.py": b"",
+                         "foo.py": b""})
+    assert _field(ctx, "py-modules") == "auto-discovered: foo"
+
+
+def test_a_declared_package_list_leaves_py_modules_qualified():
+    ctx = execctx.build({"pyproject.toml": _ST + b"[tool.setuptools]\npackages = ['a']\n"})
+    assert _field(ctx, "py-modules") == f"auto-discovered: {_AUTO_NONE}"
+
+
+def test_a_wrong_typed_backend_path_is_unknown_not_none():
+    ctx = execctx.build({"pyproject.toml": b"[build-system]\nbuild-backend = 'b'\nbackend-path = 5\n"})
+    assert "backend-path=unknown (not a list of strings);" in ctx

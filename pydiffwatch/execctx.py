@@ -298,6 +298,16 @@ def _discovered(files) -> list[str]:
     return pkgs
 
 
+_NOT_MODULES = {"setup.py", "conftest.py"}
+
+
+def _modules(files) -> list[str]:
+    """Top-level (or src/) *.py files, which setuptools auto-discovery installs as modules."""
+    return [p.rsplit("/", 1)[-1][:-3] for p in sorted(files)
+            if p.endswith(".py") and (p.count("/") == 0 or (p.count("/") == 1 and p.startswith("src/")))
+            and p.rsplit("/", 1)[-1] not in _NOT_MODULES]
+
+
 def _egg_info(files, name) -> list[str]:
     """`<x>.egg-info/<name>` at the top level or under src/."""
     out = []
@@ -317,6 +327,7 @@ def _pth(path, data) -> str:
 
 _BUILD_FILES = ("setup.py", "pyproject.toml", "setup.cfg")
 NOT_LITERAL = "none declared literally in setup.py (setup.py runs arbitrary code at build)"
+AUTO_NONE = "none found by DiffWatch (setuptools auto-discovery may also find modules and namespace packages)"
 _DYNAMIC_EPS = {"scripts", "gui-scripts", "entry-points"}
 _FLIT_BACKENDS = ("flit_core.buildapi", "flit.buildapi")
 
@@ -411,7 +422,9 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
     sreq = [COMPUTED] if sreq == COMPUTED else (_strs(sreq) or [])
     v = options.get("setup_requires", "")
     sreq += [d] if (d := _cfg_directive(v, "setup_requires")) else _cfg_list(v)
-    bpath = (_strs(bs.get("backend-path")) or []) + unknown("pyproject.toml")
+    bpath = _strs(bs.get("backend-path"))
+    bpath = (["unknown (not a list of strings)"] if bpath is None and "backend-path" in bs else bpath or []) \
+        + unknown("pyproject.toml")
     cmdclass += unknown("pyproject.toml", "setup.py", "setup.cfg")
     sreq += unknown("setup.py", "setup.cfg")
     build_line = (f"build (runs when pip builds or installs from this sdist): backend={shown}; "
@@ -428,7 +441,9 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
     # backend (or an in-tree one, or an unknown one) they say nothing about what is installed: not read, and an
     # empty field is qualified, never a bare "none"
     setuptools = backend in _SETUPTOOLS_BACKENDS and not in_tree
-    imp_none = none if setuptools else f"none in scanned files ({name} may generate its own)"  # setup.py unread
+    # setuptools' own discovery (namespace packages, modules) is wider than what is listed here: never a bare "none"
+    imp_none = ((NOT_LITERAL if "setup.py" in new_files else AUTO_NONE) if setuptools
+                else f"none in scanned files ({name} may generate its own)")               # setup.py unread
 
     def declared(setup_name, st_name, cfg_name):
         if not setuptools:
@@ -451,7 +466,9 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
     src_unknown = unknown("pyproject.toml", "setup.py", "setup.cfg")
     pkgs = declared("packages", "packages", "packages") or ", ".join(
         src_unknown + [f"auto-discovered: {_join(_discovered(new_files), imp_none)}"])
-    mods = declared("py_modules", "py-modules", "py_modules") or _join(src_unknown, imp_none)
+    mods = declared("py_modules", "py-modules", "py_modules") or (", ".join(
+        src_unknown + [f"auto-discovered: {_join(_modules(new_files), imp_none)}"]) if setuptools
+        else _join(src_unknown, imp_none))
     tops = [ln for p in _egg_info(new_files, "top_level.txt")
             for ln in new_files[p].decode("utf-8", errors="replace").split()]
     import_line = (f"import (runs when a program imports the package): packages={pkgs}; py-modules={mods}; "
