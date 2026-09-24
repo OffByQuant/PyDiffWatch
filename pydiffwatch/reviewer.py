@@ -291,6 +291,10 @@ def _one_line(s: str) -> str:
 
 _EXEC_MAX_CHARS = 4_000
 _SIG_MAX_CHARS = 3_000
+# Each block is also held to max_chars // 8 so a small-context model still sees hunks, but never below this floor:
+# the signals block has at most 45 lines (differ._signals) and each needs 23 chars ("  " + _EXEC_TRUNCATED) plus its
+# newline to say it was cut, so 1_200 (heading included) keeps every line meaningful and the block within its cap.
+_BLOCK_MIN_CHARS = 1_200
 _EXEC_TRUNCATED = "… (context truncated)"
 
 
@@ -304,7 +308,9 @@ def _render_block(heading: str, ctx: str, cap: int) -> str:
     for n, i in enumerate(sorted(range(len(lines)), key=lambda i: len(lines[i]))):
         share[i] = min(len(lines[i]), budget // (len(lines) - n))
         budget -= share[i]
-    out = [ln if len(ln) <= share[i] else ln[:max(0, share[i] - len(_EXEC_TRUNCATED))] + _EXEC_TRUNCATED
+    # A cut line keeps its "  " indent even when its share is under 23 chars (then it overruns its share; the
+    # caller's floor, _BLOCK_MIN_CHARS, keeps shares above that): unindented it could pass for a file heading.
+    out = [ln if len(ln) <= share[i] else ln[:max(2, share[i] - len(_EXEC_TRUNCATED))] + _EXEC_TRUNCATED
            for i, ln in enumerate(lines)]
     return f"{heading}\n" + "\n".join(out)
 
@@ -358,10 +364,11 @@ def build_review_input(diff, triage, *, max_chars: int, dropped: list | None = N
     # Built by execctx from author-written metadata: fenced, and each line indented and escaped to one line so
     # none can pose as a file heading (dropped_from_text) or be taken for code (_has_reviewable_content).
     ctx = getattr(diff, "exec_context", "")
-    exec_text = _render_block(_EXEC_HEADING, ctx, _EXEC_MAX_CHARS) if ctx else ""
+    block_cap = max(_BLOCK_MIN_CHARS, max_chars // 8)
+    exec_text = _render_block(_EXEC_HEADING, ctx, min(_EXEC_MAX_CHARS, block_cap)) if ctx else ""
     # Dependency / binary / ownership signals (B2): context the model can weigh, never content on its own.
     sig = getattr(diff, "signals", "")
-    sig_text = _render_block(_SIG_HEADING, sig, _SIG_MAX_CHARS) if sig else ""
+    sig_text = _render_block(_SIG_HEADING, sig, min(_SIG_MAX_CHARS, block_cap)) if sig else ""
     body_parts = [t for t in (loc_text, desc_text, exec_text, sig_text) if t]
     # Exact: text = header + "\n".join(body_parts) + "\n" + marker + a note no longer than _NOTE_RESERVE.
     used, truncated = len(header) + len("\n".join(body_parts)) + 1 + len(marker) + _NOTE_RESERVE, False

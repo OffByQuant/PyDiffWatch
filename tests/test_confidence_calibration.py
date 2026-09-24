@@ -174,6 +174,15 @@ def test_a_weak_malicious_is_downgraded_to_suspicious_for_manual_review(tmp_path
     assert not dashboard.is_flagged(dash | {"human_label": "benign"})
 
 
+def test_a_downgraded_verdict_is_not_urgent(tmp_path, monkeypatch):
+    cfg, conn, rid = _setup(tmp_path)
+    emitted = []
+    monkeypatch.setattr(orchestrator.notifier, "emit", lambda cfg, conn, v, rid, **kw: emitted.append(v))
+    orchestrator._record(cfg, conn, rid, _verdict("user-command"), 60.0)
+    assert conn.execute("SELECT urgent FROM verdicts WHERE release_id=?", (rid,)).fetchone()["urgent"] == 0
+    assert [v.urgent for v in emitted] == [False]
+
+
 def test_the_downgraded_alert_text_says_needs_manual_review(tmp_path, capsys):
     cfg, conn, rid = _setup(tmp_path)
     orchestrator._record(cfg, conn, rid, _verdict("user-command"), 60.0)

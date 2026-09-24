@@ -9,6 +9,7 @@ timeouts with attempts left, at 300s/600s/900s); `review-pending` drains the res
 e.g. oversized releases with a larger-context model.
 """
 import dataclasses
+import json
 import urllib.error
 from pathlib import Path
 
@@ -244,3 +245,23 @@ def test_the_auto_drain_neither_selects_exhausted_rows_nor_loads_input_it_does_n
     assert loaded == ["ok"] and store.get_stage(conn, "ok", "1.0.0") == "reviewed"
     [row] = [r for r in real_select(conn) if r["package"] == "big"]         # re-parked over the cap, input kept
     assert row["pending_reason"] == "too_large" and len(real_load(row)) == cfg.reviewer.max_input_chars + 1
+
+
+def test_a_weak_malicious_verdict_from_the_review_queue_is_downgraded_with_one_alert(tmp_path):
+    cfg, conn, rid, rvw = _setup(tmp_path, _Backend())
+    # as process_release does before a review
+    store.update_stage(conn, rid, "triaged", _T.score, json.dumps([r.__dict__ for r in _T.fired_rules]))
+    orchestrator._review_escalated(cfg, conn, rvw, _diff(), _T, rid, offline=True)
+    parked = conn.execute("SELECT count(*) FROM alerts").fetchone()[0]         # the park's own heuristic alert
+    be = _Backend()
+    be.complete = lambda **kw: be.calls.append(kw) or (
+        '{"runs_when":"user-command","classification":"malicious","confidence":0.95,"urgent":true,'
+        '"recommended_action":"report-to-pypi","attack_type":"x","cited_hunk":"pkg/a.py:1-1","reasoning":"r"}')
+    orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=be), auto=True)
+    assert len(be.calls) == 1 and _pending(conn) == {}
+    assert store.get_stage(conn, "pkg", "1.0.0") == "needs_adjudication"
+    row = conn.execute("SELECT classification, reasoning, urgent FROM verdicts WHERE release_id=?", (rid,)).fetchone()
+    assert row["classification"] == "suspicious" and "downgraded: runs_when=user-command" in row["reasoning"]
+    assert row["urgent"] == 0
+    assert [r["classification"] for r in conn.execute("SELECT classification FROM alerts ORDER BY rowid")][parked:] \
+        == ["suspicious"]                                                    # the review adds one alert

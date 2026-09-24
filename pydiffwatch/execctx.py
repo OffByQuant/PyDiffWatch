@@ -464,8 +464,15 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
         return None if not v or v.startswith("find") else _join(_cfg_list(v), none)
 
     src_unknown = unknown("pyproject.toml", "setup.py", "setup.cfg")
-    pkgs = declared("packages", "packages", "packages") or ", ".join(
+    pkgs_declared = declared("packages", "packages", "packages")
+    pkgs = pkgs_declared or ", ".join(
         src_unknown + [f"auto-discovered: {_join(_discovered(new_files), imp_none)}"])
+    # the package list is known when it is literal, or setuptools auto-discovery with no find directive (a find
+    # without excludes installs tests/): only then may the other: line say tests/ is not imported
+    find = isinstance(st.get("packages"), dict) or options.get("packages", "").strip().startswith("find")
+    pkgs_known = setuptools and not src_unknown and (not find if pkgs_declared is None else
+                                                     COMPUTED not in pkgs_declared
+                                                     and not pkgs_declared.startswith("unknown"))
     mods = declared("py_modules", "py-modules", "py_modules") or (", ".join(
         src_unknown + [f"auto-discovered: {_join(_modules(new_files), imp_none)}"]) if setuptools
         else _join(src_unknown, imp_none))
@@ -525,5 +532,7 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
     lines += [f"{p}: unknown (too large to scan)" for p in _BUILD_FILES if why.get(p) == "too large"]   # at most 3
     if unparseable:                                     # one line, however many files: bounded
         lines.append(f"unparseable: {_join(unparseable)}")
-    lines.append("other: files under tests/ docs/ examples/ are not imported by the package unless listed above")
+    lines.append("other: files under tests/ docs/ examples/ are not imported by the package unless listed above"
+                 if pkgs_known else "other: files under tests/ docs/ examples/ may be installed and imported "
+                 "(the package list above is not fully known)")
     return "\n".join(ln if len(ln) <= _MAX_LINE else ln[:_MAX_LINE] + "…" for ln in lines)

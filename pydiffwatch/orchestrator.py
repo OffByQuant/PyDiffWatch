@@ -97,7 +97,7 @@ def _record(cfg, conn, rid, verdict, score, dropped=()):
         # waits in `pending`; the model's own label and reasoning stay in the reasoning for the person.
         note = f"model said malicious (downgraded: {weak}); needs manual review"
         reasoning = f"{note}. Model: {verdict.reasoning}" if verdict.reasoning else note
-        v = dataclasses.replace(verdict, classification="suspicious", reasoning=reasoning)
+        v = dataclasses.replace(verdict, classification="suspicious", reasoning=reasoning, urgent=False)
         store.record_verdict(conn, rid, v)
         store.update_stage(conn, rid, "needs_adjudication", score, None)  # -> `pydiffwatch pending`
         notifier.emit(cfg, conn, v, rid, dedupe_suffix="downgraded")       # one alert; a person looks at it

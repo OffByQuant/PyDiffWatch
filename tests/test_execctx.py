@@ -798,3 +798,30 @@ def test_a_declared_package_list_leaves_py_modules_qualified():
 def test_a_wrong_typed_backend_path_is_unknown_not_none():
     ctx = execctx.build({"pyproject.toml": b"[build-system]\nbuild-backend = 'b'\nbackend-path = 5\n"})
     assert "backend-path=unknown (not a list of strings);" in ctx
+
+
+# ---- final review minor 6: the other: line claims "not imported" only when the package list is known ----
+
+_OTHER_KNOWN = "other: files under tests/ docs/ examples/ are not imported by the package unless listed above"
+_OTHER_UNKNOWN = ("other: files under tests/ docs/ examples/ may be installed and imported "
+                  "(the package list above is not fully known)")
+
+
+@pytest.mark.parametrize("files", [
+    {"pyproject.toml": _ST + b"[tool.setuptools]\npackages = ['a']\n"},           # literal
+    {"pyproject.toml": _ST, "a/__init__.py": b""},                                 # auto-discovered
+])
+def test_the_other_line_keeps_its_claim_when_the_package_list_is_known(files):
+    assert _line(execctx.build(files), "other") == _OTHER_KNOWN
+
+
+@pytest.mark.parametrize("files", [
+    {"setup.py": b"from setuptools import setup, find_packages\nsetup(name='a', packages=find_packages())\n"},
+    {"setup.cfg": b"[options]\npackages = find:\n"},
+    {"pyproject.toml": _ST + b"[tool.setuptools.packages.find]\nwhere = ['.']\n"},
+    {"pyproject.toml": b"[build-system]\nbuild-backend = 'hatchling.build'\n", "a/__init__.py": b""},
+    {"pyproject.toml": b"[build-system\n"},                                        # unparseable
+    {"setup.cfg": b"[options]\npackages = attr: a.PKGS\n"},
+])
+def test_the_other_line_makes_no_claim_when_the_package_list_is_not_known(files):
+    assert _line(execctx.build(files), "other") == _OTHER_UNKNOWN

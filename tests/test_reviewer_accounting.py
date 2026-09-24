@@ -99,3 +99,46 @@ def test_input_too_large_needed_renders_the_top_file():
     with pytest.raises(reviewer.InputTooLarge) as e:
         rvw.prepare(d, tr)
     assert "--- file: a.py (modified) ---" in e.value.text and len(e.value.text) <= e.value.needed
+
+
+# --- final review minor 1: context-block caps scale with the input cap --------------------------------------------
+
+def test_a_small_cap_with_both_blocks_at_full_size_leaves_room_for_the_top_hunk():
+    h = Hunk((0, 0), (0, 80), [f"exec(x)  # {i:02d} " + "y" * 80 for i in range(80)], [])
+    d = Diff("p", "1.1", False, [FileDiff("a.py", "modified", [h])], [],
+             exec_context="\n".join("e" * 2_000 for _ in range(10)), signals="\n".join("s" * 2_000 for _ in range(20)))
+    tr = TriageResult(40.0, [FiredRule("r", 40.0, "a.py", (1, 80))], True)
+    cap = 12_000
+    dropped = []
+    text = reviewer.build_review_input(d, tr, max_chars=cap, dropped=dropped)
+    assert "--- file: a.py" in text and dropped == [] and not text.endswith(reviewer.TRUNCATION_NOTE)
+    assert len(text) <= cap and reviewer.dropped_from_text(tr.fired_rules, text) == dropped
+    assert text.count("e" * 100) and len(text.split(reviewer._EXEC_HEADING, 1)[1].split("--- ", 1)[0]) <= cap // 8
+
+
+@pytest.mark.parametrize("cap", [0, 1_000, 8_000, 9_600, 16_000, 40_000, 200_000])
+def test_scaled_block_caps_keep_accounting_exact(cap):
+    h = Hunk((0, 0), (0, 3), ["exec(x)"] * 3, [])
+    d = Diff("p", "1.1", False, [FileDiff("a.py", "modified", [h])], [],
+             exec_context="\n".join("\x00" * 900 for _ in range(10)), signals="\n".join("s" * 900 for _ in range(45)))
+    tr = TriageResult(40.0, [FiredRule("r", 40.0, "a.py", (1, 3))], True)
+    dropped = []
+    text = reviewer.build_review_input(d, tr, max_chars=max(cap, 1), dropped=dropped)
+    assert reviewer.dropped_from_text(tr.fired_rules, text) == dropped
+    if "--- file: a.py" in text:
+        assert len(text) <= cap
+
+
+# --- final review minor 4: a cut context line always keeps its "  " prefix -----------------------------------------
+
+@pytest.mark.parametrize("cap", [1, 30, 60, 200])
+def test_a_cut_context_line_keeps_its_indent(cap):
+    block = reviewer._render_block("--- h ---", "\n".join("z" * 300 for _ in range(5)), cap)
+    assert all(ln.startswith("  ") for ln in block.split("\n")[1:])
+
+
+def test_the_block_floor_fits_the_largest_signals_block_with_every_cut_line_marked():
+    for heading, n in ((reviewer._SIG_HEADING, 45), (reviewer._EXEC_HEADING, 10)):
+        block = reviewer._render_block(heading, "\n".join("q" * 500 for _ in range(n)), reviewer._BLOCK_MIN_CHARS)
+        assert len(block) <= reviewer._BLOCK_MIN_CHARS
+        assert all(ln.startswith("  ") and ln.endswith(reviewer._EXEC_TRUNCATED) for ln in block.split("\n")[1:])
