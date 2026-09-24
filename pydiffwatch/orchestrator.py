@@ -59,9 +59,12 @@ def _review_slot(cfg):
 
 
 
-def _clip_files(paths, limit=300) -> str:
-    text = ", ".join(paths)
+def _clip(text, limit=300) -> str:
     return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def _clip_files(paths, limit=300) -> str:
+    return _clip(", ".join(paths), limit)
 
 
 def _record(cfg, conn, rid, verdict, score, dropped=()):
@@ -479,7 +482,7 @@ def _retry_later(cfg, conn, rid, rel, e) -> bool:
     if stage == "gave_up" and was != "gave_up":
         _alert_unscanned(cfg, conn, rid, rel.package, rel.version,
                          f"UNREVIEWED: pydiffwatch failed to download or scan it {store.METADATA_ATTEMPTS} times "
-                         f"and gave up (last error: {note}). Not scanned. Needs manual review.", stage="gave_up")
+                         f"and gave up (last error: {_clip(note)}). Not scanned. Needs manual review.", stage="gave_up")
     return True
 
 

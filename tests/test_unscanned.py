@@ -497,3 +497,12 @@ def test_a_first_park_over_the_cold_start_cap_does_not_claim_too_large_until_the
     assert [k for (k,) in _alerts(conn, "pkg")] == ["pkg|1.0.0|suspicious-heuristic",
                                                     "pkg|1.0.0|suspicious-heuristic|unscanned:too_large"]
     assert [i["not_scanned"] for i in orchestrator.list_pending(cfg)] == ["too_large"] and be.calls == []
+
+
+def test_the_gave_up_alert_clips_a_long_error(tmp_cfg, capsys):
+    conn = store.connect(tmp_cfg); store.init_schema(conn)
+    rel = NewRelease("flaky", "1.0", 10)
+    for _ in range(store.METADATA_ATTEMPTS):
+        orchestrator._process_fetched(tmp_cfg, conn, None, None, rel, fetcher.MetadataUnavailable("E" * 5000))
+    out = capsys.readouterr().out
+    assert "gave up" in out and "E" * 250 in out and "E" * 301 not in out
