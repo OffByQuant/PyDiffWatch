@@ -256,7 +256,7 @@ def test_a_setup_py_without_a_setup_call_is_computed():
 
 def test_a_single_plain_setup_call_is_still_read_literally():
     ctx = execctx.build({"setup.py": b"import setuptools\nsetuptools.setup(cmdclass={'build_py': B})\n"})
-    assert "cmdclass=build_py" in ctx and "setup_requires=none" in ctx
+    assert "cmdclass=build_py" in ctx and f"setup_requires={NOT_LITERAL}" in ctx
 
 
 def test_missing_top_level_txt_is_not_claimed_absent():
@@ -371,3 +371,98 @@ def test_an_entry_point_item_without_equals_is_not_dropped():
 def test_a_non_string_group_key_is_not_dropped():
     ctx = execctx.build({"setup.py": b"setup(entry_points={5: ['a = b:c']})\n"})
     assert "<computed>" in _line(ctx, "plugins") and "<computed>" in _line(ctx, "commands")
+
+
+# ---- fix round 3: setup.py is arbitrary code, so "none" is never bare while it exists ----
+
+NOT_LITERAL = "none declared literally in setup.py (setup.py runs arbitrary code at build)"
+_EP = "entry_points={'pytest11': ['p = evil:hook']}"
+_DECOY = "if False:\n    setuptools.setup(name='x')\n"
+
+
+def _plugins(src: str) -> str:
+    return _line(execctx.build({"setup.py": src.encode()}), "plugins").split("run): ", 1)[1]
+
+
+def test_with_setup_py_an_undeclared_field_is_never_a_bare_none():
+    ctx = execctx.build({"setup.py": b"from setuptools import setup\nsetup(name='a')\n"})
+    for field in ("cmdclass", "setup_requires", "py-modules"):
+        assert f"{field}={NOT_LITERAL}" in ctx, field
+    assert _line(ctx, "commands").endswith(f": {NOT_LITERAL}") and _line(ctx, "plugins").endswith(f": {NOT_LITERAL}")
+
+
+def test_without_setup_py_a_bare_none_is_still_allowed():
+    ctx = execctx.build({"pyproject.toml": b"[project]\nname = 'a'\n"})
+    assert "cmdclass=none" in ctx and "setup_requires=none" in ctx and _line(ctx, "commands").endswith(": none")
+    assert "declared literally" not in ctx
+
+
+@pytest.mark.parametrize("src", [
+    f"import setuptools\nexec(\"setuptools.setup(name='x', {_EP})\")\n" + _DECOY,       # exec: covered by wording
+    f"import setuptools\neval(\"setuptools.setup(name='x', {_EP})\")\n" + _DECOY,
+    "import _build_helpers\nfrom setuptools import setup\nsetup(name='x')\n",
+    "from setuptools import setup\nfrom _b import Dist\nsetup(name='x', distclass=Dist)\n",
+])
+def test_a_hidden_setup_reads_not_declared_literally_never_none(src):
+    assert _plugins(src) in (NOT_LITERAL, "entry points=<computed>")
+
+
+@pytest.mark.parametrize("src", [
+    f"import setuptools\nrun = setuptools.setup\nrun({_EP})\n" + _DECOY,                  # (a) attribute alias
+    f"import distutils.core\nrun = distutils.core.setup\nrun({_EP})\nif False:\n    distutils.core.setup(name='x')\n",
+    f"import functools, setuptools\np = functools.partial(setuptools.setup, {_EP})\np()\n" + _DECOY,
+    f"import sys, setuptools\nm = sys.modules['setuptools']\nf = m.setup\nf({_EP})\n" + _DECOY,
+    f"import setuptools\n_o = setuptools.setup\nsetuptools.setup = lambda **k: _o({_EP}, **k)\nsetuptools.setup(name='x')\n",
+    "import setuptools\ndel setuptools.setup\nsetuptools.setup(name='x')\n",                # (b) store / del
+    f"import setuptools\ndef w(**k):\n    return 1\nsetattr(setuptools, 'setup', w)\nsetuptools.setup(name='x')\n",
+    "from _build_helpers import *\nsetup(name='x')\n",                                      # (c) foreign star import
+    "from distutils import *\nsetup(name='x')\n",
+])
+def test_cheap_indirect_routes_make_every_keyword_computed(src):
+    assert _all_computed(execctx.build({"setup.py": src.encode()})), src
+
+
+@pytest.mark.parametrize("src", [
+    f"from setuptools import *\nsetup({_EP})\n",
+    f"from setuptools.command import *\nfrom setuptools import setup\nsetup({_EP})\n",
+    f"from distutils.core import *\nsetup({_EP})\n",
+    f"try:\n    from setuptools import setup\nexcept ImportError:\n    from distutils.core import setup\nsetup({_EP})\n",
+    f"from setuptools import setup\nif __name__ == '__main__':\n    setup({_EP})\n",
+    f"from setuptools import setup\nns = {{}}\nexec(open('pkg/_v.py').read(), ns)\nsetup(version=ns['v'], {_EP})\n",
+    f"import setuptools as st\nst.setup({_EP})\n",
+])
+def test_common_legitimate_setup_py_forms_stay_literal(src):
+    assert "pytest11: p -> evil:hook" in _plugins(src), src
+
+
+# ---- fix round 3: oversized build files and malformed / dynamic pyproject tables ----
+
+def test_an_oversized_setup_py_is_unknown_not_absent():
+    ctx = execctx.build({"pkg/__init__.py": b""}, too_large=["setup.py", "pkg/huge.py"])
+    assert "setup.py=unknown (too large to scan)" in ctx and "setup.py: unknown (too large to scan)" in ctx.split("\n")
+    assert "absent" not in ctx and "huge.py" not in ctx
+    u = "unknown (setup.py too large)"
+    assert _line(ctx, "plugins").endswith(u) and _line(ctx, "commands").endswith(u)
+    assert f"cmdclass={u}" in ctx and f"setup_requires={u}" in ctx and f"py-modules={u}" in ctx
+
+
+def test_an_oversized_pyproject_makes_the_backend_unknown():
+    ctx = execctx.build({"setup.py": b"from setuptools import setup\nsetup()\n"}, too_large=["pyproject.toml"])
+    assert "backend=unknown" in ctx and "backend-path=unknown (pyproject.toml too large)" in ctx
+    assert "pyproject.toml: unknown (too large to scan)" in ctx.split("\n")
+
+
+@pytest.mark.parametrize("pp", [b"project = 5\n", b"tool = {setuptools = 5}\n", b"[tool]\nsetuptools = 5\n"])
+def test_a_wrong_typed_pyproject_table_is_unknown(pp):
+    ctx = execctx.build({"pyproject.toml": pp})
+    assert "unknown (pyproject.toml malformed)" in ctx
+    if pp.startswith(b"project"):
+        assert _line(ctx, "plugins").endswith("unknown (pyproject.toml malformed)")
+    else:
+        assert "cmdclass=unknown (pyproject.toml malformed)" in ctx
+
+
+def test_dynamic_entry_points_are_unknown():
+    ctx = execctx.build({"pyproject.toml": b"[project]\nname = 'a'\ndynamic = ['entry-points', 'version']\n"})
+    assert _line(ctx, "plugins").endswith("unknown (pyproject.toml marks them dynamic)")
+    assert _line(ctx, "commands").endswith("unknown (pyproject.toml marks them dynamic)")
