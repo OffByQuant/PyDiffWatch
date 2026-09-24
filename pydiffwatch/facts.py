@@ -110,6 +110,21 @@ def _resolve_call(node, table) -> str | None:
 
 
 _FUNC_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+# Well below sys.getrecursionlimit()'s default (1000): a tree this deep is pathological (e.g. a
+# 5,000-term "1+1+...+1" chain) and used to RecursionError our Python-level walkers even though
+# ast.parse itself accepts it. Detected with an explicit stack -- no recursion, so this check itself
+# never crashes on the input it is guarding against.
+_MAX_AST_DEPTH = 500
+
+
+def _ast_too_deep(tree) -> bool:
+    stack = [(tree, 0)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > _MAX_AST_DEPTH:
+            return True
+        stack.extend((child, depth + 1) for child in ast.iter_child_nodes(node))
+    return False
 
 
 def _importtime_call_ids(tree) -> set:
@@ -123,12 +138,14 @@ def _importtime_call_ids(tree) -> set:
                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
 
     def _calls_outside_funcs(node):
-        for child in ast.iter_child_nodes(node):
+        stack = list(ast.iter_child_nodes(node))      # explicit stack: no call-stack depth limit
+        while stack:
+            child = stack.pop()
             if isinstance(child, _FUNC_NODES):
                 continue                              # a function/lambda body runs on call, not at import
             if isinstance(child, ast.Call):
                 yield child
-            yield from _calls_outside_funcs(child)
+            stack.extend(ast.iter_child_nodes(child))
 
     importtime = list(_calls_outside_funcs(tree))
     ids = {id(c) for c in importtime}
@@ -183,25 +200,30 @@ def _file_facts(fd) -> FileFacts:
         tree = ast.parse(fd.new_text)
     except (SyntaxError, RecursionError, MemoryError, ValueError):   # deep nesting crashes the parser itself
         return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, True, added_strs)
-    table = _build_import_table(tree)
-    importtime_ids = _importtime_call_ids(tree)
-    cats, autoexec_cats, names = set(), set(), set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        lo = getattr(node, "lineno", None)
-        if lo is None:
-            continue
-        hi = getattr(node, "end_lineno", None) or lo
-        if added_lines.isdisjoint(range(lo, hi + 1)):
-            continue
-        cat = _resolve_call(node, table)
-        if cat:
-            cats.add(cat)
-            if id(node) in importtime_ids:
-                autoexec_cats.add(cat)
-            f = node.func
-            names.add(f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", ""))
+    if _ast_too_deep(tree):
+        return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, True, added_strs)
+    try:
+        table = _build_import_table(tree)
+        importtime_ids = _importtime_call_ids(tree)
+        cats, autoexec_cats, names = set(), set(), set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            lo = getattr(node, "lineno", None)
+            if lo is None:
+                continue
+            hi = getattr(node, "end_lineno", None) or lo
+            if added_lines.isdisjoint(range(lo, hi + 1)):
+                continue
+            cat = _resolve_call(node, table)
+            if cat:
+                cats.add(cat)
+                if id(node) in importtime_ids:
+                    autoexec_cats.add(cat)
+                f = node.func
+                names.add(f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", ""))
+    except (RecursionError, MemoryError):   # a parse that succeeds can still blow limits on post-parse walks
+        return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, True, added_strs)
     return FileFacts(fd.path, lines, loc, frozenset(cats), frozenset(autoexec_cats), frozenset(names),
                      frozenset(table.values()), _blob_present(added_strs), False, added_strs)
 

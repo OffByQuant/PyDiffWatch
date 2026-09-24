@@ -71,3 +71,23 @@ def test_two_foreign_files_escalate():
 def test_tests_dir_does_not_escalate():
     # same dangerous call under tests/ stays low (location 0.2) — autoexec needs location>=3
     assert not triage(_code("tests/t.py", ["import os", "os.system('x')"]), Config(), RULES).escalate
+
+
+def test_post_parse_crash_fires_syntax_error_rule_scaled_by_location():
+    # A 5,000-term wide expression parses fine but used to RecursionError in the post-parse walk,
+    # skipping straight to a silent gave_up. It must instead surface as syntax_error=True, which
+    # scales syntax-error-suspicious (weight 20) by location_weight: 3.0 for __init__.py, 1.0 elsewhere.
+    src = "x = " + "+".join(["1"] * 5000)
+    full = src.splitlines()
+
+    def _wholefile(path, added):
+        return Diff("p", "1.1", False, [FileDiff(path, "modified",
+            [Hunk((0, 0), (0, len(added)), added, [])], "\n".join(added))], [])
+
+    r_init = triage(_wholefile("m/__init__.py", full), Config(), RULES)
+    fr_init = next(fr for fr in r_init.fired_rules if fr.rule == "syntax-error-suspicious")
+    assert fr_init.weight == 20 * 3.0
+
+    r_other = triage(_wholefile("pkg/util.py", full), Config(), RULES)
+    fr_other = next(fr for fr in r_other.fired_rules if fr.rule == "syntax-error-suspicious")
+    assert fr_other.weight == 20 * 1.0
