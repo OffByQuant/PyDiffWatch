@@ -375,3 +375,50 @@ def test_a_drain_row_that_raises_is_a_bounded_failed_attempt_not_a_crashed_tick(
     assert tuple(row) == ("review_failed", cfg.reviewer.max_review_attempts)
     out = capsys.readouterr().out
     assert _unreviewed(out) and "ValueError: corrupt row" in out and len(_alerts(conn, "pkg")) == 1
+
+
+# --- no_content: escalated only on signals with no text to show the model ------------------------------
+
+def _binary_only():
+    from pydiffwatch.models import Diff, FiredRule, TriageResult
+    d = Diff(package="pkg", version="1.0.0", is_first_release=False, changed=[],
+             added_binaries=[{"path": "pkg/x.so", "reason": "new-binary"}])
+    return d, TriageResult(score=60.0, escalate=True, fired_rules=[FiredRule("added-binary", 60.0, "pkg/x.so", (0, 0))])
+
+
+def test_a_flag_with_no_content_for_the_model_alerts_once_with_the_reviewer_on(tmp_path, capsys, monkeypatch):
+    # A dep/binary/maintainer-only flag leaves the model nothing to read, so the reviewer skips the call and
+    # returns the UNREVIEWED verdict (model 'none'). Heuristic-only mode alerts on it; the reviewer path must too.
+    be = _Backend()
+    cfg, conn, rid, rvw = _setup(tmp_path, be)
+    d, tr = _binary_only()
+    orchestrator._review_escalated(cfg, conn, rvw, d, tr, rid)
+    out = capsys.readouterr().out
+    assert be.calls == [] and store.get_stage(conn, "pkg", "1.0.0") == "needs_adjudication"
+    assert "pkg 1.0.0" in out and "UNREVIEWED:" in out and "score=60" in out
+    assert [k for (k,) in _alerts(conn, "pkg")] == ["pkg|1.0.0|suspicious-heuristic|unscanned:no_content"]
+    orchestrator._review_escalated(cfg, conn, rvw, d, tr, rid)                 # a re-review: deduped
+    assert capsys.readouterr().out == "" and len(_alerts(conn, "pkg")) == 1
+    assert [i["not_scanned"] for i in orchestrator.list_pending(cfg)] == ["no_content"]
+    out = _pending_cli(cfg, monkeypatch, capsys)
+    assert "(not scanned: no_content)" in out and "model: suspicious" not in out
+
+
+def test_a_too_large_row_alerts_once_per_outcome_through_exhaustion_to_a_benign_review(tmp_path, capsys):
+    # The alert lifecycle: too_large at first park, one exhaustion alert however many manual runs fail, and a
+    # later successful review replaces the UNREVIEWED verdict and leaves `pending`.
+    be = _Backend(fail=RuntimeError("500"))
+    cfg, conn, rid, rvw = _setup(tmp_path, be, max_input_chars=10_000)
+    orchestrator._review_escalated(cfg, conn, rvw, _diff("x" * 50_000), _T, rid)
+    assert [k for (k,) in _alerts(conn, "pkg")] == ["pkg|1.0.0|suspicious-heuristic|unscanned:too_large"]
+    big = _big(cfg, max_input_chars=200_000)
+    rvw2 = reviewer.Reviewer(big, backend=be)
+    for _ in range(4):
+        orchestrator.drain_pending(big, conn, rvw2, auto=False)
+    assert [k for (k,) in _alerts(conn, "pkg")] == ["pkg|1.0.0|suspicious-heuristic|unscanned:too_large",
+                                                    "pkg|1.0.0|suspicious-heuristic|unscanned:review_failed"]
+    be.fail = None
+    orchestrator.drain_pending(big, conn, rvw2, auto=False)
+    v = conn.execute("SELECT classification, model FROM verdicts WHERE release_id=?", (rid,)).fetchone()
+    assert tuple(v) == ("benign", "m") and store.get_stage(conn, "pkg", "1.0.0") == "reviewed"
+    assert orchestrator.list_pending(cfg) == [] and len(_alerts(conn, "pkg")) == 2

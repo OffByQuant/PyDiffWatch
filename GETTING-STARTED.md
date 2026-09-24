@@ -550,7 +550,7 @@ Alerts are also printed to stdout and recorded (deduped) in the DB, so a webhook
 **Every unscanned outcome alerts once, then waits for you.** A release pydiffwatch could not get a model
 verdict on is never silently dropped: each such outcome fires exactly one `suspicious-heuristic` alert
 (deduped per release + outcome, so a re-tick never repeats it) whose `reasoning` starts `UNREVIEWED:` and
-ends `Not scanned. Needs manual review.` (refusals and `metadata_gone` end differently — see below), and —
+ends `Not scanned. Needs manual review.` (refusals, `metadata_gone` and `no_content` end differently — see below), and —
 except `metadata_gone`, which alerts only — the release then waits in `pending` labelled
 `(not scanned: <stage>)`:
 
@@ -563,6 +563,7 @@ except `metadata_gone`, which alerts only — the release then waits in `pending
 | Download/scan failed `METADATA_ATTEMPTS` (4) times running | `(not scanned: gave_up)` | `UNREVIEWED: pydiffwatch failed to download or scan it 4 times and gave up (last error: <last error>). Not scanned. Needs manual review.` |
 | Review input exceeds the endpoint's cap | `(not scanned: too_large)` | `` UNREVIEWED: its review input is too large for the model (<detail>); run `review-pending` with a larger-context model. Not scanned. Needs manual review. `` |
 | Review failed `max_review_attempts` (3) times running | `(not scanned: review_failed)` | `` UNREVIEWED: the model failed to review it <n> times (last error: <last error>); retries are used up. Run `review-pending` to try again, e.g. with another model. Not scanned. Needs manual review. `` |
+| With the reviewer on, triage fired only on signals with no text to show the model (a dependency, binary or maintainer change) | `(not scanned: no_content)` | `UNREVIEWED: triage fired (<rules>) but none of the flagged content could be shown to the reviewer. Needs a human.` |
 | A release switches to wheel-only (see §13) after `wheel_only_grace_minutes` | `(not scanned: no_sdist)` | `UNREVIEWED: switched to wheel-only: the previous release <prev> shipped an sdist and this one ships only wheels, which pydiffwatch does not scan. Not scanned. Needs manual review.` |
 
 The refused-to-download/-unpack `<reason>` is one of `decompressed-size`, `members`, `member-name` (a name

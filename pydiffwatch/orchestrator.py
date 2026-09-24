@@ -85,6 +85,9 @@ def _record(cfg, conn, rid, verdict, score, dropped=()):
         store.update_stage(conn, rid, "reviewed", score, None)            # saved silently, no alert
     elif verdict.classification == "suspicious":
         store.update_stage(conn, rid, "needs_adjudication", score, None)  # -> `pydiffwatch pending`
+        if verdict.model == "none":   # nothing flagged could be shown to the model: warn, as heuristic-only does
+            _alert_unscanned(cfg, conn, rid, verdict.package, verdict.version, verdict.reasoning,
+                             stage="no_content", score=score, fired_rules=verdict.fired_rules, queue=False)
     else:                                                                 # malicious / unexpected
         notifier.emit(cfg, conn, verdict, rid)
         store.update_stage(conn, rid, "reviewed", score, None)
@@ -658,6 +661,8 @@ def list_pending(cfg: Config):
         diff_text, err = stored, None
         not_scanned = (row["pending_reason"] if row["stage"] == "pending_review" else row["stage"]) \
             if row["stage"] in store.UNSCANNED_STAGES else None
+        if row["stage"] == "needs_adjudication" and row["model"] == "none":
+            not_scanned = "no_content"          # the reviewer had nothing it could show the model
         if row["stage"] in ("refused_to_extract", "refused_to_fetch"):
             err = "refused, never scanned (see reason); inspect it by hand"
         elif not_scanned and not stored:
