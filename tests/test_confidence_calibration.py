@@ -264,3 +264,69 @@ def test_setuptools_tables_are_still_read_under_setuptools():
 def test_math_nan_is_not_a_valid_threshold():
     with pytest.raises(ValueError):
         ReviewerConfig(malicious_min_confidence=math.nan)
+
+
+# ---- fix round 1 ----
+
+@pytest.mark.parametrize("key", ["runs_when", "attack_type", "recommended_action", "reasoning", "cited_hunk"])
+@pytest.mark.parametrize("bad", [["build"], {"a": 1}])
+def test_a_list_or_dict_value_falls_back_to_the_default(key, bad):
+    v = _review(_full(**{key: bad}))
+    assert v.classification == "malicious"
+    assert (v.runs_when, v.attack_type, v.recommended_action) == (
+        "unknown" if key == "runs_when" else "build", "none" if key == "attack_type" else "install-hook-rce",
+        "report-to-pypi")
+    if key in ("reasoning", "cited_hunk"):
+        assert getattr(v, key) == ""
+
+
+def test_a_non_string_value_on_a_malicious_verdict_still_alerts(tmp_path):
+    cfg, conn, rid = _setup(tmp_path)
+    d = _full(attack_type=["dropper"], recommended_action={"x": 1})
+    rvw = reviewer.Reviewer(cfg, backend=_FakeBackend([json.dumps(d)]))
+    orchestrator._review_escalated(cfg, conn, rvw, _diff(), _triage(), rid)
+    assert [a["classification"] for a in _alerts(conn)] == ["malicious"]
+
+
+def test_a_non_string_action_on_a_benign_verdict_is_monitor():
+    assert _review(_full(classification="benign", recommended_action=["dismiss"])).recommended_action == "monitor"
+
+
+def test_a_missing_confidence_escalates():
+    be = _FakeBackend([json.dumps(_full(classification="benign", confidence="low")),
+                       json.dumps(_full(classification="benign", confidence=0.9))], primary="sonnet", escalation="opus")
+    v = reviewer.Reviewer(Config(), backend=be).review(_diff(), _triage())
+    assert v.model == "opus" and v.confidence == 0.9 and not be.scripted
+
+
+@pytest.mark.parametrize("files", [
+    {"pyproject.toml": b"[build-system]\nbuild-backend = 'setuptools.build_meta'\nbackend-path = ['.']\n"},
+    {"pyproject.toml": b"[build-system\nnot toml"},
+])
+def test_an_unread_setup_py_is_never_claimed_to_declare_none(files):
+    files = {**files, "setup.py": b"from setuptools import setup\nsetup(packages=['acme'], py_modules=['m'])\n"}
+    line = _import_line(execctx.build(files))
+    assert execctx.NOT_LITERAL not in line and "none declared literally" not in line
+    assert "may generate its own" in line
+
+
+@pytest.mark.parametrize("key", ["reasoning", "cited_hunk", "attack_type", "runs_when", "urgent", "confidence"])
+def test_an_explicit_null_takes_the_default(key):
+    v = _review(_full(**{key: None}))
+    assert v.classification == "malicious"
+    assert v.reasoning is not None and v.cited_hunk is not None and v.attack_type is not None
+    assert v.runs_when is not None and v.urgent in (True, False)
+
+
+def test_a_malicious_verdict_with_null_reasoning_alerts_with_the_model_lines(tmp_path, capsys):
+    cfg, conn, rid = _setup(tmp_path)
+    rvw = reviewer.Reviewer(cfg, backend=_FakeBackend([json.dumps(_full(reasoning=None))]))
+    orchestrator._review_escalated(cfg, conn, rvw, _diff(), _triage(), rid)
+    out = capsys.readouterr().out
+    assert "[DIFFWATCH] malicious" in out and "attack=install-hook-rce" in out and "model=m" in out
+
+
+@pytest.mark.parametrize("raw, want", [(True, True), (False, False), ("false", False), ("true", False),
+                                       (1, False), (None, False), ([True], False)])
+def test_urgent_is_true_only_for_json_true(raw, want):
+    assert _review(_full(urgent=raw)).urgent is want

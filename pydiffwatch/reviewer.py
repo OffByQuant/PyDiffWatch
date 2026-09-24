@@ -565,8 +565,9 @@ class Reviewer:
         # popularity/blast-radius enrichment was CUT — vet is a peer scanner; depending on it for
         # detection intel makes DiffWatch downstream/too-late. Reputation is computed natively instead.)
         esc = self.backend.escalation_model
-        if esc and v.confidence is not None and v.confidence < self.cfg.reviewer.opus_escalation_confidence:
-            logger.info("reviewer escalating %s==%s to %s (conf=%.2f)", package, version, esc, v.confidence)
+        # A missing or unusable confidence (None) is a low one: it gets the second opinion too.
+        if esc and (v.confidence is None or v.confidence < self.cfg.reviewer.opus_escalation_confidence):
+            logger.info("reviewer escalating %s==%s to %s (conf=%s)", package, version, esc, v.confidence)
             v = self._call(esc, *args, mtf(esc))
         return v
 
@@ -575,20 +576,23 @@ class Reviewer:
         text = self.backend.complete(model=model, system=SYSTEM_PROMPT, user_text=user_text,
                                      schema=REVIEW_SCHEMA, max_tokens=max_tokens,
                                      timeout=timeout)
-        d = {**_DEFAULTS, **json.loads(text)}                 # schema-constrained output -> valid JSON
-        attack_type = d["attack_type"] if d["attack_type"] in _ATTACK_TYPES else "none"
+        d = json.loads(text)                                  # schema-constrained output -> valid JSON
+        d = {**_DEFAULTS, **{k: x for k, x in d.items() if x is not None}}    # an explicit null takes the default
+
+        def pick(key, allowed=None):
+            """A string value (in `allowed`, when given), else the default: a list or dict never sinks the verdict."""
+            x = d[key]
+            return x if isinstance(x, str) and (allowed is None or x in allowed) else _DEFAULTS[key]
+
+        attack_type = pick("attack_type", _ATTACK_TYPES)
         # Spec B7: a malicious verdict always carries report-to-pypi, whatever the model chose. Anything else
         # keeps its action, and an out-of-enum one is monitored — never dismissed. A human overrides it anyway.
-        action = d["recommended_action"]
-        if d["classification"] == "malicious":
-            action = "report-to-pypi"
-        elif action not in _RECOMMENDED_ACTIONS:
-            action = "monitor"
+        action = "report-to-pypi" if d["classification"] == "malicious" else pick("recommended_action",
+                                                                                  _RECOMMENDED_ACTIONS)
         return Verdict(
             package=package, version=version,
             classification=d["classification"], score=score,
-            fired_rules=fired_rules, urgent=bool(d["urgent"]),
+            fired_rules=fired_rules, urgent=d["urgent"] is True,              # only a JSON true, never "false"
             confidence=_clamp01(d["confidence"]), attack_type=attack_type,
-            reasoning=d["reasoning"], cited_hunk=d["cited_hunk"],
-            recommended_action=action, model=model,
-            runs_when=d["runs_when"] if d["runs_when"] in _RUNS_WHEN else "unknown")
+            reasoning=pick("reasoning"), cited_hunk=pick("cited_hunk"),
+            recommended_action=action, model=model, runs_when=pick("runs_when", _RUNS_WHEN))

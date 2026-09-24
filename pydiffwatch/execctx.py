@@ -410,7 +410,7 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
     # backend (or an in-tree one, or an unknown one) they say nothing about what is installed: not read, and an
     # empty field is qualified, never a bare "none"
     setuptools = backend in _SETUPTOOLS_BACKENDS and not in_tree
-    imp_none = none if setuptools else f"none in scanned files ({name} may generate its own){tail}"
+    imp_none = none if setuptools else f"none in scanned files ({name} may generate its own)"  # setup.py unread
 
     def declared(setup_name, st_name, cfg_name):
         if not setuptools:
