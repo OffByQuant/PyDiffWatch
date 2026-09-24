@@ -543,3 +543,31 @@ def test_an_unparsed_backend_says_it_may_declare_its_own_entry_points():
 def test_parsed_backends_keep_the_plain_none(backend):
     ctx = execctx.build({"pyproject.toml": f"[build-system]\nbuild-backend = '{backend}'\n".encode()})
     assert _line(ctx, "plugins").endswith(": none"), backend
+
+
+# ---- fix round 4: setup.cfg file: / attr: directives ----
+
+def _cfg(options: str) -> str:
+    return execctx.build({"setup.cfg": f"[metadata]\nname = a\n[options]\n{options}\n".encode()})
+
+
+def test_a_setup_cfg_entry_points_file_directive_is_unknown():
+    ctx = _cfg("entry_points = file: eps.cfg")
+    u = "unknown (setup.cfg reads entry points from a file)"
+    assert _line(ctx, "commands").endswith(f": {u}") and _line(ctx, "plugins").endswith(f": {u}")
+
+
+def test_a_setup_cfg_inline_entry_points_string_is_read():
+    ctx = _cfg("entry_points =\n    [pytest11]\n    p = evil:hook")
+    assert _line(ctx, "plugins").endswith(": pytest11: p -> evil:hook")
+
+
+@pytest.mark.parametrize("key, field, what", [
+    ("packages", "packages", "packages"),
+    ("py_modules", "py-modules", "py-modules"),
+    ("setup_requires", "setup_requires", "setup_requires"),
+])
+@pytest.mark.parametrize("directive, src", [("file: x.txt", "a file"), ("attr: a.b", "a Python attribute")])
+def test_setup_cfg_directives_on_declaring_keys_are_unknown(key, field, what, directive, src):
+    ctx = _cfg(f"{key} = {directive}")
+    assert f"{field}=unknown (setup.cfg reads {what} from {src})" in ctx, ctx

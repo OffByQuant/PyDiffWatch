@@ -81,6 +81,15 @@ def _cfg_list(v) -> list[str]:
     return [x.strip() for x in str(v).replace(";", ",").replace("\n", ",").split(",") if x.strip()]
 
 
+def _cfg_directive(v, what: str) -> str | None:
+    """setup.cfg `file:` / `attr:` values are read from elsewhere at build: unknown here, never "none"."""
+    v = v.strip() if isinstance(v, str) else ""
+    for prefix, src in (("file:", "a file"), ("attr:", "a Python attribute")):
+        if v.startswith(prefix):
+            return f"unknown (setup.cfg reads {what} from {src})"
+    return None
+
+
 def _join(items, empty="none") -> str:
     items = list(dict.fromkeys(_clip(x) for x in items if str(x).strip()))
     more = len(items) - _MAX_ITEMS
@@ -366,7 +375,8 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
         cmdclass += [ln.split("=", 1)[0].strip() for ln in options["cmdclass"].splitlines()]
     sreq = kw("setup_requires")
     sreq = [COMPUTED] if sreq == COMPUTED else (_strs(sreq) or [])
-    sreq += _cfg_list(options.get("setup_requires", ""))
+    v = options.get("setup_requires", "")
+    sreq += [d] if (d := _cfg_directive(v, "setup_requires")) else _cfg_list(v)
     bpath = (_strs(bs.get("backend-path")) or []) + unknown("pyproject.toml")
     cmdclass += unknown("pyproject.toml", "setup.py", "setup.cfg")
     sreq += unknown("setup.py", "setup.cfg")
@@ -392,6 +402,8 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
         if (s := _strs(v)) is not None:
             return _join(s)
         v = options.get(cfg_name, "").strip()
+        if d := _cfg_directive(v, st_name):
+            return d
         return None if not v or v.startswith("find") else _join(_cfg_list(v))
 
     src_unknown = unknown("pyproject.toml", "setup.py", "setup.cfg")
@@ -413,9 +425,13 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
         _add_groups(eps, _table(t.get(groups)))
     _add_groups(eps, kw("entry_points"))
     _add_groups(eps, cfg.get("options.entry_points"))
+    cfg_eps = options.get("entry_points", "")
+    ep_unknown_cfg = [d] if (d := _cfg_directive(cfg_eps, "entry points")) else []
+    if not d:
+        _add_groups(eps, cfg_eps.strip() or None)               # INI text inline in [options]
     for p in _egg_info(new_files, "entry_points.txt"):
         _add_groups(eps, parsed(p, "entry_points"))
-    ep_unknown = unknown("pyproject.toml", "setup.py", "setup.cfg", "entry_points.txt")
+    ep_unknown = unknown("pyproject.toml", "setup.py", "setup.cfg", "entry_points.txt") + ep_unknown_cfg
     dynamic = project.get("dynamic")
     if isinstance(dynamic, list) and _DYNAMIC_EPS & {d for d in dynamic if isinstance(d, str)}:
         ep_unknown.append("unknown (pyproject.toml marks them dynamic)")   # the backend fills them in at build
