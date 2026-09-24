@@ -790,9 +790,12 @@ def test_setup_py_and_conftest_py_are_never_listed_as_modules():
     assert _field(ctx, "py-modules") == "auto-discovered: foo"
 
 
-def test_a_declared_package_list_leaves_py_modules_qualified():
-    ctx = execctx.build({"pyproject.toml": _ST + b"[tool.setuptools]\npackages = ['a']\n"})
-    assert _field(ctx, "py-modules") == f"auto-discovered: {_AUTO_NONE}"
+@pytest.mark.parametrize("extra", [b"[tool.setuptools]\npackages = ['a']\n",
+                                   b"[tool.setuptools.packages.find]\nwhere = ['.']\n"])
+def test_declared_or_found_packages_turn_module_auto_discovery_off(extra):
+    # setuptools auto-discovers only when nothing declares packages or py-modules: foo.py is not installed
+    ctx = execctx.build({"pyproject.toml": _ST + extra, "foo.py": b""})
+    assert _field(ctx, "py-modules") == _AUTO_NONE
 
 
 def test_a_wrong_typed_backend_path_is_unknown_not_none():

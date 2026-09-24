@@ -473,9 +473,10 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
     pkgs_known = setuptools and not src_unknown and (not find if pkgs_declared is None else
                                                      COMPUTED not in pkgs_declared
                                                      and not pkgs_declared.startswith("unknown"))
+    # setuptools auto-discovers modules only while nothing declares (or finds) packages or py-modules
     mods = declared("py_modules", "py-modules", "py_modules") or (", ".join(
-        src_unknown + [f"auto-discovered: {_join(_modules(new_files), imp_none)}"]) if setuptools
-        else _join(src_unknown, imp_none))
+        src_unknown + [f"auto-discovered: {_join(_modules(new_files), imp_none)}"])
+        if setuptools and pkgs_declared is None and not find else _join(src_unknown, imp_none))
     tops = [ln for p in _egg_info(new_files, "top_level.txt")
             for ln in new_files[p].decode("utf-8", errors="replace").split()]
     import_line = (f"import (runs when a program imports the package): packages={pkgs}; py-modules={mods}; "
