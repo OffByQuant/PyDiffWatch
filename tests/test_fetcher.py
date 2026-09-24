@@ -278,3 +278,27 @@ def test_a_large_pkg_info_never_crowds_setup_py_out_of_a_first_release_review(mo
     lines = text.split("\n")
     assert "--- file: setup.py (added) ---" in lines and "--- file: pyproject.toml (added) ---" in lines
     assert "PKG-INFO" not in text and "curl -sSL" not in text
+
+
+def _oversized_setup():
+    return (b"from setuptools import setup\nsetup(entry_points={'pytest11': ['p = evil:hook']})\n"
+            + b"# pad\n" * 200_000)                                             # > 1 MiB max_source_file_bytes
+
+
+@pytest.mark.parametrize("prior_has_it", [False, True])
+def test_an_oversized_setup_py_is_unknown_in_the_block_never_absent(monkeypatch, prior_has_it):
+    # Padding setup.py past the source cap must not turn "runs at build, declares pytest11" into "absent, none",
+    # including on an update where the same oversized setup.py was already in the prior sdist.
+    from pydiffwatch import differ
+    big = _oversized_setup()
+    monkeypatch.setattr(fetcher, "_package_json", lambda p, cfg: _meta("acme", [
+        ("1.0", "2026-01-01T00:00:00Z"), ("1.1", "2026-01-02T00:00:00Z")]))
+    blobs = {"mock://acme/1.0": make_sdist({"acme/__init__.py": b"x = 1\n", **({"setup.py": big} if prior_has_it else {})}),
+             "mock://acme/1.1": make_sdist({"acme/__init__.py": b"x = 2\n", "setup.py": big})}
+    monkeypatch.setattr(fetcher, "_download", lambda url, cfg: blobs[url])
+    monkeypatch.setattr(fetcher, "_screen_added_deps", lambda *a, **k: [])
+    art = fetcher.fetch_artifacts(Config(), NewRelease("acme", "1.1", 5))
+    assert "setup.py" not in art.new_files and art.too_large == ("setup.py",)
+    ctx = differ.build_diff(art).exec_context
+    assert "setup.py=unknown (too large to scan)" in ctx and "absent" not in ctx
+    assert "plugins" in ctx and "unknown (setup.py too large)" in ctx

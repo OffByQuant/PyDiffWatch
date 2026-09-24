@@ -295,6 +295,9 @@ def fetch_artifacts(cfg, rel: NewRelease, attempt: int = 1) -> ArtifactSet | NoS
                            is_new_package=True, maintainer_metadata=mtmeta, description=summary)
 
     new_files, new_bins = extract_sdist(_download(new_sd["url"], slow), cfg)
+    # Before the prior comparison drops unchanged ones: the execution context must know an oversized
+    # setup.py is there even when it did not change (padding it must not read as "absent").
+    too_large = tuple(b["path"] for b in new_bins if b.get("reason") == "source-too-large")
     prior_files: dict[str, bytes] = {}
     prior_bins = None
     prior_ver = None
@@ -321,4 +324,5 @@ def fetch_artifacts(cfg, rel: NewRelease, attempt: int = 1) -> ArtifactSet | NoS
     return ArtifactSet(rel.package, rel.version, prior_ver, "sdist",
                        new_files, prior_files, {}, _cap_foreign(new_bins, cfg),
                        is_new_package=is_new, maintainer_metadata=mtmeta,
-                       added_dep_findings=dep_findings, prior_error=prior_error, description=summary)
+                       added_dep_findings=dep_findings, prior_error=prior_error, description=summary,
+                       too_large=too_large)
