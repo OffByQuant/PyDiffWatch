@@ -156,3 +156,14 @@ def test_render_shows_reviewer_guard_state():
         "host_memory": "swap 83% used"}})
     assert "reviews paused (timeout)" in html and "85 tok/s" in html and "52,020" in html
     assert "swap 83% used" in html
+
+
+def test_rank_uses_the_human_label_like_the_badge_and_the_flagged_count(tmp_path):
+    # (h), npm #24: a model-malicious release a person cleared as benign sinks below the flagged ones, and a
+    # model-benign one a person labelled malicious rises to the top. The status strip's count agrees.
+    rows = [{"package": "cleared", "version": "1", "classification": "malicious", "human_label": "benign"},
+            {"package": "queued", "version": "1", "classification": "suspicious"},
+            {"package": "caught", "version": "1", "classification": "benign", "human_label": "malicious"}]
+    out = dashboard.render_dashboard(rows, status={"flagged_total": sum(map(dashboard.is_flagged, rows))})
+    assert out.index("caught") < out.index("queued") < out.index("cleared")
+    assert "2 flagged for review" in out and "2 flagged</span>" in out

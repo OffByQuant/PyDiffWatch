@@ -138,10 +138,12 @@ footer{color:var(--muted);font-size:12.5px;margin-top:28px;text-align:center}
 
 
 def _rank(row) -> int:
-    cls = (row.get("classification") or "").lower()
+    # A human adjudication is the final word, as in is_flagged and the badge.
+    human = row.get("human_label")
+    cls = human.lower() if human is not None else (row.get("classification") or "").lower()
     if cls == "malicious":
         return 0
-    if cls == "suspicious" or is_flagged(row):
+    if is_flagged(row):
         return 1
     return 2
 
