@@ -147,10 +147,18 @@ def _attempt_review(cfg, conn, rvw, rid, package, version, score, fired_rules, t
     return True
 
 
+def _park(conn, rid, reason, detail, text):
+    """park_for_review; text None (the stored input couldn't be read back) keeps the stored input."""
+    if text is None:
+        store.set_pending_reason(conn, rid, reason, detail)
+    else:
+        store.park_for_review(conn, rid, reason, detail, text)
+
+
 def _park_auto(conn, rid, reason, detail, text):
     """Park for a reason the auto-drain retries on its own. A stale UNREVIEWED verdict (e.g. from an earlier
     too_large park) goes: the release is not waiting for a person while the auto-drain owns it."""
-    store.park_for_review(conn, rid, reason, detail, text)
+    _park(conn, rid, reason, detail, text)
     store.clear_unscanned_verdict(conn, rid)
 
 
@@ -159,7 +167,7 @@ def _review_failed(cfg, conn, rid, package, version, score, fired_rules, text, e
     it; once they are used up (>=, so a lowered max_review_attempts counts too) it warns, once."""
     n = store.bump_review_attempts(conn, rid)
     if n >= cfg.reviewer.max_review_attempts:      # the auto-drain stops retrying it from here on
-        store.park_for_review(conn, rid, "review_failed", f"{n} failed attempt(s): {err}", text)
+        _park(conn, rid, "review_failed", f"{n} failed attempt(s): {err}", text)
         _alert_review_exhausted(cfg, conn, rid, package, version, n, err, score, fired_rules)
     else:
         _park_auto(conn, rid, "review_failed", f"{n} failed attempt(s): {err}", text)
@@ -220,32 +228,49 @@ def drain_pending(cfg, conn, rvw, *, auto: bool, reasons=None, limit=None, guard
     for row in rows:
         if limit is not None and tried >= limit:
             break
-        if auto and row["pending_reason"] == "review_failed" and \
-                row["review_attempts"] >= cfg.reviewer.max_review_attempts:
-            if not row["has_verdict"]:     # e.g. max_review_attempts was lowered after its last attempt
-                _alert_review_exhausted(cfg, conn, row["release_id"], row["package"], row["version"],
-                                        row["review_attempts"], (row["pending_detail"] or "").split(": ", 1)[-1],
-                                        row["triage_score"], _rules_from_json(row["triage_rules"]))
-            continue
-        text = store.review_input(row)
-        rid = row["release_id"]
-        if len(text) > cap:
-            if auto:
-                explain = guard.cap_explain() if guard is not None else f"cap {cap}"
-                # Over the provisional cold-start cap it may fit once the endpoint is measured: park silently.
-                _park_too_large(cfg, conn, rid, row["package"], row["version"], row["triage_score"],
-                                _rules_from_json(row["triage_rules"]), f"needs {len(text)} chars; {explain}", text,
-                                alert=not provisional)
-            continue
-        tried += 1
-        fired_rules = _rules_from_json(row["triage_rules"])
-        dropped = reviewer.dropped_from_text(fired_rules, text)   # spec U2: recovered from stored text
-        if not _attempt_review(cfg, conn, rvw, rid, row["package"], row["version"], row["triage_score"],
-                               fired_rules, reviewer.refresh_marker(text), guard, dropped=dropped):
+        try:
+            attempted, go_on = _drain_one(cfg, conn, rvw, row, auto=auto, cap=cap, provisional=provisional,
+                                          guard=guard)
+        except Exception as e:   # a corrupt row or a bug on this input: its failed attempt, never a stalled tick
+            logger.exception("review queue: %s==%s failed", row["package"], row["version"])
+            try:
+                rules = _rules_from_json(row["triage_rules"])
+            except Exception:
+                rules = []
+            _review_failed(cfg, conn, row["release_id"], row["package"], row["version"], row["triage_score"],
+                           rules, None, f"{type(e).__name__}: {e}")
+            attempted, go_on = True, True
+        tried += attempted
+        if not go_on:
             break
-        if store.get_stage(conn, row["package"], row["version"]) != "pending_review":
+        if attempted and store.get_stage(conn, row["package"], row["version"]) != "pending_review":
             done += 1
     return done
+
+
+def _drain_one(cfg, conn, rvw, row, *, auto, cap, provisional, guard):
+    """One drain_pending row. Returns (attempted: a review was tried, go_on: keep draining)."""
+    if auto and row["pending_reason"] == "review_failed" and \
+            row["review_attempts"] >= cfg.reviewer.max_review_attempts:
+        if not row["has_verdict"]:     # e.g. max_review_attempts was lowered after its last attempt
+            _alert_review_exhausted(cfg, conn, row["release_id"], row["package"], row["version"],
+                                    row["review_attempts"], (row["pending_detail"] or "").split(": ", 1)[-1],
+                                    row["triage_score"], _rules_from_json(row["triage_rules"]))
+        return False, True
+    text = store.review_input(row)
+    rid = row["release_id"]
+    if len(text) > cap:
+        if auto:
+            explain = guard.cap_explain() if guard is not None else f"cap {cap}"
+            # Over the provisional cold-start cap it may fit once the endpoint is measured: park silently.
+            _park_too_large(cfg, conn, rid, row["package"], row["version"], row["triage_score"],
+                            _rules_from_json(row["triage_rules"]), f"needs {len(text)} chars; {explain}", text,
+                            alert=not provisional)
+        return False, True
+    fired_rules = _rules_from_json(row["triage_rules"])
+    dropped = reviewer.dropped_from_text(fired_rules, text)   # spec U2: recovered from stored text
+    return True, _attempt_review(cfg, conn, rvw, rid, row["package"], row["version"], row["triage_score"],
+                                 fired_rules, reviewer.refresh_marker(text), guard, dropped=dropped)
 
 
 

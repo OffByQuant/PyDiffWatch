@@ -224,6 +224,12 @@ def park_for_review(conn, release_id, reason, detail, review_input):
                  (reason, detail, zlib.compress(review_input.encode()), len(review_input), release_id))
     conn.commit()
 
+def set_pending_reason(conn, release_id, reason, detail):
+    """Re-park a pending_review row under a new reason, keeping its stored review input."""
+    conn.execute("UPDATE releases SET stage='pending_review', pending_reason=?, pending_detail=? WHERE id=?",
+                 (reason, detail, release_id))
+    conn.commit()
+
 def clear_pending(conn, release_id):
     conn.execute("UPDATE releases SET pending_reason=NULL, pending_detail=NULL, review_input=NULL, "
                  "review_input_chars=NULL WHERE id=?",

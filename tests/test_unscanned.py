@@ -346,3 +346,32 @@ def test_a_failure_after_triage_still_gives_up_with_its_alert(tmp_path, capsys, 
     out = capsys.readouterr().out
     assert _unreviewed(out) and "gave up" in out and "deterministic bug" in out
     assert [k for (k,) in _alerts(conn, "pkg")] == ["pkg|1.0.0|suspicious-heuristic|unscanned:gave_up"]
+
+
+@pytest.mark.parametrize("module, name", [(store, "review_input"), (reviewer, "dropped_from_text")])
+def test_a_drain_row_that_raises_is_a_bounded_failed_attempt_not_a_crashed_tick(tmp_path, capsys, monkeypatch,
+                                                                                 module, name):
+    # Ruling on round 1: drain_pending runs before the retry sweep and ingest, so any exception escaping it
+    # stalled every tick. Each row's failure now counts toward max_review_attempts and reaches the exhaustion
+    # alert; the drain carries on with the next row.
+    cfg, conn, rid, rvw = _setup(tmp_path, _Backend())
+    def text(body):
+        return reviewer.build_review_input(_diff(body), _T, max_chars=cfg.reviewer.max_input_chars)
+    _parked(conn, rid, text("exec(x)"))
+    other = store.record_release(conn, "ok", "1.0.0", 2, False, None, "tgz")
+    _parked(conn, other, text("exec(y)"))
+    real = getattr(module, name)
+
+    def broken(arg, *a, **k):
+        is_pkg = (arg["package"] == "pkg") if name == "review_input" else ("exec(x)" in a[0])
+        if is_pkg:
+            raise ValueError("corrupt row")
+        return real(arg, *a, **k)
+    monkeypatch.setattr(module, name, broken)
+    for _ in range(cfg.reviewer.max_review_attempts + 1):
+        orchestrator.drain_pending(cfg, conn, rvw, auto=True)
+    assert store.get_stage(conn, "ok", "1.0.0") != "pending_review"    # the next row was still drained
+    row = conn.execute("SELECT pending_reason, review_attempts FROM releases WHERE id=?", (rid,)).fetchone()
+    assert tuple(row) == ("review_failed", cfg.reviewer.max_review_attempts)
+    out = capsys.readouterr().out
+    assert _unreviewed(out) and "ValueError: corrupt row" in out and len(_alerts(conn, "pkg")) == 1
