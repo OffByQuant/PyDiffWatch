@@ -217,10 +217,15 @@ def drain_pending(cfg, conn, rvw, *, auto: bool, reasons=None, limit=None, guard
 
 
 
-def _fetch_one(cfg, rel):
+def _fetch_one(cfg, rel, attempt=1):
     """Worker half of the pipeline — runs OFF the main thread. Does NO sqlite and NO notifier work
     (sqlite is single-threaded), only network + in-memory extraction (incl. PyPI-baseline resolution).
+    Attempt k (a retry of a failed release) gets k times the download and metadata deadlines, as review
+    retries get timeout x attempt; attempt 1 keeps them as configured.
     Returns the ArtifactSet, a NoSdist, or the Exception it caught, for the main thread to map."""
+    if attempt > 1:
+        cfg = dataclasses.replace(cfg, fetch_deadline_s=cfg.fetch_deadline_s * attempt,
+                                  packument_deadline_s=cfg.packument_deadline_s * attempt)
     try:
         return fetcher.fetch_artifacts(cfg, rel)
     except Exception as e:        # incl. RefusedToFetch/RefusedToExtract — mapped on the main thread
@@ -373,7 +378,10 @@ def _retry_later(cfg, conn, rid, rel, e) -> bool:
     was = store.get_stage(conn, rel.package, rel.version)
     note = f"{type(e).__name__}: {e}"
     stage = store.note_metadata_failure(conn, rid, note)
-    logger.warning("scan failed for %s==%s (%s): %s", rel.package, rel.version, stage, note)
+    n = store.fetch_attempts(conn, rid)
+    then = (f"giving up after {n} attempts" if stage == "gave_up" else
+            f"will retry next tick (attempt {n} of {store.METADATA_ATTEMPTS})")
+    logger.warning("scan failed for %s==%s (%s); %s", rel.package, rel.version, note, then)
     if stage == "gave_up" and was != "gave_up":
         _alert_unscanned(cfg, conn, rid, rel.package, rel.version,
                          f"UNREVIEWED: pydiffwatch failed to download or scan it {store.METADATA_ATTEMPTS} times "
@@ -384,9 +392,11 @@ def _retry_later(cfg, conn, rid, rel, e) -> bool:
 def _retry_metadata(cfg, conn, rvw, ruleset, offline, guard):
     """Re-fetch and re-scan releases that failed on an earlier tick. They are behind the cursor already,
     so a result here never gates it; a repeat failure counts toward the give-up (_retry_later)."""
-    due = [NewRelease(r["package"], r["version"], r["serial"]) for r in store.metadata_retries_due(conn)]
+    rows = store.metadata_retries_due(conn)
+    due = [NewRelease(r["package"], r["version"], r["serial"]) for r in rows]
+    attempts = [(r["fetch_attempts"] or 0) + 1 for r in rows]
     with ThreadPoolExecutor(max_workers=max(1, cfg.fetch_concurrency)) as ex:
-        for rel, result in zip(due, ex.map(lambda r: _fetch_one(cfg, r), due)):
+        for rel, result in zip(due, ex.map(lambda r, k: _fetch_one(cfg, r, k), due, attempts)):
             _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline, guard)
 
 

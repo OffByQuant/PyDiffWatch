@@ -266,6 +266,9 @@ def clear_fetch_failures(conn, release_id, note=None):
     conn.execute("UPDATE releases SET fetch_attempts=0, fetch_note=? WHERE id=?", (note, release_id))
     conn.commit()
 
+def fetch_attempts(conn, release_id) -> int:
+    return conn.execute("SELECT fetch_attempts FROM releases WHERE id=?", (release_id,)).fetchone()[0] or 0
+
 def set_fetch_note(conn, release_id, note):
     conn.execute("UPDATE releases SET fetch_note=? WHERE id=?", (note, release_id))
     conn.commit()
@@ -275,10 +278,10 @@ def metadata_retries_due(conn, limit=20, now=None):
     by `now` (epoch seconds; default: now), soonest due first, then failed ones (metadata_retry) by serial. Each
     kind gets its own `limit`, so a backlog of failing retries can't starve a due re-check."""
     now = datetime.datetime.now(datetime.UTC).timestamp() if now is None else now
-    waits = conn.execute("SELECT package, version, serial FROM releases WHERE stage='no_sdist_wait' "
+    waits = conn.execute("SELECT package, version, serial, fetch_attempts FROM releases WHERE stage='no_sdist_wait' "
                          "AND recheck_at <= ? ORDER BY recheck_at, serial LIMIT ?", (now, limit)).fetchall()
-    return waits + conn.execute("SELECT package, version, serial FROM releases WHERE stage='metadata_retry' "
-                                "ORDER BY serial LIMIT ?", (limit,)).fetchall()
+    return waits + conn.execute("SELECT package, version, serial, fetch_attempts FROM releases "
+                                "WHERE stage='metadata_retry' ORDER BY serial LIMIT ?", (limit,)).fetchall()
 
 def wait_for_sdist(conn, release_id, recheck_at):
     """Park a wheel-only release off the cursor until `recheck_at` (epoch seconds), when it is re-fetched."""
