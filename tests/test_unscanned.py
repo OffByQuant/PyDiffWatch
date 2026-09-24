@@ -322,3 +322,27 @@ def test_an_exception_while_preparing_the_review_parks_instead_of_refetching(tmp
     assert store.fetch_attempts(conn, rid) == 0
     orchestrator.drain_pending(cfg, conn, rvw, auto=True)
     assert store.get_stage(conn, "pkg", "1.0.0") == "reviewed"
+
+
+# --- Task 8, fix round 1 --------------------------------------------------------------------------------
+
+def _boom(*a, **k):
+    raise ValueError("deterministic bug on this diff")
+
+
+@pytest.mark.parametrize("target", ["build_review_input", "build_evidence"])
+def test_a_failure_after_triage_still_gives_up_with_its_alert(tmp_path, capsys, monkeypatch, target):
+    # Review finding 1: the failure count was reset right after triage, before the evidence and review steps
+    # (both parse attacker-controlled diff content), so a deterministic crash there retried forever, silently.
+    cfg, conn, rid, rvw = _setup(tmp_path, _Backend())
+    art = _escalating(monkeypatch)
+    monkeypatch.setattr(reviewer, target, _boom)
+    rel = NewRelease("pkg", "1.0.0", 1)
+    seen = []
+    for _ in range(store.METADATA_ATTEMPTS + 2):
+        orchestrator._process_fetched(cfg, conn, rvw, None, rel, art)
+        seen.append((store.get_stage(conn, "pkg", "1.0.0"), store.fetch_attempts(conn, rid)))
+    assert seen[store.METADATA_ATTEMPTS - 1] == ("gave_up", store.METADATA_ATTEMPTS), seen
+    out = capsys.readouterr().out
+    assert _unreviewed(out) and "gave up" in out and "deterministic bug" in out
+    assert [k for (k,) in _alerts(conn, "pkg")] == ["pkg|1.0.0|suspicious-heuristic|unscanned:gave_up"]

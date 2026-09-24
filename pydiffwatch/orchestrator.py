@@ -390,7 +390,6 @@ def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=
         tr = engine.triage(d, cfg, ruleset, {"current": result.maintainer_metadata, "prior": prior_meta})
         store.update_stage(conn, rid, "triaged", tr.score,
                            json.dumps([r.__dict__ for r in tr.fired_rules]))
-        store.clear_fetch_failures(conn, rid, result.prior_error)   # scanned: earlier failures stop counting
         # Persist the flagged payload code itself (not just file:line metadata) so the DB is a
         # self-contained takedown-report source that survives the package being pulled from PyPI.
         ev = reviewer.build_evidence(d, tr, max_chars=cfg.evidence_max_chars) if tr.escalate else None
@@ -406,6 +405,9 @@ def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=
                                f"{type(e).__name__}: {e}")
                 notifier.emit(cfg, conn, Verdict(d.package, d.version, "suspicious-heuristic",
                                                  tr.score, tr.fired_rules, False), rid)
+        # Only now, with evidence and review handled, do earlier failures stop counting: a crash in any step
+        # above (they parse package content) must still reach gave_up.
+        store.clear_fetch_failures(conn, rid, result.prior_error)
         return True   # terminal: an unfinished LLM review is parked in the pending-review queue
     except Exception as e:
         logger.exception("processing failed for %s==%s", rel.package, rel.version)
