@@ -360,7 +360,7 @@ class Reviewer:
                                 self.prepare(diff, triage), attempt=attempt)
 
     def review_text(self, package, version, score, fired_rules, user_text, *, attempt: int = 1,
-                    max_tokens=None) -> Verdict:
+                    max_tokens_for=None) -> Verdict:
         if not _has_reviewable_content(user_text):
             # Triage fired only on signals with no text to show (binary members, maintainers). A model
             # asked to judge nothing answers "benign"; that is a pass on a package nobody looked at.
@@ -374,9 +374,11 @@ class Reviewer:
                 reasoning=f"UNREVIEWED: triage fired ({rules}) but none of the flagged content could be "
                           f"shown to the reviewer. Needs a human.")
         timeout = self.cfg.reviewer.timeout * attempt
-        mt = max_tokens if max_tokens is not None else self.cfg.reviewer.max_output_tokens
-        args = (package, version, score, fired_rules, user_text, timeout, mt)
-        v = self._call(self.backend.primary_model, *args)
+        # max_tokens is clamped PER MODEL: an escalation model on the same endpoint can have a smaller
+        # context window than the primary, so its clamp must not reuse the primary's (spec C2).
+        mtf = max_tokens_for if max_tokens_for is not None else (lambda model: self.cfg.reviewer.max_output_tokens)
+        args = (package, version, score, fired_rules, user_text, timeout)
+        v = self._call(self.backend.primary_model, *args, mtf(self.backend.primary_model))
         # §7 escalation (Claude only): low-confidence verdict -> re-run with the backend's bigger model.
         # The local backend exposes escalation_model=None, so a single model is used. (vet-mcp
         # popularity/blast-radius enrichment was CUT — vet is a peer scanner; depending on it for
@@ -384,7 +386,7 @@ class Reviewer:
         esc = self.backend.escalation_model
         if esc and v.confidence is not None and v.confidence < self.cfg.reviewer.opus_escalation_confidence:
             logger.info("reviewer escalating %s==%s to %s (conf=%.2f)", package, version, esc, v.confidence)
-            v = self._call(esc, *args)
+            v = self._call(esc, *args, mtf(esc))
         return v
 
     def _call(self, model, package, version, score, fired_rules, user_text, timeout, max_tokens) -> Verdict:

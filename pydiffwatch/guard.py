@@ -60,6 +60,7 @@ class ReviewerGuard:
         self.paused_until = s.get("paused_until") or 0.0
         self.slow_streak = s.get("slow_streak") or 0
         self.ctx_tokens = None
+        self._esc_ctx_tokens = {}
         self.warned_no_room = False
 
     def begin_batch(self):
@@ -81,6 +82,19 @@ class ReviewerGuard:
             self.ctx_tokens = self.backend.context_length()
         if self.tok_s is None:
             self._calibrate()
+
+    def ctx_tokens_for(self, model):
+        """The context window for `model` — the primary model's is `ctx_tokens` (looked up in
+        begin_batch); any other model (e.g. an escalation model on the same endpoint) is looked up the
+        same way, on demand, and cached here for the guard's lifetime. None when unmeasured or the
+        endpoint can't report it (spec C2: the reviewer then sends the config value unclamped)."""
+        if model == self.backend.primary_model:
+            return self.ctx_tokens
+        if not self.measured:
+            return None
+        if model not in self._esc_ctx_tokens:
+            self._esc_ctx_tokens[model] = self.backend.context_length(model)
+        return self._esc_ctx_tokens[model]
 
     def _calibrate(self):
         try:

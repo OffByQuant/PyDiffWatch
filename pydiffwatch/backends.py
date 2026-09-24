@@ -206,11 +206,14 @@ class OpenAICompatibleBackend:
         self.last_usage = _usage_of(data)
         return self.last_usage
 
-    def context_length(self) -> int | None:
-        """Best effort: the context window the server advertises for this model, else None."""
+    def context_length(self, model=None) -> int | None:
+        """Best effort: the context window the server advertises for `model` (default: primary_model),
+        else None. The escalation model is a different id on the same endpoint and may have a smaller
+        window (§C2) — callers look it up separately rather than reusing the primary model's value."""
+        model = model or self.primary_model
         try:
             for m in self._get(f"{self.endpoint}/models", 5.0, self._auth_headers()).get("data", []):
-                if m.get("id") == self.primary_model:
+                if m.get("id") == model:
                     for k in ("context_length", "max_model_len", "max_context_length"):
                         if isinstance(m.get(k), int) and m[k] > 0:
                             return m[k]
@@ -270,7 +273,7 @@ class AnthropicBackend:
         self.last_usage = _anthropic_usage(resp)
         return self.last_usage
 
-    def context_length(self) -> int | None:
+    def context_length(self, model=None) -> int | None:
         return None
 
 

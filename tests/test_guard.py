@@ -26,7 +26,7 @@ class Backend:
         self.clock.t += self.k * len(text) / 1000
         return {"prompt_tokens": int(len(text) * self.tpc), "completion_tokens": 1} if self.tpc else None
 
-    def context_length(self):
+    def context_length(self, model=None):
         return self.ctx
 
 

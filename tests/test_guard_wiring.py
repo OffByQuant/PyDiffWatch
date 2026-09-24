@@ -32,7 +32,7 @@ class Backend:
             raise reviewer.ReviewUnavailable("still busy") from TimeoutError("timed out")
         return {"prompt_tokens": 1000, "completion_tokens": 1}
 
-    def context_length(self):
+    def context_length(self, model=None):
         return None
 
 
@@ -232,8 +232,12 @@ class _CapturingMaxTokens(Backend):
         return super().complete(**kw)
 
 
+def _review_text(body="x" * 90_000):
+    return reviewer.build_review_input(_diff("a", body), _T, max_chars=1_000_000)
+
+
 def _big_review_text():
-    return reviewer.build_review_input(_diff("a", "x" * 90_000), _T, max_chars=1_000_000)
+    return _review_text()
 
 
 def test_max_tokens_clamped_to_the_context_window(tmp_path):
@@ -266,6 +270,49 @@ def test_max_tokens_unclamped_with_no_guard(tmp_path):
     orchestrator._attempt_review(cfg, conn, rvw, rid, "a", "1.0.0", 60.0, _T.fired_rules,
                                  _big_review_text(), guard=None)
     assert be.captured_max_tokens == cfg.reviewer.max_output_tokens
+
+
+class _EscalatingCapture(Backend):
+    # confidence 0.1 on every call triggers escalation every time (opus_escalation_confidence default > 0.1).
+    escalation_model = "big"
+
+    def __init__(self):
+        super().__init__()
+        self.captured = {}
+
+    def complete(self, **kw):
+        self.calls += 1
+        self.captured[kw["model"]] = kw["max_tokens"]
+        self.last_usage = self.usage
+        return _OK.replace('"confidence":0.9', '"confidence":0.1')
+
+    def context_length(self, model=None):
+        # The escalation model ("big") is a different id on the same endpoint with a SMALLER window than
+        # the primary's — the bug this test guards against reused the primary's clamp for it.
+        return {"big": 20_000}.get(model)
+
+
+def test_escalation_call_clamps_against_its_own_context_window(tmp_path):
+    be = _EscalatingCapture()
+    cfg, conn, gd, rvw = _setup(tmp_path, be)
+    gd.ctx_tokens = 32_768   # primary's window
+    rid = store.record_release(conn, "a", "1.0.0", 1, False, None, "tgz")
+    orchestrator._attempt_review(cfg, conn, rvw, rid, "a", "1.0.0", 60.0, _T.fired_rules,
+                                 _review_text("x" * 20_000), gd)
+    assert be.calls == 2
+    assert be.captured["big"] < be.captured["m"]                 # escalation's smaller window bites harder
+    assert be.captured["big"] < cfg.reviewer.max_output_tokens
+
+
+def test_max_tokens_never_exceeds_the_configured_output_cap(tmp_path):
+    # The 256-token floor must never push max_tokens above a smaller configured max_output_tokens.
+    be = _CapturingMaxTokens()
+    cfg, conn, gd, rvw = _setup(tmp_path, be, max_output_tokens=200)
+    gd.ctx_tokens = 1_000_000   # plenty of room, so the floor (not the window) would otherwise dominate
+    rid = store.record_release(conn, "a", "1.0.0", 1, False, None, "tgz")
+    orchestrator._attempt_review(cfg, conn, rvw, rid, "a", "1.0.0", 60.0, _T.fired_rules,
+                                 _review_text("x" * 100), gd)
+    assert be.captured_max_tokens == 200
 
 
 def test_upgrade_backfills_the_length_of_already_parked_inputs(tmp_path):

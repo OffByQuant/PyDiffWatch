@@ -42,7 +42,7 @@ class _Backend:
     def ping(self, text, *, timeout):     # the reviewer guard's probe / calibration: a fast endpoint
         return {"prompt_tokens": 5000, "completion_tokens": 1, "prompt_per_second": 100_000.0}
 
-    def context_length(self):
+    def context_length(self, model=None):
         return None
 
 

@@ -90,15 +90,20 @@ def _record(cfg, conn, rid, verdict, score, dropped=()):
         store.update_stage(conn, rid, "reviewed", score, None)
 
 
-def _max_tokens_for(cfg, guard, text) -> int:
-    """spec C2: clamp reviewer.max_output_tokens to what's left of the model's context window once the
+def _max_tokens_for(cfg, guard, text, model) -> int:
+    """spec C2: clamp reviewer.max_output_tokens to what's left of `model`'s own context window once the
     prompt is accounted for, so an OpenAI-compatible endpoint (e.g. vLLM) doesn't reject prompt + max_tokens
-    > max_model_len with HTTP 400. Unclamped (the config value) when the window isn't known."""
+    > max_model_len with HTTP 400. Looked up per model (an escalation model on the same endpoint can have a
+    smaller window than the primary) via guard.ctx_tokens_for. Unclamped (the config value) when the
+    window isn't known, and never above the config value even when the floor would otherwise exceed it."""
     max_output_tokens = cfg.reviewer.max_output_tokens
-    if guard is None or guard.ctx_tokens is None:
+    if guard is None:
+        return max_output_tokens
+    ctx_tokens = guard.ctx_tokens_for(model)
+    if ctx_tokens is None:
         return max_output_tokens
     prompt_estimate = math.ceil((len(reviewer.SYSTEM_PROMPT) + len(text)) / guard.cpt)
-    return max(256, min(max_output_tokens, guard.ctx_tokens - prompt_estimate - 64))
+    return min(max_output_tokens, max(256, ctx_tokens - prompt_estimate - 64))
 
 
 def _attempt_review(cfg, conn, rvw, rid, package, version, score, fired_rules, text, guard=None,
@@ -118,7 +123,7 @@ def _attempt_review(cfg, conn, rvw, rid, package, version, score, fired_rules, t
     try:
         with _review_slot(cfg):
             verdict = rvw.review_text(package, version, score, fired_rules, text, attempt=attempt,
-                                      max_tokens=_max_tokens_for(cfg, guard, text))
+                                      max_tokens_for=lambda model: _max_tokens_for(cfg, guard, text, model))
     except reviewer.ReviewUnavailable as e:
         logger.warning("LLM review failed for %s==%s (attempt %d): %s", package, version, attempt, e)
         if _endpoint_down(e):     # an outage, not this release's fault: don't spend an attempt
