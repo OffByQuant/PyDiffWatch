@@ -154,6 +154,12 @@ def _rank_files(diff, triage):
 
 
 _DESC_HEADING = "--- package description (the author's claim; context, not evidence) ---"
+_LOC_HEADING = "flagged_locations:"
+
+
+def _one_line(s: str) -> str:
+    """An author-chosen string with control characters escaped, so it stays on one line."""
+    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in s)
 
 
 def build_review_input(diff, triage, *, max_chars: int) -> str:
@@ -173,23 +179,25 @@ def build_review_input(diff, triage, *, max_chars: int) -> str:
     # straight into attack_type. Pointers preserve "where to look"; the model concludes independently.
     seen: list[str] = []
     for r in sorted(triage.fired_rules, key=lambda r: -r.weight):
-        loc = f"{r.file}:{r.lines[0]}-{r.lines[1]}"
+        loc = f"{_one_line(r.file)}:{r.lines[0]}-{r.lines[1]}"
         if r.file in ranked_set and loc not in seen:
             seen.append(loc)
     header = (
         f"package: {diff.package}\nversion: {diff.version}\n"
         f"is_first_release: {diff.is_first_release}"
         + (" (FIRST RELEASE - whole-package scan, no prior baseline)" if diff.is_first_release else "")
-        + f"\ntriage_score: {triage.score:.0f}\nflagged_locations: {', '.join(seen)}\n"
+        + f"\ntriage_score: {triage.score:.0f}\n"
         + f"untrusted_content_marker: {marker}\n"
         + f"\n{marker}\n"
     )
 
+    # File paths are author-chosen (sdist member names), so the flagged locations are fenced too.
+    loc_text = f"{_LOC_HEADING} {', '.join(seen)}" if seen else ""
     # info.summary is author-written: it goes inside the markers, flattened to one line by the differ.
     desc = getattr(diff, "description", "")
     desc_text = f"{_DESC_HEADING}\n  {desc}" if desc else ""
-    body_parts = [desc_text] if desc_text else []
-    used, truncated = len(header) + len(marker) + len(TRUNCATION_NOTE) + len(desc_text), False
+    body_parts = [t for t in (loc_text, desc_text) if t]
+    used, truncated = len(header) + len(marker) + len(TRUNCATION_NOTE) + len("\n".join(body_parts)), False
     for path in ranked_paths:
         rendered = _render_file(by_path[path])
         if used + len(rendered) + 1 > max_chars:
@@ -261,10 +269,13 @@ def refresh_marker(review_input: str) -> str:
 
 
 def _has_reviewable_content(review_input: str) -> bool:
-    """True if any file content was rendered between the injection markers. The description alone is not."""
-    body = review_input.split(_marker_of(review_input), 3)[2]
-    if body.lstrip().startswith(_DESC_HEADING):    # the author's claim alone is nothing to review
-        body = body.lstrip().split("\n", 2)[2] if body.lstrip().count("\n") >= 2 else ""
+    """True if any file content was rendered between the injection markers. The flagged-locations line
+    (where triage looked) and the description (the author's claim) are not content."""
+    body = review_input.split(_marker_of(review_input), 3)[2].lstrip()
+    if body.startswith(_LOC_HEADING):                # one line, control characters escaped
+        body = body.split("\n", 1)[1].lstrip() if "\n" in body else ""
+    if body.startswith(_DESC_HEADING):               # heading line + one flattened description line
+        body = body.split("\n", 2)[2] if body.count("\n") >= 2 else ""
     return bool(body.strip())
 
 
