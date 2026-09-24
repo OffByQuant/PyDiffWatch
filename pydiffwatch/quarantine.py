@@ -16,7 +16,7 @@ def _norm(name: str) -> str:
     return re.sub(r"[-_.]+", "-", (name or "").strip().lower())
 
 
-# Maintainer `rrdrqup` (PyPI account created 2026-05-30) pushed these three in a burst. Quarantined
+# One new maintainer account pushed these three in a burst. Quarantined
 # as deceptive typosquats — never fetch/process/install. Static review (verdicts in DB):
 #   - cudrequest   : typosquat of `requests`; ships an insecure PHP login app — NO active payload.
 #   - pythondocxx  : typosquat of `python-docx`; an OpenRouter AI CLI — NO active payload.
