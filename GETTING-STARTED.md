@@ -347,6 +347,14 @@ PyPI"** action so going from "the tool flagged this" to "reported for takedown" 
 self-contained HTML file with no JavaScript; every untrusted string (package name, the model's reasoning,
 cited code) is HTML-escaped, so a package literally named `<script>…</script>` can't attack the page.
 
+**Your own `adjudicate` call is the final word.** Once you've adjudicated a release with
+`pydiffwatch pending` / `pydiffwatch adjudicate <id> ...` (§5), the dashboard shows *your* label, not the
+model's, for that card: a human `benign` clears the flag for good — no highlight, no "Report malware"
+button, and it drops out of the flagged count in the status strip — even if the model called it
+malicious or suspicious. Conversely, a human `malicious` or `suspicious` label keeps the card flagged
+(highlighted, with the report button) even if the model called it benign. The badge text and the sort
+order (malicious first, then flagged, then benign) both follow your label once one is set.
+
 Generate it from whatever the database already holds:
 
 ```bash
