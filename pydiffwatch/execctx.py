@@ -389,7 +389,7 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
     pths = [_pth(p, b) for p, b in sorted(new_files.items()) if p.endswith(".pth")]
     pths += [f"unknown ({p} too large to scan)" for p in sorted(too_large) if p.endswith(".pth")]
     startup = ("startup (.pth files; an `import` line runs at every interpreter start if the file is installed "
-               f"into site-packages): {_join(pths)}")
+               f"into site-packages): {_join(pths, none)}")      # setup.py may write a .pth at build
 
     # import
     def declared(setup_name, st_name, cfg_name):
@@ -397,20 +397,20 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
         if v == COMPUTED:
             return COMPUTED
         if (s := _strs(v)) is not None:
-            return _join(s)
+            return _join(s, none)
         v = st.get(st_name)
         if isinstance(v, dict):                      # [tool.setuptools.packages.find]
             return None
         if (s := _strs(v)) is not None:
-            return _join(s)
+            return _join(s, none)
         v = options.get(cfg_name, "").strip()
         if d := _cfg_directive(v, st_name):
             return d
-        return None if not v or v.startswith("find") else _join(_cfg_list(v))
+        return None if not v or v.startswith("find") else _join(_cfg_list(v), none)
 
     src_unknown = unknown("pyproject.toml", "setup.py", "setup.cfg")
     pkgs = declared("packages", "packages", "packages") or ", ".join(
-        src_unknown + [f"auto-discovered: {_join(_discovered(new_files))}"])
+        src_unknown + [f"auto-discovered: {_join(_discovered(new_files), none)}"])
     mods = declared("py_modules", "py-modules", "py_modules") or _join(src_unknown, none)
     tops = [ln for p in _egg_info(new_files, "top_level.txt")
             for ln in new_files[p].decode("utf-8", errors="replace").split()]

@@ -586,3 +586,24 @@ def test_an_oversized_egg_info_entry_points_txt_is_unknown():
     u = "unknown (a.egg-info/entry_points.txt too large)"
     assert _line(ctx, "commands").endswith(f": {u}") and _line(ctx, "plugins").endswith(f": {u}")
     assert "cmdclass=none" in ctx                       # entry_points.txt declares only entry points
+
+
+# ---- fix round 4: no bare "none" left while setup.py exists ----
+
+def test_with_setup_py_auto_discovery_and_startup_are_never_a_bare_none():
+    ctx = execctx.build({"setup.py": b"from setuptools import setup\nsetup(name='a')\n"})
+    assert f"packages=auto-discovered: {NOT_LITERAL}" in ctx
+    assert _line(ctx, "startup").endswith(f": {NOT_LITERAL}")
+
+
+@pytest.mark.parametrize("src, field", [
+    ("import setuptools\nsetuptools.setup(packages=[])\n", "packages"),
+    ("import setuptools\nexec('...')\nsetuptools.setup(py_modules=[])\n", "py-modules"),
+])
+def test_with_setup_py_a_literal_empty_list_is_never_a_bare_none(src, field):
+    assert f"{field}={NOT_LITERAL}" in execctx.build({"setup.py": src.encode()})
+
+
+def test_without_setup_py_empty_discovery_and_startup_stay_none():
+    ctx = execctx.build({"pyproject.toml": b"[project]\nname = 'a'\n"})
+    assert "packages=auto-discovered: none;" in ctx and _line(ctx, "startup").endswith(": none")
