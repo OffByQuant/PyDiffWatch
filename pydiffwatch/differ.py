@@ -1,4 +1,5 @@
 import difflib
+from . import execctx
 from .models import ArtifactSet, Diff, FileDiff, Hunk
 
 def _lines(b: bytes) -> list[str]:
@@ -25,4 +26,5 @@ def build_diff(a: ArtifactSet) -> Diff:
             new_text = new.decode("utf-8", errors="replace") if new is not None else None
             changed.append(FileDiff(path, kind, hunks, new_text))
     return Diff(a.package, a.version, a.prior_version is None, changed,
-                list(a.added_binaries), list(a.added_dep_findings), _description(a.description))
+                list(a.added_binaries), list(a.added_dep_findings), _description(a.description),
+                execctx.build(a.new_files))

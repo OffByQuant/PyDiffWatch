@@ -36,6 +36,7 @@ class Diff:
     changed: list[FileDiff]; added_binaries: list[dict]
     added_dep_findings: list[dict] = field(default_factory=list)   # signal 5: suspicious added deps
     description: str = ""          # the new version's info.summary, one line: the author's claim, context only
+    exec_context: str = ""         # how the new version's files run (build, startup, import, commands, plugins)
 
 @dataclass(frozen=True)
 class FiredRule:

@@ -94,8 +94,14 @@ crypto wallets — AND sends them off the machine (any host, including the packa
 - REMOTE CODE EXECUTION: downloads code and executes it, or decodes/deobfuscates a payload and executes it.
 - DESTRUCTION OR PERSISTENCE: deletes or encrypts user files, or installs itself to run outside its own \
 invocation (shell profiles, cron, other tools' hooks) without being asked to.
-- Any of the above in code that runs at install time (setup.py, a custom pyproject build backend, a .pth \
-file) is also install-hook-rce or build-backend-rce.
+- Any of the above in code that runs at build or install time (setup.py, a custom pyproject build backend) \
+or in a .pth import line, which runs at every interpreter start once installed, is also install-hook-rce or \
+build-backend-rce.
+HOW FILES RUN. A file runs at build or install only if it is setup.py, the declared or in-tree build backend \
+listed in the execution context, or code they import. A .pth import line runs at every interpreter start once \
+installed. __init__.py and top-level modules run on import. A console script runs only when the user types \
+it. A plugin entry point runs whenever its host tool loads plugins; treat that as automatic. A setup command \
+the user runs on purpose is not persistence "without being asked".
 Without concrete evidence of one of these in the shown code, the verdict is "benign", even when the code \
 uses powerful primitives (subprocess, exec/eval, network, file writes). Use "suspicious" only when the shown \
 code points at one of these but a needed piece is not shown (for example it fetches and runs a payload \
@@ -158,6 +164,8 @@ def _rank_files(diff, triage):
 
 _DESC_HEADING = "--- package description (the author's claim; context, not evidence) ---"
 _LOC_HEADING = "flagged_locations:"
+_EXEC_HEADING = ("--- execution context (from pyproject/setup.cfg/setup.py/entry_points.txt/.pth; "
+                 "how this version's files run) ---")
 
 
 def _one_line(s: str) -> str:
@@ -204,7 +212,11 @@ def build_review_input(diff, triage, *, max_chars: int, dropped: list | None = N
     # info.summary is author-written: it goes inside the markers, flattened to one line by the differ.
     desc = getattr(diff, "description", "")
     desc_text = f"{_DESC_HEADING}\n  {desc}" if desc else ""
-    body_parts = [t for t in (loc_text, desc_text) if t]
+    # Built by execctx from author-written metadata: fenced, and each line indented and escaped to one line so
+    # none can pose as a file heading (dropped_from_text) or be taken for code (_has_reviewable_content).
+    ctx = getattr(diff, "exec_context", "")
+    exec_text = f"{_EXEC_HEADING}\n" + "\n".join("  " + _one_line(x) for x in ctx.split("\n")) if ctx else ""
+    body_parts = [t for t in (loc_text, desc_text, exec_text) if t]
     used, truncated = len(header) + len(marker) + len(TRUNCATION_NOTE) + len("\n".join(body_parts)), False
     rendered_paths = []
     for path in ranked_paths:
@@ -315,12 +327,18 @@ def refresh_marker(review_input: str) -> str:
 
 def _has_reviewable_content(review_input: str) -> bool:
     """True if any file content was rendered between the injection markers. The flagged-locations line
-    (where triage looked) and the description (the author's claim) are not content."""
+    (where triage looked), the description (the author's claim) and the execution context (how files run)
+    are not content."""
     body = review_input.split(_marker_of(review_input), 3)[2].lstrip()
     if body.startswith(_LOC_HEADING):                # one line, control characters escaped
         body = body.split("\n", 1)[1].lstrip() if "\n" in body else ""
     if body.startswith(_DESC_HEADING):               # heading line + one flattened description line
         body = body.split("\n", 2)[2] if body.count("\n") >= 2 else ""
+    if body.lstrip().startswith(_EXEC_HEADING):      # heading line + indented context lines
+        rest = body.lstrip().split("\n")[1:]
+        while rest and rest[0].startswith("  "):
+            rest.pop(0)
+        body = "\n".join(rest)
     return bool(body.strip())
 
 
