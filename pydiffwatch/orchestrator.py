@@ -654,10 +654,16 @@ def review_pending(cfg: Config, reasons=None, limit=None):
         conn.close()
 
 
+def _retry_backlog(conn) -> dict:
+    """Releases retrying a failed download/scan and given up on, and how long ago the oldest retrying one was
+    first seen (e.g. '3 hours ago'; None when nothing is retrying)."""
+    return {**store.metadata_retry_counts(conn), "oldest_retrying_age": _poll_age(store.oldest_retrying_at(conn))[0]}
+
+
 def metadata_retry_counts(cfg: Config) -> dict:
     conn = store.connect(cfg); store.init_schema(conn)
     try:
-        return store.metadata_retry_counts(conn)
+        return _retry_backlog(conn)
     finally:
         conn.close()
 
@@ -871,6 +877,7 @@ def export_dashboard(cfg: Config, out_path=None, generated_at: str = ""):
         cur = store.get_cursor(conn)
         releases_total = store.count_releases(conn)
         pending_review = store.pending_review_counts(conn)
+        retry = _retry_backlog(conn)
     finally:
         conn.close()
     reachable, reviewer_label = _probe_reviewer(cfg)
@@ -881,7 +888,7 @@ def export_dashboard(cfg: Config, out_path=None, generated_at: str = ""):
         "releases_total": releases_total, "verdicts_total": len(rows),
         "flagged_total": sum(1 for r in rows if dashboard.is_flagged(r)),
         "reviewer": reviewer_label, "model_reachable": reachable, "pending_review": pending_review,
-        "guard": guard_status(cfg),
+        "guard": guard_status(cfg), "retry": retry,
     }
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(dashboard.render_dashboard(rows, status=status, generated_at=generated_at))

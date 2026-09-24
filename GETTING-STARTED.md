@@ -231,7 +231,10 @@ later ticks without holding up the releases after it; after 4 attempts it become
 in `pending`, with the error kept on the release row (`fetch_note`). Each retry attempt gets that many
 times `fetch_deadline_s`/`packument_deadline_s` (attempt 2 gets 240s/600s, attempt 3 360s/900s, ...), and a
 pre-ingest sweep re-fetches releases due for retry, most-tried first, before a time budget of its own
-(`packument_deadline_s`) runs out — the rest wait for the next tick. If the
+(`packument_deadline_s`) runs out — the rest wait for the next tick. `pending` and the dashboard's status
+strip show that backlog: `N release(s) being retried (oldest first seen <age>), M given up on` in `pending`,
+`N scan(s) retrying (oldest first seen <age>) · M scan(s) given up` on the dashboard. A retry backlog
+whose oldest row keeps getting older means PyPI (or your network) keeps failing it. If the
 release's *prior* version fails to download, it's diffed against nothing (every file in the new release
 reported as added) rather than skipped, and the release's evidence says so. Within a diff, an
 oversized/binary/foreign-language file only counts as a signal when this release adds or changes it — an
@@ -397,7 +400,8 @@ scans back-to-back and sleeps only once it has caught up. `--model` / `--endpoin
 
 `--interval N` sets the seconds between scans once caught up (default 300); `--out`/`--port` work as above. A failed scan
 (network blip, endpoint down) is logged and the daemon keeps going; Ctrl-C stops cleanly. The dashboard's
-status strip shows whether your model endpoint is reachable and how long ago the last scan ran — start your
+status strip shows whether your model endpoint is reachable, how long ago the last scan ran, and the
+review and retry backlogs — start your
 model server (§2) before `watch --serve`, or reviews fall back to heuristics until it's up.
 
 It is a **foreground** process — keep the terminal open, or run it under your agent harness, which will run
@@ -520,7 +524,7 @@ jobs:
 
 ## 8. State, persistence & containment
 
-All state lives under `.diffwatch/` (paths configurable via `db_path`, `cache_dir`, `lock_path`):
+All state lives under `.diffwatch/` (paths configurable via `db_path`, `lock_path`):
 
 - `diffwatch.sqlite` — the cursor, every processed release, verdicts, alerts, and stored payload evidence.
 - `diffwatch.lock` — an exclusive `flock` that prevents overlapping `run`s.

@@ -173,6 +173,14 @@ def _status_strip(status: dict) -> str:
     pending = status.get("pending_review") or {}
     pending_txt = (f"{sum(pending.values())} pending LLM review ("
                    + ", ".join(f"{k}: {v}" for k, v in sorted(pending.items())) + ")") if pending else ""
+    retry = status.get("retry") or {}
+    backlog = []
+    if retry.get("retrying"):
+        age = retry.get("oldest_retrying_age")
+        backlog.append(f"{int(retry['retrying'])} scan(s) retrying" + (f" (oldest first seen {age})" if age else ""))
+    if retry.get("gave_up"):
+        backlog.append(f"{int(retry['gave_up'])} scan(s) given up")
+    retry_txt = " · ".join(backlog)
     from .guard import describe
     g = status.get("guard")
     guard_txt = describe(g) if g else ""
@@ -181,7 +189,7 @@ def _status_strip(status: dict) -> str:
   <span class="stat">last poll: {e(age)}</span>
   <span class="stat">cursor: {e(serial_txt)}</span>
   <span class="stat">{int(status.get('releases_total') or 0)} releases · {int(status.get('verdicts_total') or 0)} reviewed · {int(status.get('flagged_total') or 0)} flagged</span>
-{f'  <span class="stat">{e(pending_txt)}</span>' + chr(10) if pending_txt else ''}{f'  <span class="stat">{e(guard_txt)}</span>' + chr(10) if guard_txt else ''}</div>"""
+{f'  <span class="stat">{e(pending_txt)}</span>' + chr(10) if pending_txt else ''}{f'  <span class="stat">{e(retry_txt)}</span>' + chr(10) if retry_txt else ''}{f'  <span class="stat">{e(guard_txt)}</span>' + chr(10) if guard_txt else ''}</div>"""
 
 
 def render_dashboard(rows, status: dict = None, generated_at: str = "") -> str:

@@ -82,7 +82,7 @@ def test_a_repeated_5xx_gives_up_after_4_attempts_without_pinning_the_cursor(tmp
     assert store.metadata_retry_counts(conn) == {"retrying": 0, "gave_up": 1}
     orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
     assert calls.count("flaky") == 4                         # given up: not fetched again
-    assert orchestrator.metadata_retry_counts(tmp_cfg) == {"retrying": 0, "gave_up": 1}
+    assert orchestrator.metadata_retry_counts(tmp_cfg) == {"retrying": 0, "gave_up": 1, "oldest_retrying_age": None}
 
 
 def test_a_retried_release_is_scanned_once_metadata_comes_back(tmp_cfg, monkeypatch):
@@ -313,3 +313,34 @@ def test_each_retry_gets_a_longer_deadline_and_logs_its_attempt(tmp_cfg, monkeyp
     msgs = [r.getMessage() for r in caplog.records if "slow==1.0" in r.getMessage()]
     assert "(TimeoutError: download took too long); will retry next tick (attempt 1 of 4)" in msgs[0]
     assert "attempt 3 of 4" in msgs[2] and "giving up after 4 attempts" in msgs[3]
+
+
+def _backlog(conn):
+    import datetime
+    old = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=3, minutes=5)).isoformat()
+    for i, stage in enumerate(("metadata_retry", "metadata_retry", "gave_up")):
+        rid = store.record_release(conn, f"p{i}", "1.0", i, False, None, "sdist")
+        store.update_stage(conn, rid, stage)
+    conn.execute("UPDATE releases SET processed_at=? WHERE package='p0'", (old,)); conn.commit()
+
+
+def test_pending_shows_the_age_of_the_oldest_retrying_release(tmp_cfg, monkeypatch, capsys):
+    from pydiffwatch import __main__ as cli
+    conn = store.connect(tmp_cfg); store.init_schema(conn)
+    _backlog(conn)
+    monkeypatch.setattr(cli, "_cfg", lambda args: tmp_cfg)
+    monkeypatch.setattr(cli.egress, "install_guard", lambda cfg: None)
+    monkeypatch.setattr(sys, "argv", ["pydiffwatch", "pending"])
+    cli.main()
+    out = capsys.readouterr().out
+    assert "2 release(s) being retried (oldest first seen 3 hours ago)" in out and "1 given up on" in out
+
+
+def test_the_dashboard_status_strip_shows_the_retry_backlog(tmp_cfg):
+    conn = store.connect(tmp_cfg); store.init_schema(conn)
+    _backlog(conn)
+    html = orchestrator.export_dashboard(tmp_cfg).read_text()
+    assert "2 scan(s) retrying (oldest first seen 3 hours ago) · 1 scan(s) given up" in html
+    store.update_stage(conn, 1, "gave_up"); store.update_stage(conn, 2, "gave_up")
+    html = orchestrator.export_dashboard(tmp_cfg).read_text()
+    assert "retrying" not in html and "3 scan(s) given up" in html

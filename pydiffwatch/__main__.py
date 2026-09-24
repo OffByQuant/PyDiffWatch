@@ -143,7 +143,8 @@ def main():
             print(f"[pydiffwatch] reviewer: {describe(gs)}")
         mr = metadata_retry_counts(cfg)
         if mr["retrying"] or mr["gave_up"]:
-            print(f"[pydiffwatch] failed to download or scan: {mr['retrying']} release(s) being retried, "
+            oldest = f" (oldest first seen {mr['oldest_retrying_age']})" if mr["oldest_retrying_age"] else ""
+            print(f"[pydiffwatch] failed to download or scan: {mr['retrying']} release(s) being retried{oldest}, "
                   f"{mr['gave_up']} given up on after {store.METADATA_ATTEMPTS} attempts (not scanned)")
         queued = pending_review_counts(cfg)
         if queued:

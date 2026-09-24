@@ -343,6 +343,10 @@ def metadata_retry_counts(conn) -> dict:
                      "FROM releases").fetchone()
     return {"retrying": r[0], "gave_up": r[1]}
 
+def oldest_retrying_at(conn):
+    """When the longest-waiting release in metadata_retry was first seen (ISO time), or None."""
+    return conn.execute("SELECT MIN(processed_at) FROM releases WHERE stage='metadata_retry'").fetchone()[0]
+
 def get_reviewer_stats(conn, endpoint, model):
     row = conn.execute("SELECT tok_s, chars_per_token, samples, state, detail, paused_until, slow_streak "
                        "FROM reviewer_stats WHERE endpoint=? AND model=?", (endpoint, model)).fetchone()
