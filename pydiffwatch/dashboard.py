@@ -81,6 +81,12 @@ def _card(row: dict) -> str:
     reason_html = f'<div class="reason">{e(reasoning)}</div>' if reasoning else ""
     cited_html = (f'<div class="cited"><span class="k">cited</span> {e(cited)}</div>'
                   if cited else "")
+    human_html = ""
+    if human:
+        note = row.get("human_note") or ""
+        model_cls = (row.get("classification") or "?").lower()
+        human_html = (f'<div class="human">your verdict: {e(human)}{" — " + e(note) if note else ""}'
+                      f'{f" · model said {e(model_cls)}" if model_cls != human.lower() else ""}</div>')
     triage = row.get("triage_score")
     triage_html = (f'<span class="k">triage</span><span class="v">{int(triage)}</span>'
                    if triage is not None else "")
@@ -95,6 +101,7 @@ def _card(row: dict) -> str:
     {attack_html}
     <span class="k">model</span><span class="v">{e(row.get('model') or '?')}</span>
   </div>
+  {human_html}
   {reason_html}
   {cited_html}
   <div class="actions">{''.join(actions)}</div>
@@ -120,6 +127,7 @@ h1{font-size:24px;letter-spacing:-.3px}.sub{color:var(--muted);margin:6px 0 28px
 .meta .k{color:var(--muted);text-transform:uppercase;letter-spacing:.5px;font-size:11px}
 .meta .v{font-family:var(--mono);margin-right:8px}
 .reason{background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:12px 14px;font-size:14px;line-height:1.55;color:#c9d1d9}
+.human{margin-bottom:10px;font-size:13px;color:var(--ink);font-weight:600}
 .cited{margin-top:8px;font-size:12.5px;color:var(--muted);font-family:var(--mono)}
 .actions{display:flex;gap:10px;margin-top:14px}
 .btn{font-size:13px;font-weight:600;text-decoration:none;padding:8px 14px;border-radius:8px;border:1px solid var(--line);color:var(--ink)}

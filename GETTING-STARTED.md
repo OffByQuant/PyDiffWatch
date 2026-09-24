@@ -354,7 +354,9 @@ model's, for that card: a human `benign` clears the flag for good — no highlig
 button, and it drops out of the flagged count in the status strip — even if the model called it
 malicious or suspicious. Conversely, a human `malicious` or `suspicious` label keeps the card flagged
 (highlighted, with the report button) even if the model called it benign. The badge text and the sort
-order (malicious first, then flagged, then benign) both follow your label once one is set.
+order (malicious first, then flagged, then benign) both follow your label once one is set. The card also
+reads `your verdict: <label> — <your note> · model said <classification>` (the note and the model's call
+only when there is one, and only when it differs from yours).
 
 Generate it from whatever the database already holds:
 

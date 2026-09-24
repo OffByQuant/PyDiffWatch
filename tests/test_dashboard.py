@@ -167,3 +167,23 @@ def test_rank_uses_the_human_label_like_the_badge_and_the_flagged_count(tmp_path
     out = dashboard.render_dashboard(rows, status={"flagged_total": sum(map(dashboard.is_flagged, rows))})
     assert out.index("caught") < out.index("queued") < out.index("cleared")
     assert "2 flagged for review" in out and "2 flagged</span>" in out
+
+
+def test_a_labelled_card_shows_your_verdict_your_note_and_what_the_model_said(tmp_path):
+    # npm #24: "your verdict: X — <note> · model said Y", the note escaped like every other untrusted string.
+    cfg = Config(db_path=tmp_path / "db.sqlite", lock_path=tmp_path / "l", reviewer_enabled=False)
+    conn = store.connect(cfg); store.init_schema(conn)
+    rid = store.record_release(conn, "caught", "1.0", 1, False, None, "sdist")
+    store.record_verdict(conn, rid, Verdict("caught", "1.0", "benign", 60.0, [], False, model="m"))
+    store.adjudicate(conn, rid, "malicious", "curl|sh in setup.py <script>")
+    out = orchestrator.export_dashboard(cfg).read_text()
+    assert "your verdict: malicious — curl|sh in setup.py &lt;script&gt; · model said benign" in out
+    assert "<script>" not in out
+
+
+def test_a_card_without_a_note_or_a_disagreement_keeps_the_line_short():
+    out = dashboard.render_dashboard([{"package": "p", "version": "1", "classification": "malicious",
+                                       "human_label": "malicious"}])
+    assert "your verdict: malicious</div>" in out
+    assert "your verdict" not in dashboard.render_dashboard([{"package": "p", "version": "1",
+                                                              "classification": "malicious"}])
