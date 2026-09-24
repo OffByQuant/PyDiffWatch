@@ -142,3 +142,43 @@ def test_the_block_floor_fits_the_largest_signals_block_with_every_cut_line_mark
         block = reviewer._render_block(heading, "\n".join("q" * 500 for _ in range(n)), reviewer._BLOCK_MIN_CHARS)
         assert len(block) <= reviewer._BLOCK_MIN_CHARS
         assert all(ln.startswith("  ") and ln.endswith(reviewer._EXEC_TRUNCATED) for ln in block.split("\n")[1:])
+
+
+# --- residual R1: the text stored with InputTooLarge always contains the top file -----------------------------------
+
+def _big_blocks_diff(hunk_chars):
+    n = max(1, hunk_chars // 100)
+    h = Hunk((0, 0), (0, n), [f"exec(x)  # {i:05d} " + "y" * 82 for i in range(n)], [])
+    d = Diff("p", "1.1", False, [FileDiff("a.py", "modified", [h])], [],
+             exec_context="\n".join("e" * 2_000 for _ in range(10)), signals="\n".join("s" * 2_000 for _ in range(20)))
+    return d, TriageResult(40.0, [FiredRule("r", 40.0, "a.py", (1, n))], True)
+
+
+def _too_large(d, tr, cap):
+    from pydiffwatch.config import Config, ReviewerConfig
+    rvw = reviewer.Reviewer(Config(reviewer=ReviewerConfig(max_input_chars=cap)), backend=object())
+    with pytest.raises(reviewer.InputTooLarge) as e:
+        rvw.prepare(d, tr)
+    return e.value
+
+
+def test_input_too_large_at_12k_with_full_blocks_stores_the_top_file():
+    d, tr = _big_blocks_diff(10_000)
+    e = _too_large(d, tr, 12_000)
+    assert reviewer._has_reviewable_content(e.text) and "--- file: a.py (modified) ---" in e.text
+    assert len(e.text) <= e.needed and reviewer.dropped_from_text(tr.fired_rules, e.text) == []
+
+
+@pytest.mark.parametrize("cap", [8_000, 12_000, 16_000, 24_000])
+@pytest.mark.parametrize("hunk", [5_000, 10_000, 20_000, 30_000])
+def test_input_too_large_sweep_always_stores_reviewable_text(cap, hunk):
+    d, tr = _big_blocks_diff(hunk)
+    from pydiffwatch.config import Config, ReviewerConfig
+    rvw = reviewer.Reviewer(Config(reviewer=ReviewerConfig(max_input_chars=cap)), backend=object())
+    try:
+        rvw.prepare(d, tr)
+        return                                           # it fit at this cap: nothing is stored
+    except reviewer.InputTooLarge as e:
+        assert reviewer._has_reviewable_content(e.text), (cap, hunk, e.needed, len(e.text))
+        assert "--- file: a.py (modified) ---" in e.text and len(e.text) <= e.needed
+        assert reviewer.dropped_from_text(tr.fired_rules, e.text) == []

@@ -315,7 +315,12 @@ def _render_block(heading: str, ctx: str, cap: int) -> str:
     return f"{heading}\n" + "\n".join(out)
 
 
-def build_review_input(diff, triage, *, max_chars: int, dropped: list | None = None) -> str:
+def _block_cap(max_chars: int) -> int:
+    return max(_BLOCK_MIN_CHARS, max_chars // 8)
+
+
+def build_review_input(diff, triage, *, max_chars: int, dropped: list | None = None,
+                       block_cap: int | None = None) -> str:
     """Assemble the user-message text for the reviewer. Pure and deterministic.
 
     Selection (§7): files containing >=1 fired rule, ranked by summed contributed weight;
@@ -327,6 +332,9 @@ def build_review_input(diff, triage, *, max_chars: int, dropped: list | None = N
     files that carried fired-rule weight > 0 but were not rendered — either cut by the char cap
     or, for a first release, past the top-40 cutoff. Weight-0 files that are simply never
     candidates (the normal "only flagged files are shown" filtering) are not reported.
+
+    `block_cap` pins the context-block cap (default: scaled from max_chars), so InputTooLarge can rebuild at a
+    larger `needed` with the blocks at the size `needed` was measured with.
     """
     marker = _new_marker()
     ranked_paths, by_path = _rank_files(diff, triage)
@@ -364,7 +372,7 @@ def build_review_input(diff, triage, *, max_chars: int, dropped: list | None = N
     # Built by execctx from author-written metadata: fenced, and each line indented and escaped to one line so
     # none can pose as a file heading (dropped_from_text) or be taken for code (_has_reviewable_content).
     ctx = getattr(diff, "exec_context", "")
-    block_cap = max(_BLOCK_MIN_CHARS, max_chars // 8)
+    block_cap = block_cap if block_cap is not None else _block_cap(max_chars)
     exec_text = _render_block(_EXEC_HEADING, ctx, min(_EXEC_MAX_CHARS, block_cap)) if ctx else ""
     # Dependency / binary / ownership signals (B2): context the model can weigh, never content on its own.
     sig = getattr(diff, "signals", "")
@@ -474,7 +482,8 @@ def build_evidence(diff, triage, *, max_chars: int) -> str:
 
 class InputTooLarge(Exception):
     """The highest-risk file alone exceeds reviewer.max_input_chars. `text` is the review input built
-    with a cap of `needed`, so a larger-context model can review it later without re-fetching."""
+    with a cap of `needed` (context blocks kept at the size they had at `cap`), so it holds the top file and a
+    larger-context model can review it later without re-fetching."""
     def __init__(self, needed: int, cap: int, text: str):
         super().__init__(f"needs {needed} chars, cap {cap}")
         self.needed, self.cap, self.text = needed, cap, text
@@ -540,7 +549,10 @@ class Reviewer:
             top = len(_render_file(by_path[ranked_paths[0]], whole=False))   # the smallest render that fits
             if top:
                 needed = len(text) + _NOTE_RESERVE + top + 1
-                raise InputTooLarge(needed, cap, build_review_input(diff, triage, max_chars=needed))
+                # Blocks pinned at the size `needed` was measured with: scaled to `needed` they would grow and
+                # crowd the top file out again, and the stored text would hold nothing to review.
+                raise InputTooLarge(needed, cap, build_review_input(diff, triage, max_chars=needed,
+                                                                    block_cap=_block_cap(cap)))
         return text
 
     def review(self, diff, triage, *, attempt: int = 1) -> Verdict:
