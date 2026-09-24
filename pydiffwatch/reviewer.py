@@ -162,13 +162,18 @@ def _one_line(s: str) -> str:
     return "".join(c if c.isprintable() else repr(c)[1:-1] for c in s)
 
 
-def build_review_input(diff, triage, *, max_chars: int) -> str:
+def build_review_input(diff, triage, *, max_chars: int, dropped: list | None = None) -> str:
     """Assemble the user-message text for the reviewer. Pure and deterministic.
 
     Selection (§7): files containing >=1 fired rule, ranked by summed contributed weight;
     first releases rank all changed files by per-file score and keep the top 40. The selected
     file diffs are wrapped in injection delimiters; fired rules + score + is_first_release are
     surfaced as metadata. Over max_chars -> drop lowest-ranked files and append TRUNCATION_NOTE.
+
+    When `dropped` is passed, it is extended (highest-weight first) with the paths of changed
+    files that carried fired-rule weight > 0 but were not rendered — either cut by the char cap
+    or, for a first release, past the top-40 cutoff. Weight-0 files that are simply never
+    candidates (the normal "only flagged files are shown" filtering) are not reported.
     """
     marker = _new_marker()
     ranked_paths, by_path = _rank_files(diff, triage)
@@ -198,6 +203,7 @@ def build_review_input(diff, triage, *, max_chars: int) -> str:
     desc_text = f"{_DESC_HEADING}\n  {desc}" if desc else ""
     body_parts = [t for t in (loc_text, desc_text) if t]
     used, truncated = len(header) + len(marker) + len(TRUNCATION_NOTE) + len("\n".join(body_parts)), False
+    rendered_paths = []
     for path in ranked_paths:
         rendered = _render_file(by_path[path])
         if used + len(rendered) + 1 > max_chars:
@@ -205,10 +211,16 @@ def build_review_input(diff, triage, *, max_chars: int) -> str:
             break
         body_parts.append(rendered)
         used += len(rendered) + 1
+        rendered_paths.append(path)
 
     text = header + "\n".join(body_parts) + f"\n{marker}"
     if truncated or len(ranked_paths) != len([fd for fd in diff.changed]):
         text += TRUNCATION_NOTE
+    if dropped is not None:
+        weights = _file_weights(triage)
+        rendered_set = set(rendered_paths)
+        dropped.extend(sorted((p for p in by_path if p not in rendered_set and weights.get(p, 0.0) > 0.0),
+                              key=lambda p: -weights[p]))
     return text
 
 
@@ -294,9 +306,14 @@ class Reviewer:
 
     def prepare(self, diff, triage, cap=None) -> str:
         """Build the review input, or raise InputTooLarge if the highest-risk file can't fit in `cap`
-        (default: max_input_chars; the guard passes the endpoint's measured cap)."""
+        (default: max_input_chars; the guard passes the endpoint's measured cap).
+
+        Also stashes `self.dropped_files`: the weighted files the cap dropped from this build (see
+        build_review_input), so a benign verdict on this text can be told apart from a full review
+        (spec U2) without changing this method's return type."""
         cap = cap if cap is not None else self.cfg.reviewer.max_input_chars
-        text = build_review_input(diff, triage, max_chars=cap)
+        self.dropped_files = []
+        text = build_review_input(diff, triage, max_chars=cap, dropped=self.dropped_files)
         ranked_paths, by_path = _rank_files(diff, triage)
         if not _has_reviewable_content(text) and ranked_paths:
             top = len(_render_file(by_path[ranked_paths[0]]))

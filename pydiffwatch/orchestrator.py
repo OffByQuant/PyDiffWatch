@@ -60,8 +60,22 @@ def _review_slot(cfg):
 
 
 
-def _record(cfg, conn, rid, verdict, score):
+def _clip_files(paths, limit=300) -> str:
+    text = ", ".join(paths)
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def _record(cfg, conn, rid, verdict, score, dropped=()):
     store.clear_pending(conn, rid)
+    # spec U2: a benign verdict is not final when the input cap dropped a file that carried fired-rule
+    # weight — the model never saw it, so route to adjudication instead of saving silently.
+    if verdict.classification == "benign" and dropped:
+        v = dataclasses.replace(verdict, reasoning=f"reviewed partially: {_clip_files(dropped)} not shown")
+        store.record_verdict(conn, rid, v)
+        store.update_stage(conn, rid, "needs_adjudication", score, None)  # -> `pydiffwatch pending`
+        notifier.emit(cfg, conn, dataclasses.replace(v, classification="suspicious-heuristic"), rid,
+                     dedupe_suffix="partial-review")                      # one alert; a person looks at it
+        return
     store.record_verdict(conn, rid, verdict)
     # Route by the model's classification. A `suspicious` verdict is queued for human adjudication — it
     # is NOT alerted. benign is saved silently; malicious (or any unexpected class) alerts immediately.
@@ -75,10 +89,13 @@ def _record(cfg, conn, rid, verdict, score):
         store.update_stage(conn, rid, "reviewed", score, None)
 
 
-def _attempt_review(cfg, conn, rvw, rid, package, version, score, fired_rules, text, guard=None) -> bool:
+def _attempt_review(cfg, conn, rvw, rid, package, version, score, fired_rules, text, guard=None,
+                    dropped=()) -> bool:
     """One review attempt; on failure the release is (re)parked with the reason. Returns False when no more
     reviews should be sent now (endpoint unreachable, guard deferring, or the guard's breaker just opened),
-    so a drain stops instead of hammering the server."""
+    so a drain stops instead of hammering the server. `dropped`: weighted files this text's cap dropped
+    (spec U2), carried through to _record — empty for a re-drained parked row, whose original prepare()
+    call is gone."""
     if guard is not None:
         why = guard.admit()
         if why:
@@ -111,7 +128,7 @@ def _attempt_review(cfg, conn, rvw, rid, package, version, score, fired_rules, t
         # prompt_tokens cover the system prompt as well as the package content, so the chars must too.
         guard.record_success(getattr(rvw.backend, "last_usage", None), time.monotonic() - t0,
                              len(reviewer.SYSTEM_PROMPT) + len(text))
-    _record(cfg, conn, rid, verdict, score)
+    _record(cfg, conn, rid, verdict, score, dropped=dropped)
     return True
 
 
@@ -128,10 +145,12 @@ def _review_escalated(cfg, conn, rvw, d, tr, rid, *, offline=False, guard=None):
         _park_too_large(cfg, conn, rid, d.package, d.version, tr.score, tr.fired_rules, detail, e.text)
         return      # its one alert is the unscanned one, with the score and rules
     else:
+        dropped = getattr(rvw, "dropped_files", ())   # spec U2: weighted files prepare()'s cap dropped
         if offline:
             store.park_for_review(conn, rid, "endpoint_unreachable", "reviewer endpoint unreachable", text)
         else:
-            _attempt_review(cfg, conn, rvw, rid, d.package, d.version, tr.score, tr.fired_rules, text, guard)
+            _attempt_review(cfg, conn, rvw, rid, d.package, d.version, tr.score, tr.fired_rules, text, guard,
+                            dropped=dropped)
     if store.get_stage(conn, d.package, d.version) == "pending_review":
         # Not reviewed yet: alert on the heuristic now rather than wait for the queue to drain.
         notifier.emit(cfg, conn, Verdict(d.package, d.version, "suspicious-heuristic",
