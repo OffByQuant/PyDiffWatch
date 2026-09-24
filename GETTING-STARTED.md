@@ -228,7 +228,10 @@ was pulled before it could be scanned — that's terminal (`metadata_gone`) and 
 release PyPI itself removed fast is worth a look. Any other failure on a release (a metadata timeout, 5xx
 or malformed JSON, a failed or timed-out sdist download, an error while diffing or scoring it) retries on
 later ticks without holding up the releases after it; after 4 attempts it becomes `gave_up` and shows up
-in `pending`, with the error kept on the release row (`fetch_note`). If the
+in `pending`, with the error kept on the release row (`fetch_note`). Each retry attempt gets that many
+times `fetch_deadline_s`/`packument_deadline_s` (attempt 2 gets 240s/600s, attempt 3 360s/900s, ...), and a
+pre-ingest sweep re-fetches releases due for retry, most-tried first, before a time budget of its own
+(`packument_deadline_s`) runs out — the rest wait for the next tick. If the
 release's *prior* version fails to download, it's diffed against nothing (every file in the new release
 reported as added) rather than skipped, and the release's evidence says so. Within a diff, an
 oversized/binary/foreign-language file only counts as a signal when this release adds or changes it — an
@@ -246,7 +249,8 @@ pydiffwatch -c pydiffwatch.toml evidence <id>                # print the stored 
 prints the payload code captured **at detection time** and stored in the DB, so it survives the package
 later being pulled from PyPI. A release pydiffwatch **refused** to download or unpack (over-size, a
 malformed archive) is never scanned, so it can't get a model verdict either — it lands in `pending` too,
-with an `UNREVIEWED` note explaining what was refused and why, for you to inspect by hand. To backfill
+labelled `(not scanned: <stage>)` with an `UNREVIEWED` note explaining what happened and why, for you to
+inspect by hand — see §9 for the full list of unscanned outcomes and their exact wording. To backfill
 evidence for older flagged rows captured before evidence storage existed:
 
 ```bash
@@ -508,7 +512,6 @@ jobs:
 All state lives under `.diffwatch/` (paths configurable via `db_path`, `cache_dir`, `lock_path`):
 
 - `diffwatch.sqlite` — the cursor, every processed release, verdicts, alerts, and stored payload evidence.
-- `artifact_cache/` — downloaded sdists (size-capped, read in memory, never installed).
 - `diffwatch.lock` — an exclusive `flock` that prevents overlapping `run`s.
 
 Persist `.diffwatch/` and you can move PyDiffWatch between machines without losing the cursor or history.
@@ -535,6 +538,36 @@ webhook_url = "https://hooks.slack.com/services/XXX/YYY/ZZZ"
 ```
 
 Alerts are also printed to stdout and recorded (deduped) in the DB, so a webhook failure never loses one.
+
+**Every unscanned outcome alerts once, then waits for you.** A release pydiffwatch could not get a model
+verdict on is never silently dropped: each such outcome fires exactly one `suspicious-heuristic` alert
+(deduped per release + outcome, so a re-tick never repeats it) whose `reasoning` starts `UNREVIEWED:` and
+ends `Not scanned. Needs manual review.` (refusals and `metadata_gone` end differently — see below), and —
+except `metadata_gone`, which alerts only — the release then waits in `pending` labelled
+`(not scanned: <stage>)`:
+
+| Outcome | `pending` label | Alert wording |
+|---|---|---|
+| Refused to download the sdist (over-size or malformed) | `(not scanned: refused_to_fetch)` | `UNREVIEWED: pydiffwatch refused to download it (<reason>: <why>), so nothing in it was scanned. Oversized or malformed archives can hide a payload from scanners. Needs manual review.` |
+| A new release of a project on the quarantine list | `(not scanned: refused_to_fetch)` | `UNREVIEWED: this project is on pydiffwatch's quarantine list (<reason>), so this release was not downloaded. Not scanned. Needs manual review.` |
+| Refused to unpack the sdist (over-size or malformed archive) | `(not scanned: refused_to_extract)` | `UNREVIEWED: pydiffwatch refused to unpack its sdist (<reason>: <why>), so nothing in it was scanned. Oversized or malformed archives can hide a payload from scanners. Needs manual review.` |
+| Metadata 404s before the release could be scanned | *(alert only — not queued; the files are gone)* | `UNREVIEWED: removed from PyPI before it could be scanned (its metadata returns 404); the files are gone, so there is nothing to review.` |
+| Download/scan failed `METADATA_ATTEMPTS` (4) times running | `(not scanned: gave_up)` | `UNREVIEWED: pydiffwatch failed to download or scan it 4 times and gave up (last error: <last error>). Not scanned. Needs manual review.` |
+| Review input exceeds the endpoint's cap | `(not scanned: too_large)` | `` UNREVIEWED: its review input is too large for the model (<detail>); run `review-pending` with a larger-context model. Not scanned. Needs manual review. `` |
+| Review failed `max_review_attempts` (3) times running | `(not scanned: review_failed)` | `` UNREVIEWED: the model failed to review it <n> times (last error: <last error>); retries are used up. Run `review-pending` to try again, e.g. with another model. Not scanned. Needs manual review. `` |
+| A release switches to wheel-only (see §13) after `wheel_only_grace_minutes` | `(not scanned: no_sdist)` | `UNREVIEWED: switched to wheel-only: the previous release <prev> shipped an sdist and this one ships only wheels, which pydiffwatch does not scan. Not scanned. Needs manual review.` |
+
+The refused-to-download/-unpack `<reason>` is one of `decompressed-size`, `members`, `member-name` (a name
+too long **or** containing a control character), `member-size`, `total-size`, `download-size`, or
+`bad-archive: ...`.
+
+**A benign verdict on truncated input is not final.** When the reviewer's input cap drops a file that
+carried fired-rule weight — including a first release with more than 40 weighted (score > 0) files, since
+only the top 40 by weight are ever shown to the model — a `benign` classification is routed to
+adjudication instead of saved silently, with `reviewed partially: <files> not shown` prepended to the
+`reasoning` (and one `suspicious-heuristic` alert). It shows up in `pending` like any other model verdict
+(`model: benign conf=... attack=...`), not as `(not scanned: ...)` — it *was* reviewed, just not on every
+file.
 
 ---
 
@@ -590,3 +623,16 @@ PyDiffWatch reads **sdists** only. A release that ships no sdist for that versio
 has nothing to diff or scan; it's recorded with stage `no_sdist` and skipped, not treated as an error.
 Built-distribution review (inspecting the wheel itself) is on the [roadmap](README.md#-roadmap) but not
 implemented.
+
+A package that has **always** been wheel-only is recorded as `no_sdist` silently — there's no earlier
+sdist release to have lost coverage on. But when a release **switches**, i.e. the package's previous
+release shipped an sdist and this one doesn't, that's worth a warning — except wheels often finish
+uploading before the sdist does, so an immediate check would false-positive on a release that's still
+mid-upload. To cover that, a detected switch waits `wheel_only_grace_minutes` (default 60) and is
+re-checked once that grace period is up. Only if the sdist still hasn't shown up does it warn (the
+`no_sdist` row in §9's table above) and settle into `no_sdist`; if the sdist shows up first, the release
+is scanned normally and no warning fires. Set it in the config file:
+
+```toml
+wheel_only_grace_minutes = 60   # how long a wheel-only switch waits for a late sdist before it warns
+```

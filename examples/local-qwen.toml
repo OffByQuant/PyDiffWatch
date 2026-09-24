@@ -1,6 +1,7 @@
 # Local OpenAI-compatible endpoint (llama-swap / vLLM / LM Studio serving e.g. Qwen). No API key.
 # This is the default profile. Point base_url at your server.
 threshold_t = 40.0
+# wheel_only_grace_minutes = 60   # how long a wheel-only switch waits for a late sdist before it warns
 
 [reviewer]
 provider = "openai"
