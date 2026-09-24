@@ -118,6 +118,25 @@ def test_post_parse_recursion_crash_marks_unparseable_non_init_file():
     assert f.syntax_error is True
 
 
+def test_generated_shape_under_depth_cap_is_not_flagged():
+    # A ~300-term chain (generated-code shape, e.g. a wide string-builder) is well under _MAX_AST_DEPTH
+    # and must not be treated as suspicious on depth alone.
+    src = "x = " + "+".join(["1"] * 300)
+    f = build_facts(_wholefile("pkg/util.py", src)).files[0]
+    assert f.syntax_error is False
+
+
+def test_depth_flag_is_additive_not_a_replacement_for_scanning():
+    # CRITICAL fix: the depth check must never short-circuit the actual extraction. A file with both a
+    # real decode->exec loader AND a deep pad must still report the loader's categories/names -- the
+    # depth flag only adds syntax_error=True, it does not empty out everything else.
+    pad = "+".join(["1"] * 5000)
+    src = f"import base64\npad = {pad}\nexec(base64.b64decode(d))\n"
+    f = build_facts(_wholefile("pkg/util.py", src)).files[0]
+    assert f.syntax_error is True
+    assert "exec" in f.bound_categories and "decode" in f.bound_categories
+
+
 def test_importtime_call_ids_iterative_matches_recursive_on_normal_code():
     # Equivalence check for the iterative rewrite: nested functions, a class, and top-level calls.
     from pydiffwatch.facts import _importtime_call_ids

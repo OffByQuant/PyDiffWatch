@@ -91,3 +91,16 @@ def test_post_parse_crash_fires_syntax_error_rule_scaled_by_location():
     r_other = triage(_wholefile("pkg/util.py", full), Config(), RULES)
     fr_other = next(fr for fr in r_other.fired_rules if fr.rule == "syntax-error-suspicious")
     assert fr_other.weight == 20 * 1.0
+
+
+def test_deep_pad_does_not_mask_a_real_decode_exec_loader():
+    # CRITICAL fix: previously the depth guard short-circuited extraction entirely, so padding a real
+    # decode->exec loader with a deep expression dropped combo-decode-exec and the release stopped
+    # escalating -- an evasion. The extraction must always run; the depth flag is additive only.
+    pad = "+".join(["1"] * 5000)   # depth well past _MAX_AST_DEPTH -- syntax_error will also be set
+    added = ["import base64", f"_pad = {pad}", "exec(base64.b64decode(d))"]
+    d = Diff("p", "1.1", False, [FileDiff("pkg/util.py", "modified",
+        [Hunk((0, 0), (0, len(added)), added, [])], "\n".join(added))], [])
+    r = triage(d, Config(), RULES)
+    assert any(fr.rule == "combo-decode-exec" for fr in r.fired_rules)
+    assert r.escalate

@@ -110,11 +110,14 @@ def _resolve_call(node, table) -> str | None:
 
 
 _FUNC_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
-# Well below sys.getrecursionlimit()'s default (1000): a tree this deep is pathological (e.g. a
-# 5,000-term "1+1+...+1" chain) and used to RecursionError our Python-level walkers even though
-# ast.parse itself accepts it. Detected with an explicit stack -- no recursion, so this check itself
-# never crashes on the input it is guarding against.
-_MAX_AST_DEPTH = 500
+# At sys.getrecursionlimit()'s default (1000): hand-written code stays far below this (stdlib max
+# observed ~34); generated code can approach it (a 300-branch elif ladder is depth 304, a ~250-call
+# builder/ORM chain crosses 500, a 600-piece string concat is 601) without being malicious on its own,
+# so the flag is additive to whatever else was found, not a replacement for scanning it. A tree past
+# this depth (e.g. a 5,000-term "1+1+...+1" chain) is what used to RecursionError our Python-level
+# walkers even though ast.parse itself accepts it. Detected with an explicit stack -- no recursion, so
+# this check itself never crashes on the input it is guarding against.
+_MAX_AST_DEPTH = 1000
 
 
 def _ast_too_deep(tree) -> bool:
@@ -200,8 +203,8 @@ def _file_facts(fd) -> FileFacts:
         tree = ast.parse(fd.new_text)
     except (SyntaxError, RecursionError, MemoryError, ValueError):   # deep nesting crashes the parser itself
         return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, True, added_strs)
-    if _ast_too_deep(tree):
-        return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, True, added_strs)
+    too_deep = _ast_too_deep(tree)   # additive flag only -- every walk below is iterative, so it never
+                                      # excuses us from actually scanning a deep-but-otherwise-normal file
     try:
         table = _build_import_table(tree)
         importtime_ids = _importtime_call_ids(tree)
@@ -225,7 +228,7 @@ def _file_facts(fd) -> FileFacts:
     except (RecursionError, MemoryError):   # a parse that succeeds can still blow limits on post-parse walks
         return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, True, added_strs)
     return FileFacts(fd.path, lines, loc, frozenset(cats), frozenset(autoexec_cats), frozenset(names),
-                     frozenset(table.values()), _blob_present(added_strs), False, added_strs)
+                     frozenset(table.values()), _blob_present(added_strs), too_deep, added_strs)
 
 
 def _normalize_binaries(added_binaries):
