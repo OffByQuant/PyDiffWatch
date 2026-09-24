@@ -13,6 +13,12 @@ from .models import NewRelease
 
 logger = logging.getLogger(__name__)
 
+# The changelog action logged when a release's sdist is uploaded; Warehouse logs `add <python_version> file
+# <filename>`, and an sdist's python_version is "source". `new release` fires on a release's FIRST file, so when
+# the wheels upload first the release is recorded no_sdist; this later event re-scans it (spec U4).
+# LIVE-RUN VERIFY: the exact string is unverified offline. Check a live changelog_since_serial batch.
+SDIST_UPLOAD_ACTION = "add source file "
+
 
 def _proxy(cfg: Config):
     """An XML-RPC proxy whose socket reads time out after fetch_timeout_s; without one, a hung call stalls
@@ -45,12 +51,14 @@ def changes_since(cfg: Config, since_serial: int) -> list[NewRelease]:
         logger.warning("PyPI changelog request failed (%s: %s); retrying from serial %d next tick",
                        type(e).__name__, e, since_serial)
         return []  # next tick retries from the same serial — no gap
-    best: dict[tuple[str, str], int] = {}
+    best: dict[tuple[str, str], list] = {}   # (name, version) -> [serial, new release seen, sdist upload seen]
     for name, version, _ts, action, serial in rows:
-        if action != "new release" or version is None:
+        sdist = action.startswith(SDIST_UPLOAD_ACTION)
+        if (action != "new release" and not sdist) or version is None:
             continue
-        key = (name, version)
-        if serial > best.get(key, -1):
-            best[key] = serial
-    items = [NewRelease(package=n, version=v, serial=s) for (n, v), s in best.items()]
+        ev = best.setdefault((name, version), [-1, False, False])
+        ev[0] = max(ev[0], serial)
+        ev[1 if not sdist else 2] = True
+    items = [NewRelease(package=n, version=v, serial=s, new_release=nr, sdist_upload=sd)
+             for (n, v), (s, nr, sd) in best.items()]
     return sorted(items, key=lambda r: r.serial)

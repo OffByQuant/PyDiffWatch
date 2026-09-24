@@ -170,10 +170,10 @@ def test_predecessor_ignores_yanked_and_wheel_only(monkeypatch):
     assert art.prior_version == "1.0"                      # skipped yanked 1.1 and wheel-only 1.2
 
 
-def test_no_sdist_returns_none(monkeypatch):
+def test_no_sdist_returns_no_sdist(monkeypatch):
     monkeypatch.setattr(fetcher, "_package_json", lambda p, cfg: _meta("wheelpkg", [
         ("1.0", "2026-01-01T00:00:00Z", False)]))          # wheel-only release
-    assert fetcher.fetch_artifacts(Config(), NewRelease("wheelpkg", "1.0", 5)) is None
+    assert fetcher.fetch_artifacts(Config(), NewRelease("wheelpkg", "1.0", 5)) == fetcher.NoSdist(None)
 
 
 def test_fetch_captures_maintainer_metadata(monkeypatch):

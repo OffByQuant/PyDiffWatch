@@ -328,6 +328,12 @@ def record_verdict(conn, release_id, verdict) -> int:
     conn.commit()
     return conn.execute("SELECT id FROM verdicts WHERE release_id=?", (release_id,)).fetchone()[0]
 
+def clear_unscanned_verdict(conn, release_id):
+    """Drop a release's UNREVIEWED verdict (model 'none'), e.g. the wheel-only switch warning once its sdist
+    arrives and it is re-scanned. A model verdict, or one a person has labelled, is kept."""
+    conn.execute("DELETE FROM verdicts WHERE release_id=? AND model='none' AND human_label IS NULL", (release_id,))
+    conn.commit()
+
 def get_stage(conn, package, version):
     row = conn.execute("SELECT stage FROM releases WHERE package=? AND version=?",
                        (package, version)).fetchone()
@@ -336,7 +342,7 @@ def get_stage(conn, package, version):
 # Stages at which a release can be left unscanned. Carrying the UNREVIEWED verdict (model 'none'), such a
 # release waits in `pending`, which labels it `(not scanned: <stage>)`; for pending_review the label is the
 # pending_reason (too_large, review_failed).
-UNSCANNED_STAGES = ("refused_to_extract", "refused_to_fetch", "gave_up", "pending_review")
+UNSCANNED_STAGES = ("refused_to_extract", "refused_to_fetch", "gave_up", "pending_review", "no_sdist")
 
 def pending_adjudication(conn):
     """Releases queued for agent review (§8.1), not yet labelled: suspicious LLM verdicts

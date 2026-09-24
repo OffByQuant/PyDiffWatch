@@ -202,7 +202,7 @@ def drain_pending(cfg, conn, rvw, *, auto: bool, reasons=None, limit=None, guard
 def _fetch_one(cfg, rel):
     """Worker half of the pipeline — runs OFF the main thread. Does NO sqlite and NO notifier work
     (sqlite is single-threaded), only network + in-memory extraction (incl. PyPI-baseline resolution).
-    Returns the ArtifactSet, None (no sdist), or the Exception it caught, for the main thread to map."""
+    Returns the ArtifactSet, a NoSdist, or the Exception it caught, for the main thread to map."""
     try:
         return fetcher.fetch_artifacts(cfg, rel)
     except Exception as e:        # incl. RefusedToFetch/RefusedToExtract — mapped on the main thread
@@ -262,6 +262,8 @@ def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=
     Returns True iff the release reached a terminal stage; a failure is queued for retry (_retry_later),
     which is terminal for the cursor."""
     rid = store.record_release(conn, rel.package, rel.version, rel.serial, False, None, "sdist")
+    if store.get_stage(conn, rel.package, rel.version) == "no_sdist":
+        store.clear_unscanned_verdict(conn, rid)   # re-scan after its sdist upload: drop the switch warning
     if isinstance(result, fetcher.RefusedToFetch):
         store.update_stage(conn, rid, "refused_to_fetch")
         if str(result).startswith("quarantined"):
@@ -289,8 +291,14 @@ def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=
         return True
     if isinstance(result, Exception):   # metadata or sdist download failed (incl. a deadline expiry)
         return _retry_later(cfg, conn, rid, rel, result)
-    if result is None:
-        store.update_stage(conn, rid, "no_sdist")   # no sdist for this version — permanent
+    if result is None or isinstance(result, fetcher.NoSdist):
+        store.update_stage(conn, rid, "no_sdist")   # terminal, unless its sdist upload event arrives later
+        prev = getattr(result, "switched_from", None)
+        if prev:    # an sdist-only scan can be dodged by going wheel-only; a package always wheel-only is silent
+            _alert_unscanned(cfg, conn, rid, rel.package, rel.version,
+                             f"UNREVIEWED: switched to wheel-only: the previous release {prev} shipped an sdist and "
+                             f"this one ships only wheels, which pydiffwatch does not scan. Not scanned. Needs "
+                             f"manual review.", stage="no_sdist")
         return True
     store.set_baseline(conn, rid, result.prior_version, result.is_new_package)
     if result.prior_error:
@@ -353,6 +361,16 @@ def seed_now(cfg: Config):
     if s is not None:
         store.set_last_serial(conn, s)
     return s
+
+
+def _to_fetch(conn, rel) -> bool:
+    """Whether run_once fetches and processes this changelog item. A release not yet at a TERMINAL stage is
+    fetched. An sdist upload re-scans a release recorded no_sdist (its wheels uploaded first); on any other
+    release it is a no-op (one SELECT, no fetch), since that release's own `new release` event covers it."""
+    stg = store.get_stage(conn, rel.package, rel.version)
+    if rel.sdist_upload and stg == "no_sdist":
+        return True
+    return rel.new_release and stg not in TERMINAL
 
 
 def run_once(cfg: Config, *, seed_if_fresh: bool = True, recent: int | None = None) -> int:
@@ -426,7 +444,7 @@ def run_once(cfg: Config, *, seed_if_fresh: bool = True, recent: int | None = No
                 drain_pending(cfg, conn, rvw, auto=True, limit=cfg.reviewer.max_pending_per_tick, guard=guard)
         _retry_metadata(cfg, conn, rvw, ruleset, offline, guard)
         releases = ingest.changes_since(cfg, last)[:cfg.max_releases_per_run]
-        prepared = [(rel, store.get_stage(conn, rel.package, rel.version)) for rel in releases]
+        prepared = [(rel, _to_fetch(conn, rel)) for rel in releases]
 
         # Fetch concurrently in a bounded window but CONSUME results in ascending-serial order on the
         # main thread so the cursor-advance invariant holds: advance only to the highest serial such
@@ -438,9 +456,9 @@ def run_once(cfg: Config, *, seed_if_fresh: bool = True, recent: int | None = No
             for start in range(0, len(prepared), W):
                 window = prepared[start:start + W]
                 futs = {i: ex.submit(_fetch_one, cfg, rel)
-                        for i, (rel, stg) in enumerate(window) if stg not in TERMINAL}
-                for i, (rel, stg) in enumerate(window):
-                    if stg in TERMINAL:
+                        for i, (rel, fetch) in enumerate(window) if fetch}
+                for i, (rel, fetch) in enumerate(window):
+                    if not fetch:
                         terminal = True                      # already-terminal: nothing to fetch
                     else:
                         terminal = _process_fetched(cfg, conn, rvw, ruleset, rel, futs[i].result(), offline, guard)
@@ -525,7 +543,7 @@ def list_pending(cfg: Config):
         elif not stored:                                  # older row with no captured payload -> re-fetch
             try:
                 art = fetcher.fetch_artifacts(cfg, NewRelease(row["package"], row["version"], row["serial"]))
-                if art is not None:
+                if art is not None and not isinstance(art, fetcher.NoSdist):
                     d = differ.build_diff(art)
                     tr = engine.triage(d, cfg, ruleset)
                     diff_text = reviewer.build_review_input(d, tr, max_chars=cfg.reviewer.max_input_chars)
@@ -562,7 +580,7 @@ def backfill_evidence(cfg: Config, release_id: int | None = None, all_flagged: b
             pkg, ver = row["package"], row["version"]
             try:
                 art = fetcher.fetch_artifacts(cfg, NewRelease(pkg, ver, row["serial"]))
-                if art is None:
+                if art is None or isinstance(art, fetcher.NoSdist):
                     results.append({"package": pkg, "version": ver, "captured": False, "error": "no sdist"})
                     continue
                 # A row detected as a first release was whole-package scanned (no baseline then). If a

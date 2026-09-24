@@ -1,4 +1,5 @@
 import io, gzip, tarfile, hashlib, json, time, urllib.request, urllib.error, posixpath
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from .config import Config
 from .models import NewRelease, ArtifactSet
@@ -8,6 +9,13 @@ class RefusedToExtract(Exception): ...
 class RefusedToFetch(Exception): ...
 class MetadataGone(Exception): ...          # PyPI's JSON metadata 404s: the project was removed
 class MetadataUnavailable(Exception): ...   # any other metadata failure: retried on later ticks
+
+
+@dataclass(frozen=True)
+class NoSdist:
+    """This version has no sdist (wheel-only, or its wheels uploaded before its sdist). `switched_from`: the
+    previous release, when it had an sdist — a switch to wheel-only, which dodges an sdist-only scan."""
+    switched_from: str | None = None
 
 class _BoundedReader:
     """Forward-only wrapper over a decompressed stream that refuses once cumulative bytes read
@@ -227,7 +235,19 @@ def _pick_predecessor(meta: dict, version: str):
             best = (ts, ver, f.get("url"))
     return (best[1], best[2]) if best else None
 
-def fetch_artifacts(cfg, rel: NewRelease) -> ArtifactSet | None:
+def _switched_from(releases: dict, version: str) -> str | None:
+    """The release uploaded just before `version` (by each release's first file upload), if it had an sdist.
+    Read from the package JSON already fetched, so it is right on a fresh database too."""
+    def first(files):
+        return min((f["upload_time_iso_8601"] for f in files or [] if f.get("upload_time_iso_8601")), default=None)
+    t = first(releases.get(version))
+    if t is None:
+        return None
+    prev = max(((ts, v) for v, files in releases.items() if v != version
+                and (ts := first(files)) is not None and ts < t), default=None)
+    return prev[1] if prev and _sdist(releases[prev[1]]) else None
+
+def fetch_artifacts(cfg, rel: NewRelease) -> ArtifactSet | NoSdist:
     """Fetch + extract the sdist(s) for one release. The baseline is resolved from PyPI's version
     history (the package JSON), NOT our DB: an UPDATE (a prior version exists) is diffed against its
     predecessor; a genuinely NEW package (no prior) is handled per cfg.new_package_policy."""
@@ -247,7 +267,7 @@ def fetch_artifacts(cfg, rel: NewRelease) -> ArtifactSet | None:
         raise MetadataUnavailable(f"{rel.package}: {type(e).__name__}: {e}") from e
     new_sd = _sdist(meta.get("releases", {}).get(rel.version))
     if not new_sd:
-        return None                                   # no sdist for this version (wheel-only; Phase 3)
+        return NoSdist(_switched_from(meta.get("releases", {}), rel.version))   # wheel-only: not scanned
     pred = _pick_predecessor(meta, rel.version)
     is_new = pred is None
     mtmeta = _maintainer_metadata(meta, new_sd)

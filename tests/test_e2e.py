@@ -53,7 +53,7 @@ def test_cursor_resume_across_runs(tmp_cfg, monkeypatch):
                         lambda url, cfg: blobs[tuple(url.replace("mock://", "").split("/"))])
 
     monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: [
-        r for r in [type("R", (), {"package": "victim", "version": "1.0", "serial": 10})()]
+        r for r in [NewRelease("victim", "1.0", 10)]
         if r.serial > since])
     orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
     conn = store.connect(tmp_cfg)
@@ -62,7 +62,7 @@ def test_cursor_resume_across_runs(tmp_cfg, monkeypatch):
 
     # second run: a new release at serial 11; changes_since must only see it (since=10)
     monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: [
-        r for r in [type("R", (), {"package": "victim", "version": "1.1", "serial": 11})()]
+        r for r in [NewRelease("victim", "1.1", 11)]
         if r.serial > since])
     n = orchestrator.run_once(tmp_cfg)
     assert n == 1                      # only the new release processed
