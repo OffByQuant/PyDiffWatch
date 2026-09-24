@@ -544,16 +544,25 @@ def watch(cfg: Config, interval: int = 300, out_path=None, iterations=None, slee
     n = 0
     try:
         while iterations is None or n < iterations:
-            before = _cursor(cfg)
-            try:
-                run_once(cfg, recent=recent)
+            before = None
+            try:    # any per-tick failure (e.g. a transient "database is locked") is logged; the daemon stays up
+                before = _cursor(cfg)
+                try:
+                    run_once(cfg, recent=recent)
+                except Exception:
+                    logger.exception("watch: scan tick failed; daemon continuing")
+                export_dashboard(cfg, out_path=out_path)
             except Exception:
-                logger.exception("watch: scan tick failed; daemon continuing")
-            export_dashboard(cfg, out_path=out_path)
+                logger.exception("watch: tick failed; daemon continuing")
             n += 1
             if iterations is not None and n >= iterations:
                 break
-            if not _behind(cfg, before):
+            try:
+                behind = before is not None and _behind(cfg, before)
+            except Exception:
+                logger.exception("watch: backlog check failed; sleeping as usual")
+                behind = False
+            if not behind:
                 sleep_fn(interval)
     except KeyboardInterrupt:
         pass

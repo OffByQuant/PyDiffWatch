@@ -48,3 +48,38 @@ def test_watch_passes_recent_to_each_tick(tmp_path, monkeypatch):
     monkeypatch.setattr(orchestrator, "export_dashboard", lambda *a, **k: None)
     orchestrator.watch(cfg, interval=300, iterations=2, sleep_fn=lambda s: None, recent=500)
     assert seen == [500, 500]
+
+
+def test_watch_survives_a_locked_database_outside_the_scan(tmp_path, monkeypatch):
+    # Final review: _cursor, export_dashboard and _behind sat outside the tick's try/except, so a transient
+    # "database is locked" (review-pending writing at the same moment) killed the daemon.
+    import sqlite3
+    cfg = _cfg(tmp_path)
+    runs, slept = [], []
+    monkeypatch.setattr(orchestrator, "run_once", lambda c, **k: runs.append(1))
+    monkeypatch.setattr(orchestrator, "export_dashboard", lambda *a, **k: None)
+    real, calls = orchestrator._cursor, []
+
+    def cursor(c):
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real(c)
+    monkeypatch.setattr(orchestrator, "_cursor", cursor)
+    assert orchestrator.watch(cfg, interval=300, iterations=3, sleep_fn=slept.append) == 3
+    assert slept == [300, 300] and len(runs) == 2          # the locked tick is skipped, not fatal
+
+
+def test_watch_survives_a_failed_dashboard_export(tmp_path, monkeypatch):
+    import sqlite3
+    cfg = _cfg(tmp_path)
+    runs, slept, exports = [], [], []
+    monkeypatch.setattr(orchestrator, "run_once", lambda c, **k: runs.append(1))
+
+    def export(*a, **k):
+        exports.append(1)
+        if len(exports) == 1:
+            raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(orchestrator, "export_dashboard", export)
+    assert orchestrator.watch(cfg, interval=300, iterations=2, sleep_fn=slept.append) == 2
+    assert len(runs) == 2 and slept == [300]
