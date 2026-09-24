@@ -3,6 +3,7 @@
 and a later tick never repeats the alert. `metadata_gone` also alerts, but stays out of `pending`: the files
 are gone, so nobody can review it."""
 import dataclasses
+import sqlite3
 import sys
 
 from pydiffwatch import __main__ as cli
@@ -179,3 +180,42 @@ def test_prune_keeps_every_unscanned_row(tmp_path, capsys):
     store.prune(conn, retention_days=1)
     kept = {r[0] for r in conn.execute("SELECT package FROM releases WHERE version != '9.9'")}
     assert kept == {"pkg", "pkg2", "flaky", "cudrequest", "gone"}
+
+
+# --- migration -----------------------------------------------------------------------------------------
+
+_OLD_SCHEMA = """
+CREATE TABLE cursor(id INTEGER PRIMARY KEY CHECK(id=1), last_serial INTEGER NOT NULL DEFAULT 0, updated_at TEXT);
+INSERT INTO cursor(id, last_serial) VALUES (1, 0);
+CREATE TABLE releases(id INTEGER PRIMARY KEY, package TEXT, version TEXT, serial INTEGER, is_first_release INTEGER,
+  prior_version TEXT, artifact_basis TEXT, triage_score REAL, triage_rules TEXT, stage TEXT, processed_at TEXT,
+  UNIQUE(package, version));
+CREATE TABLE alerts(id INTEGER PRIMARY KEY, release_id INTEGER, classification TEXT, score REAL, fired_rules TEXT,
+  dedupe_key TEXT UNIQUE, delivery_status TEXT, sent_at TEXT);
+CREATE TABLE verdicts(id INTEGER PRIMARY KEY, release_id INTEGER UNIQUE, classification TEXT, confidence REAL,
+  attack_type TEXT, reasoning TEXT, cited_hunk TEXT, model TEXT, urgent INTEGER, created_at TEXT,
+  human_label TEXT, human_note TEXT, adjudicated_at TEXT);
+INSERT INTO releases(id, package, version, serial, stage) VALUES
+  (1, 'old-extract', '1.0', 1, 'refused_to_extract'),
+  (2, 'old-fetch', '1.0', 2, 'refused_to_fetch'),
+  (3, 'has-verdict', '1.0', 3, 'refused_to_extract'),
+  (4, 'fine', '1.0', 4, 'triaged');
+INSERT INTO verdicts(release_id, classification, reasoning, model, human_label)
+  VALUES (3, 'suspicious', 'kept as is', 'none', 'benign');
+"""
+
+
+def test_old_verdictless_refusals_get_the_unreviewed_verdict_once(tmp_cfg, monkeypatch, capsys):
+    raw = sqlite3.connect(tmp_cfg.db_path); raw.executescript(_OLD_SCHEMA); raw.commit(); raw.close()
+    for _ in range(2):                                            # idempotent across connects
+        conn = store.connect(tmp_cfg); store.init_schema(conn)
+        rows = conn.execute("SELECT release_id, classification, model, reasoning, human_label FROM verdicts "
+                            "ORDER BY release_id").fetchall()
+        conn.close()
+        assert [r["release_id"] for r in rows] == [1, 2, 3]
+        assert all(r["classification"] == "suspicious" and r["model"] == "none" for r in rows)
+        assert _unreviewed(rows[0]["reasoning"]) and _unreviewed(rows[1]["reasoning"])
+        assert rows[2]["reasoning"] == "kept as is" and rows[2]["human_label"] == "benign"
+    assert [i["package"] for i in orchestrator.list_pending(tmp_cfg)] == ["old-extract", "old-fetch"]
+    out = _pending_cli(tmp_cfg, monkeypatch, capsys)
+    assert "(not scanned: refused_to_extract)" in out and "(not scanned: refused_to_fetch)" in out

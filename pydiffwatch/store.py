@@ -60,6 +60,18 @@ def migrate_schema(conn):
             conn.execute("UPDATE releases SET review_input_chars=? WHERE id=?",
                          (len(zlib.decompress(blob).decode()), rid))
         conn.commit()
+    if conn.execute("SELECT 1 FROM meta WHERE key='unreviewed_refusals'").fetchone() is None:
+        # Refused releases recorded before refusals were queued have no verdict, so `pending` never showed
+        # them. Give each the UNREVIEWED verdict once; a row that already has a verdict is left alone.
+        conn.execute("INSERT INTO verdicts(release_id, classification, confidence, attack_type, reasoning, "
+                     "cited_hunk, model, urgent, created_at) "
+                     "SELECT r.id, 'suspicious', 0.0, 'none', ?, '', 'none', 0, ? FROM releases r "
+                     "WHERE r.stage IN ('refused_to_extract', 'refused_to_fetch') "
+                     "AND NOT EXISTS (SELECT 1 FROM verdicts v WHERE v.release_id = r.id)",
+                     ("UNREVIEWED: pydiffwatch refused to download or unpack it, recorded before refusals were "
+                      "queued for review, so the reason was not kept. Not scanned. Needs manual review.", _now()))
+        conn.execute("INSERT INTO meta(key, value) VALUES('unreviewed_refusals', ?)", (_now(),))
+        conn.commit()
 
 def get_last_serial(conn) -> int:
     return conn.execute("SELECT last_serial FROM cursor WHERE id=1").fetchone()[0]
