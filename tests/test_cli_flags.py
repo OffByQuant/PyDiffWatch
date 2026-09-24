@@ -103,3 +103,8 @@ def test_recent_zero_is_allowed_and_means_start_now(cmd, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["pydiffwatch", cmd, "--recent", "0"])
     cli.main()
     assert seen["recent"] == 0
+
+
+def test_a_directory_as_config_exits_cleanly(tmp_path):
+    with pytest.raises(SystemExit, match=str(tmp_path)):
+        cli._cfg(_args(config=str(tmp_path)))

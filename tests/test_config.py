@@ -78,3 +78,9 @@ def test_load_config_reads_reviewer_extra_body(tmp_path):
     '''))
     cfg = load_config(p)
     assert cfg.reviewer.extra_body == {"reasoning": {"enabled": False}}
+
+
+def test_load_config_on_a_directory_raises_file_not_found(tmp_path):
+    # Final review: path.exists() let a directory through to read_text(), an IsADirectoryError traceback.
+    with pytest.raises(FileNotFoundError, match="not a file"):
+        load_config(tmp_path)

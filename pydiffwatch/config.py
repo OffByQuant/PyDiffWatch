@@ -79,6 +79,8 @@ def load_config(path) -> Config:
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"config file not found: {path}")
+    if not path.is_file():
+        raise FileNotFoundError(f"config path is not a file: {path}")
     raw = tomllib.loads(path.read_text())
     rv = raw.pop("reviewer", {})
     default_rv = ReviewerConfig()
