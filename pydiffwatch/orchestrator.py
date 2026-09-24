@@ -215,11 +215,15 @@ def _alert_heuristic(cfg, conn, rid, package, version, score, fired_rules):
     notifier.emit(cfg, conn, Verdict(package, version, "suspicious-heuristic", score, fired_rules, False), rid)
 
 
-def drain_pending(cfg, conn, rvw, *, auto: bool, reasons=None, limit=None, guard=None) -> int:
+def drain_pending(cfg, conn, rvw, *, auto: bool, reasons=None, limit=None, guard=None,
+                  clock=time.monotonic) -> int:
     """Review parked releases. auto (each tick): model_busy first, then unreachable-endpoint parks, failed
     reviews with attempts left, and too_large rows that now fit. Manual (`review-pending`): by default oversized
     releases and exhausted retries — run it with a larger-context model config. Inputs over this endpoint's cap are skipped
-    (auto: re-parked as too_large). `limit` caps attempts, not successes. Returns the number reviewed."""
+    (auto: re-parked as too_large). `limit` caps attempts, not successes. Returns the number reviewed.
+    The auto-drain runs before the retry sweep and ingest, holding the scan lock, so it has a time budget
+    (reviewer.timeout, one first attempt's worth): no new review starts once it is spent, and the rest wait for
+    the next tick. A review already started runs to its own timeout."""
     if auto:
         reasons = ("model_busy", "in_review", "endpoint_unreachable", "review_failed")
     elif not reasons:
@@ -234,8 +238,13 @@ def drain_pending(cfg, conn, rvw, *, auto: bool, reasons=None, limit=None, guard
     rows = sorted(rows,
                   key=lambda r: (r["pending_reason"] != "model_busy", r["release_id"]))
     done = tried = 0
-    for row in rows:
+    t0 = clock()
+    for n, row in enumerate(rows):
         if limit is not None and tried >= limit:
+            break
+        if auto and clock() - t0 >= cfg.reviewer.timeout:
+            logger.warning("review queue used its %.0fs budget; %d release(s) wait for the next tick",
+                           cfg.reviewer.timeout, len(rows) - n)
             break
         try:
             attempted, go_on = _drain_one(cfg, conn, rvw, row, auto=auto, cap=cap, provisional=provisional,

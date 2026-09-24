@@ -202,3 +202,21 @@ def test_a_benign_model_verdict_never_drops_the_evidence_of_a_labelled_release(t
     benign = orchestrator.Verdict("pkg", "1.0.0", "benign", 60.0, [], False, model="m", reasoning="fine")
     orchestrator._record(cfg, conn, rid, benign, 60.0)
     assert store.get_evidence(conn, rid) == "payload code"
+
+
+def test_the_auto_drain_starts_no_new_review_once_its_time_budget_is_spent(tmp_path):
+    # It runs before the retry sweep and ingest, holding the scan lock: reviewer.timeout bounds it.
+    cfg, conn, rid, rvw = _setup(tmp_path, _Backend())
+    for i, pkg in enumerate(("a", "b", "c")):
+        r = store.record_release(conn, pkg, "1.0.0", 2 + i, False, None, "tgz")
+        orchestrator._review_escalated(cfg, conn, rvw, dataclasses.replace(_diff(), package=pkg), _T, r,
+                                       offline=True)
+    ticks = iter(range(0, 10_000, 200))                     # every clock read is 200s after the last
+    be = _Backend()
+    orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=be), auto=True,
+                               clock=lambda: next(ticks))
+    assert len(be.calls) == 1                               # 200s < 300s: one review; at 400s it stops
+    assert sorted(_pending(conn)) == ["b", "c"]             # the rest wait for the next tick
+    orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=be), auto=False,
+                               reasons=("endpoint_unreachable",), clock=lambda: next(ticks))
+    assert len(be.calls) == 3 and _pending(conn) == {}      # `review-pending` is run by hand: no budget

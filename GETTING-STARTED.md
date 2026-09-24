@@ -295,7 +295,7 @@ later review doesn't depend on PyPI still hosting the sdist.
 | `review_failed` | a review timed out or failed; retried at `timeout` × attempt (300s, 600s, 900s) | every tick, up to `max_review_attempts` (3) |
 | `too_large` | the highest-risk file alone exceeds `max_input_chars` (200k chars) | `review-pending` with a larger-context model |
 
-Each tick retries at most `max_pending_per_tick` (20) queued releases before scanning. The rest wait for
+Each tick retries at most `max_pending_per_tick` (20) queued releases before scanning, and starts no new one once `timeout` (300s) has passed since the first, so a slow model can't hold up the scan for hours. The rest wait for
 you — typically with a bigger model pointed at the same database:
 
 ```bash
