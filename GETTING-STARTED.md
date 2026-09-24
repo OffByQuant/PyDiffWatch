@@ -254,9 +254,11 @@ known)`.
 Under setuptools with nothing declared, the import line lists what auto-discovery would find:
 `packages=auto-discovered: ...` (directories with an `__init__.py`, top level or under `src/`, except
 `tests`, `docs`, `examples` and similar) and `py-modules=auto-discovered: ...` (top-level or `src/` `*.py`
-files, except `setup.py` and `conftest.py`). When it finds nothing it says `none found by DiffWatch
-(setuptools auto-discovery may also find modules and namespace packages)` (or, while setup.py exists, `none
-declared literally in setup.py (setup.py runs arbitrary code at build)`), never a bare "none". At most three
+files, except `setup.py` and `conftest.py`). Only names that are Python identifiers are listed: setuptools
+installs only those as modules, but may still install a package directory with another name (a `src/` one, or
+a `-stubs` one), so an unlisted directory is not evidence that it isn't shipped. When it finds nothing it
+says `none found by DiffWatch (setuptools auto-discovery may also find modules and namespace packages)`
+(or, while setup.py exists, `none declared literally in setup.py (setup.py runs arbitrary code at build)`), never a bare "none". At most three
 `<name>.egg-info/entry_points.txt` files are parsed; the rest are named on the commands and plugins lines as
 `unknown (N more egg-info entry_points.txt not read)`. Likewise at most three `<name>.egg-info/top_level.txt`
 files are read; the rest are named first in the import line's `top_level.txt=` field as `unknown (N more

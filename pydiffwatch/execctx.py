@@ -234,12 +234,13 @@ def _ep_lines(v):
 def _collect(slot: list, entries) -> None:
     """slot = [kept, more]: keep a group's first _MAX_ITEMS + 1 distinct entries (one more than _join shows, so
     it still says "+N more") and only count the rest, so memory is bounded however many a source declares.
-    An entry repeated after the cap is counted again: the count may overstate, never understate."""
+    An entry repeated after the cap is counted again: the count may overstate, never understate. An unknown
+    entry is always kept (at most one more): counted only, it would hide that the group is not fully known."""
     kept = slot[0]
     for e in entries:
         if e in kept:
             continue
-        if len(kept) <= _MAX_ITEMS:
+        if len(kept) <= _MAX_ITEMS or e == _UNKNOWN_EP:
             kept.append(e)
         else:
             slot[1] += 1
@@ -272,12 +273,15 @@ _COMMAND_GROUPS = ("console_scripts", "gui_scripts")
 
 def _entry_points_lines(eps: dict, unknown: list, empty: str) -> tuple[str, str]:
     plugin_groups = [g for g in eps if g not in _COMMAND_GROUPS and g != COMPUTED]
-    cmds = [n if n == COMPUTED else f"{n} -> {t}" for g in _COMMAND_GROUPS for n, t in eps.get(g, [[]])[0]]
-    plugins = [f"{g}: {n}" if n == COMPUTED else f"{g}: {n} -> {t}" for g in plugin_groups for n, t in eps[g][0]]
-    if COMPUTED in eps:
-        cmds.append(f"entry points={COMPUTED}")
-        plugins.append(f"entry points={COMPUTED}")
-    # unknown first: past the cap it would fold into "+N more" and the line would hide that sources went unread
+    cmd_eps = [(n, t) for g in _COMMAND_GROUPS for n, t in eps.get(g, [[]])[0]]
+    plugin_eps = [(g, n, t) for g in plugin_groups for n, t in eps[g][0]]
+    computed = [f"entry points={COMPUTED}"] if COMPUTED in eps else []
+    # unknown and computed first: past the cap they would fold into "+N more" and the line would hide that
+    # sources went unread or entries are not statically known
+    cmds = computed + [COMPUTED for n, _ in cmd_eps if n == COMPUTED] + [
+        f"{n} -> {t}" for n, t in cmd_eps if n != COMPUTED]
+    plugins = computed + [f"{g}: {COMPUTED}" for g, n, _ in plugin_eps if n == COMPUTED] + [
+        f"{g}: {n} -> {t}" for g, n, t in plugin_eps if n != COMPUTED]
     return (_join(unknown + cmds, empty, sum(eps[g][1] for g in _COMMAND_GROUPS if g in eps)),
             _join(unknown + plugins, empty, sum(eps[g][1] for g in plugin_groups)))
 
@@ -294,7 +298,9 @@ def _discovered(files) -> list[str]:
         if parts[-1] != "__init__.py":
             continue
         if len(parts) == 2 or (len(parts) == 3 and parts[0] == "src"):
-            if parts[-2] not in _NOT_PACKAGES:
+            # an identifier only, so no name can pose as a field; setuptools may still install a src/ or
+            # -stubs directory with another name (the import line is best effort)
+            if parts[-2] not in _NOT_PACKAGES and parts[-2].isidentifier():
                 pkgs.append(parts[-2])
     return pkgs
 
@@ -303,10 +309,11 @@ _NOT_MODULES = {"setup.py", "conftest.py"}
 
 
 def _modules(files) -> list[str]:
-    """Top-level (or src/) *.py files, which setuptools auto-discovery installs as modules."""
+    """Top-level (or src/) *.py files with an identifier stem, which setuptools auto-discovery installs as
+    modules. A non-identifier stem is not installed, and could pose as a field (`x; top_level.txt=none.py`)."""
     return [p.rsplit("/", 1)[-1][:-3] for p in sorted(files)
             if p.endswith(".py") and (p.count("/") == 0 or (p.count("/") == 1 and p.startswith("src/")))
-            and p.rsplit("/", 1)[-1] not in _NOT_MODULES]
+            and p.rsplit("/", 1)[-1] not in _NOT_MODULES and p.rsplit("/", 1)[-1][:-3].isidentifier()]
 
 
 def _egg_info(files, name) -> list[str]:

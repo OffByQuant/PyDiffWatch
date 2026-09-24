@@ -865,3 +865,44 @@ def test_unread_top_level_txt_sources_are_named_even_when_the_read_ones_are_empt
     files = {f"a{j:02d}.egg-info/top_level.txt": b"\n" if j < 3 else b"x\n" for j in range(5)}
     ctx = execctx.build(files)
     assert _field(ctx, "top_level.txt") == "unknown (2 more egg-info top_level.txt not read)"
+
+
+# ---- residual R3: only identifier names are listed as auto-discovered (no field-separator look-alikes) ----
+
+def test_a_non_identifier_module_name_is_not_listed_and_never_leaves_a_bare_none():
+    ctx = execctx.build({"pyproject.toml": _ST, "x; top_level.txt=none.py": b""})
+    assert _field(ctx, "py-modules") == f"auto-discovered: {_AUTO_NONE}"
+    assert _line(ctx, "import").count("top_level.txt=") == 1
+
+
+def test_identifier_modules_are_still_listed_beside_a_non_identifier_one():
+    ctx = execctx.build({"pyproject.toml": _ST, "good.py": b"", "bad-name.py": b"", "src/x y.py": b""})
+    assert _field(ctx, "py-modules") == "auto-discovered: good"
+
+
+def test_a_non_identifier_package_directory_is_not_listed():
+    ctx = execctx.build({"pyproject.toml": _ST, "x; py-modules=none/__init__.py": b"", "pkg/__init__.py": b""})
+    assert _field(ctx, "packages") == "auto-discovered: pkg"
+    ctx = execctx.build({"pyproject.toml": _ST, "bad-name/__init__.py": b""})
+    assert _field(ctx, "packages") == f"auto-discovered: {_AUTO_NONE}"
+
+
+# ---- residual R4: computed and unknown entry-point markers come first, never folded into "+N more" ----
+
+def test_a_computed_setup_py_entry_points_shows_past_thirty_scripts():
+    pp = b"[project]\nname = 'a'\n[project.scripts]\n" + b"".join(b"c%02d = 'm:f'\n" % i for i in range(30))
+    ctx = execctx.build({"pyproject.toml": pp,
+                         "setup.py": b"from setuptools import setup\nsetup(name='a', entry_points=EPS)\n"})
+    cmds, plugins = _line(ctx, "commands"), _line(ctx, "plugins")
+    assert f"entry points={execctx.COMPUTED}" in cmds and f"entry points={execctx.COMPUTED}" in plugins
+    assert cmds.endswith(", … (+11 more)")
+
+
+def test_an_unknown_entry_after_a_group_s_cap_still_shows():
+    eps = {}
+    execctx._add_groups(eps, {"console_scripts": [f"c{i} = m:f" for i in range(30)] + [5],
+                              "pytest11": [f"p{i} = m" for i in range(30)] + ["no equals sign"]})
+    cmds, plugins = execctx._entry_points_lines(eps, [], "none")
+    assert cmds.startswith(f"{execctx.COMPUTED}, c0 -> m:f, ") and cmds.endswith(", … (+11 more)")
+    assert plugins.startswith(f"pytest11: {execctx.COMPUTED}, pytest11: p0 -> m, ")
+    assert plugins.endswith(", … (+11 more)")
