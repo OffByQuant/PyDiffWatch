@@ -169,3 +169,22 @@ def test_guard_and_hostmem_bans_detect_violations():
     assert not _violations("import platform\nplatform.system()\n", _HOSTMEM_FORBIDDEN, allowed_calls={"platform.system"})
     assert _urllib_beyond_parse("import urllib.request\n") and _urllib_beyond_parse("from urllib import request\n")
     assert not _urllib_beyond_parse("from urllib.parse import urlsplit\nimport ctypes\n")
+
+
+# facts.py parses untrusted package source with ast.parse and walks it: no exec, no import machinery (site,
+# importlib), no network, no disk writes.
+_FACTS_FORBIDDEN = _EXEC_INSTALL_UNPICKLE | _NETWORK | {"site"}
+
+
+def test_facts_only_parses_never_executes_imports_or_fetches():
+    src = (_DIFFWATCH / "facts.py").read_text()
+    bad = _violations(src, _FACTS_FORBIDDEN) + _disk_violations(src)
+    assert not bad, f"facts.py must only ast.parse package source, never run or fetch it (§6); found: {bad}"
+
+
+def test_facts_ban_detects_violations():
+    assert _violations("import site\n", _FACTS_FORBIDDEN)
+    assert _violations("from importlib import import_module\n", _FACTS_FORBIDDEN)
+    assert _violations("import urllib.request\n", _FACTS_FORBIDDEN)
+    assert _violations("compile(src, 'x', 'exec')\n", _FACTS_FORBIDDEN)
+    assert not _violations("import ast\nast.parse(src)\n", _FACTS_FORBIDDEN)
