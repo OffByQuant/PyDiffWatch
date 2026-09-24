@@ -27,6 +27,10 @@ new PyPI releases → diff against the prior version → community rules score t
 State lives in a local SQLite database; nothing is hosted, and nothing leaves your machine except the
 calls to PyPI and the model endpoint you point it at.
 
+PyDiffWatch reads **sdists**, PyPI's source-distribution format — today's coverage. A release that ships
+only a wheel and no sdist has no source to diff and isn't scanned; it's recorded as `no_sdist`, not an
+error. Built-distribution (wheel) review is on the [roadmap](#-roadmap).
+
 ---
 
 ## 💡 Why PyDiffWatch
