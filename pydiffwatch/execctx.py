@@ -1,12 +1,12 @@
 """How a release's files run (spec A3), for the reviewer: which code runs at build, at interpreter start, on
 import, when the user types a command, and when a host tool loads plugins.
 
-Pure, no I/O. Built from the new release's extracted top-level metadata: pyproject.toml (tomllib), setup.cfg
-and entry_points.txt (configparser), setup.py (ast: literal setup() keywords only, anything else is
-"<computed>"), top_level.txt and .pth lines. Nothing is imported or executed. Every value here is
-author-written: the reviewer fences the block as untrusted. Files that do not parse are named on one capped
-line, `unparseable: a, b, … (+N more)`, and every field they could declare reads `unknown (<file> unparseable)`
-instead of "none"; nothing in here raises on package content."""
+Pure, no I/O. Built from the new release's extracted top-level metadata: pyproject.toml (tomllib: [project] and
+[tool.setuptools|poetry|flit]), setup.cfg and entry_points.txt (configparser), setup.py (ast: literal setup()
+keywords only, anything else is "<computed>"), top_level.txt and .pth lines. Nothing is imported or executed.
+Every value here is author-written: the reviewer fences the block as untrusted. Files that do not parse are named
+on one capped line, `unparseable: a, b, … (+N more)`, and every field they could declare reads `unknown (<file>
+unparseable)` instead of "none"; nothing in here raises on package content."""
 import ast
 import configparser
 import email.parser
@@ -303,8 +303,8 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
     """The execution-context block for one release, as plain lines (the reviewer escapes and fences them).
 
     too_large: paths the extractor recorded as too large to scan (not in new_files). A build file, a .pth or an
-    egg-info entry_points.txt among them is unknown, never "absent" or "none". Best effort by construction: while setup.py exists, a field it could declare is
-    never a bare "none", because setup.py is arbitrary code."""
+    egg-info entry_points.txt among them is unknown, never "absent" or "none". Best effort by construction: while
+    setup.py exists, a field it could declare is never a bare "none", because setup.py is arbitrary code."""
     unparseable: list[str] = []
     why: dict[str, str] = {p: "too large" for p in (*_BUILD_FILES, *_egg_info(too_large, "entry_points.txt"))
                            if p in too_large}      # source -> why it is unknown
@@ -329,7 +329,8 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
             unparseable.append("setup.py")
             why["setup.py"] = "unparseable"
     if any(k in pp and not isinstance(pp[k], dict) for k in ("build-system", "project", "tool")) or any(
-            k in _dict(pp.get("tool")) and not isinstance(pp["tool"][k], dict) for k in ("setuptools", "poetry", "flit")):
+            k in _dict(pp.get("tool")) and not isinstance(pp["tool"][k], dict)
+            for k in ("setuptools", "poetry", "flit")):
         why["pyproject.toml"] = "malformed"
 
     def kw(name):
