@@ -53,7 +53,7 @@ def test_multi_file_sweep_update_with_whole_file_surface():
     tr = TriageResult(90.0, [FiredRule("r", 40, "setup.py", (2, 5)), FiredRule("r", 30, "pkg/__init__.py", (1, 2)),
                              FiredRule("r", 20, "a.py", (1, 40)), FiredRule("r", 10, "b.py", (1, 5))], True)
     results = _sweep(d, tr)
-    assert len(_headings(results[-1][1])) == 4
+    assert "@@ whole file" in results[-1][1] and len(_headings(results[-1][1])) == 4
 
 
 def test_a_large_zero_weight_file_does_not_hide_smaller_ones_after_it():

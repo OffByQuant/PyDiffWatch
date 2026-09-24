@@ -227,6 +227,6 @@ def test_dropped_from_text_resists_a_forged_heading_via_embedded_newline():
     tr = TriageResult(50.0, [FiredRule("autoexec", 40.0, "victim.py", (1, 1)),
                              FiredRule("autoexec", 50.0, forged_path, (1, 1))], True)
     # cap wide enough for the higher-weight (attacker) file alone, too small to also fit victim.py.
-    text = reviewer.build_review_input(d, tr, max_chars=490)
+    text = reviewer.build_review_input(d, tr, max_chars=502)   # 490 + the "\n@@ new L1-1" position line (spec H)
     assert "print(1)" in text and "os.system('id')" not in text   # only the attacker file rendered
     assert reviewer.dropped_from_text(tr.fired_rules, text) == ["victim.py"]
