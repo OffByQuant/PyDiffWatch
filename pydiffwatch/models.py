@@ -20,6 +20,7 @@ class ArtifactSet:
     prior_error: str | None = None   # the prior sdist couldn't be fetched, so this was diffed against nothing
     description: str | None = None   # this version's PyPI info.summary: the author's claim, context only
     too_large: tuple[str, ...] = ()  # this version's source members too large to scan (unfiltered by the prior)
+    surface_omitted: int | None = None   # a first release under `surface`: source files the filter left out
 
 @dataclass(frozen=True)
 class Hunk:
@@ -38,6 +39,8 @@ class Diff:
     added_dep_findings: list[dict] = field(default_factory=list)   # signal 5: suspicious added deps
     description: str = ""          # the new version's info.summary, one line: the author's claim, context only
     exec_context: str = ""         # how the new version's files run (build, startup, import, commands, plugins)
+    baseline_unavailable: str = "" # the prior version whose sdist could not be fetched (diffed against nothing)
+    surface_omitted: int | None = None   # a first release under `surface`: source files not shown
 
 @dataclass(frozen=True)
 class FiredRule:

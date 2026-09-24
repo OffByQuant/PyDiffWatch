@@ -313,10 +313,13 @@ def fetch_artifacts(cfg, rel: NewRelease, attempt: int = 1) -> ArtifactSet | NoS
     prior_ver = None
     prior_error = None
     dep_findings: list[dict] = []
+    surface_omitted = None
     if is_new:
         if cfg.new_package_policy == "surface":
             # Scan only the install/import-time surface — small, never truncated, high-value.
+            n = len(new_files)
             new_files = {p: b for p, b in new_files.items() if _is_surface(p)}
+            surface_omitted = n - len(new_files)          # the reviewer is told these exist (B11)
         # "full": keep the whole tree (legacy whole-codebase scan)
     else:
         prior_ver, prior_url = pred
@@ -335,4 +338,4 @@ def fetch_artifacts(cfg, rel: NewRelease, attempt: int = 1) -> ArtifactSet | NoS
                        new_files, prior_files, {}, _cap_foreign(new_bins, cfg),
                        is_new_package=is_new, maintainer_metadata=mtmeta,
                        added_dep_findings=dep_findings, prior_error=prior_error, description=summary,
-                       too_large=too_large)
+                       too_large=too_large, surface_omitted=surface_omitted)

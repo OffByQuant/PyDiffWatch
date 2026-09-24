@@ -231,10 +231,17 @@ def build_review_input(diff, triage, *, max_chars: int, dropped: list | None = N
         loc = f"{_one_line(r.file)}:{r.lines[0]}-{r.lines[1]}"
         if r.file in ranked_set and loc not in seen:
             seen.append(loc)
+    omitted = getattr(diff, "surface_omitted", None)
+    first = ("" if not diff.is_first_release else
+             " (FIRST RELEASE - whole-package scan, no prior baseline)" if omitted is None else
+             f" (FIRST RELEASE - install/import-surface files only; {omitted} other source files not shown; "
+             "no prior baseline)")
+    prior = getattr(diff, "baseline_unavailable", "")
+    baseline = (f"\nbaseline: the prior release {_one_line(prior)[:100]} could not be fetched, so every file below "
+                "shows as (added); most of it existed before this release" if prior else "")
     header = (
         f"package: {diff.package}\nversion: {diff.version}\n"
-        f"is_first_release: {diff.is_first_release}"
-        + (" (FIRST RELEASE - whole-package scan, no prior baseline)" if diff.is_first_release else "")
+        f"is_first_release: {diff.is_first_release}{first}{baseline}"
         + f"\ntriage_score: {triage.score:.0f}\n"
         + f"untrusted_content_marker: {marker}\n"
         + f"\n{marker}\n"

@@ -27,4 +27,5 @@ def build_diff(a: ArtifactSet) -> Diff:
             changed.append(FileDiff(path, kind, hunks, new_text))
     return Diff(a.package, a.version, a.prior_version is None, changed,
                 list(a.added_binaries), list(a.added_dep_findings), _description(a.description),
-                execctx.build(a.new_files, a.too_large))
+                execctx.build(a.new_files, a.too_large),
+                a.prior_version if a.prior_error and a.prior_version else "", a.surface_omitted)
