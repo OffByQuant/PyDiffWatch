@@ -120,17 +120,22 @@ def get_evidence(conn, release_id):
 def prune(conn, retention_days: int = 0):
     """Shrink the database, keeping everything a person may act on (verdicts, alerts, the review queues and
     their evidence):
-    - compress evidence stored as plain text by older versions;
     - drop evidence nobody needs: releases reviewed benign, and releases below the review threshold;
+    - compress the remaining evidence stored as plain text by older versions;
     - with retention_days > 0, delete plain release rows older than that (no verdict, no alert, not in an
       actionable stage), except each package's newest release, and its newest release carrying maintainer
       metadata, which get_release_metadata reads as the next release's maintainer baseline;
     then compact the file."""
-    for rid, text in conn.execute("SELECT id, evidence FROM releases WHERE typeof(evidence)='text'").fetchall():
-        conn.execute("UPDATE releases SET evidence=? WHERE id=?", (zlib.compress(text.encode()), rid))
     conn.execute("UPDATE releases SET evidence=NULL WHERE evidence IS NOT NULL AND (stage='triaged' OR id IN "
                  "(SELECT release_id FROM verdicts WHERE classification='benign' "
                  "AND COALESCE(human_label,'benign')='benign'))")
+    last = 0    # compress in id-keyed batches, so a large legacy database is never held in memory at once
+    while rows := conn.execute("SELECT id, evidence FROM releases WHERE typeof(evidence)='text' AND id > ? "
+                               "ORDER BY id LIMIT 500", (last,)).fetchall():
+        for rid, text in rows:
+            conn.execute("UPDATE releases SET evidence=? WHERE id=?", (zlib.compress(text.encode()), rid))
+        conn.commit()
+        last = rows[-1][0]
     if retention_days > 0:
         cutoff = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=retention_days)).isoformat()
         # Kept stages a person may still act on: the adjudication queue, refused (never-scanned) releases, the

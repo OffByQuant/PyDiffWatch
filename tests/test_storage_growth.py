@@ -188,3 +188,22 @@ def test_prune_command_shrinks_an_existing_database(tmp_path):
     before = cfg.db_path.stat().st_size
     freed = orchestrator.prune(cfg)
     assert freed > 0 and cfg.db_path.stat().st_size < before
+
+
+def test_prune_drops_unneeded_evidence_before_compressing_and_compresses_in_batches(tmp_path, monkeypatch):
+    # Final review: the first prune on a legacy DB fetchall()ed every plain-text evidence row into memory and
+    # compressed it, including rows it was about to NULL.
+    _, conn = _db(tmp_path)
+    kept = [_old(conn, f"bad{i}", "1.0", 1, stage="needs_adjudication", evidence=_EV) for i in range(1203)]
+    dropped = _old(conn, "fine", "1.0", 1, stage="triaged", evidence=_EV)
+    compressed, sql = [], []
+    real = store.zlib.compress
+    monkeypatch.setattr(store.zlib, "compress", lambda b: compressed.append(b) or real(b))
+    conn.set_trace_callback(sql.append)
+    store.prune(conn)
+    conn.set_trace_callback(None)
+    assert len(compressed) == len(kept)                          # the triaged row was dropped, never compressed
+    assert _raw(conn, dropped) is None
+    assert all(store.get_evidence(conn, rid) == _EV for rid in kept)
+    selects = [s for s in sql if s.lstrip().upper().startswith("SELECT") and "typeof(evidence)" in s]
+    assert len(selects) >= 3 and all("LIMIT" in s for s in selects)
