@@ -318,3 +318,13 @@ def test_oversized_pth_and_egg_info_entry_points_are_unknown_in_the_block(monkey
     ctx = differ.build_diff(art).exec_context
     assert "unknown (evil.pth too large to scan)" in ctx
     assert "unknown (acme.egg-info/entry_points.txt too large)" in ctx
+
+
+@pytest.mark.parametrize("ep", [b"[pytest11]\np = e:h\n", b"#\n" * 600_000])      # small, and > 1 MiB
+def test_a_top_level_entry_points_txt_never_breaks_build_diff(ep):
+    from pydiffwatch import differ
+    from pydiffwatch.models import ArtifactSet
+    nf, bins = fetcher.extract_sdist(make_sdist({"acme/__init__.py": b"x = 2\n", "entry_points.txt": ep}), Config())
+    too_large = tuple(b["path"] for b in bins if b.get("reason") == "source-too-large")
+    d = differ.build_diff(ArtifactSet("acme", "1.1", "1.0", "sdist", nf, {}, {}, [], too_large=too_large))
+    assert "plugins" in d.exec_context

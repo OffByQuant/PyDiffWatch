@@ -607,3 +607,16 @@ def test_with_setup_py_a_literal_empty_list_is_never_a_bare_none(src, field):
 def test_without_setup_py_empty_discovery_and_startup_stay_none():
     ctx = execctx.build({"pyproject.toml": b"[project]\nname = 'a'\n"})
     assert "packages=auto-discovered: none;" in ctx and _line(ctx, "startup").endswith(": none")
+
+
+# ---- fix round 5: top-level metadata paths never raise ----
+
+@pytest.mark.parametrize("files, too_large", [
+    ({"entry_points.txt": b"[pytest11]\np = e:h\n"}, ()),
+    ({"top_level.txt": b"a\n"}, ()),
+    ({"pyproject.toml": b"[project]\nname = 'a'\n"}, ("entry_points.txt",)),
+    ({}, ("top_level.txt",)),
+    ({"entry_points.txt": b"x", "top_level.txt": b"a"}, ("entry_points.txt", "top_level.txt", "a.pth", "x")),
+])
+def test_top_level_metadata_paths_never_raise(files, too_large):
+    assert isinstance(execctx.build(files, too_large), str)

@@ -282,8 +282,8 @@ def _egg_info(files, name) -> list[str]:
     out = []
     for p in sorted(files):
         parts = p.split("/")
-        if parts[-1] == name and parts[-2].endswith(".egg-info") and (len(parts) == 2 or
-                                                                      (len(parts) == 3 and parts[0] == "src")):
+        if parts[-1] == name and (len(parts) == 2 or (len(parts) == 3 and parts[0] == "src")) and \
+                parts[-2].endswith(".egg-info"):            # length first: a top-level path has no parts[-2]
             out.append(p)
     return out
 
