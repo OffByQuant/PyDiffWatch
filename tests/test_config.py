@@ -48,13 +48,13 @@ def test_cli_missing_config_exits_with_error(tmp_path):
     import argparse
     from pydiffwatch.__main__ import _cfg
     with pytest.raises(SystemExit, match="nope.toml"):
-        _cfg(argparse.Namespace(config=str(tmp_path / "nope.toml")))
+        _cfg(argparse.Namespace(config=str(tmp_path / "nope.toml"), model=None, endpoint=None))
 
 
 def test_cli_without_config_uses_defaults():
     import argparse
     from pydiffwatch.__main__ import _cfg
-    assert _cfg(argparse.Namespace(config=None)) == Config()
+    assert _cfg(argparse.Namespace(config=None, model=None, endpoint=None)) == Config()
 
 
 def test_default_max_output_tokens_fits_reasoning_models():

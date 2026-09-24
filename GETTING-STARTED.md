@@ -192,8 +192,9 @@ pydiffwatch -c pydiffwatch.toml seed-now
 ```
 
 (You can skip this: a plain `run` on a fresh database self-seeds the cursor to "now" and processes
-nothing that tick, then the next tick polls forward. Use `run --backfill` to process historical releases
-from genesis instead.)
+nothing that tick, then the next tick polls forward. `run --recent N` (or `watch --recent N`) starts N PyPI
+changelog events back instead and scans them right away; one release is several events, so that is fewer
+than N releases. Use `run --backfill` to process historical releases from genesis instead.)
 
 **Each tick** — this is what your scheduler runs:
 
@@ -287,12 +288,18 @@ refreshes the dashboard after each tick, and — with `--serve` — serves it th
 you a running monitor plus a live results page:
 
 ```bash
-pydiffwatch -c pydiffwatch.toml seed-now                  # first time only (start "from now")
-pydiffwatch -c pydiffwatch.toml watch --serve             # scan every 5 min + live dashboard
+pydiffwatch -c pydiffwatch.toml watch --serve --recent 500   # start 500 changelog events back + live dashboard
+pydiffwatch --model qwen-singleshot watch --serve             # same, no config file: OpenAI-compatible server
 # → open http://127.0.0.1:8787/dashboard.html
 ```
 
-`--interval N` sets the seconds between scans (default 300); `--out`/`--port` work as above. A failed scan
+Without `--recent`, a fresh database starts "from now" and the first results appear on the next scan.
+`--recent N` counts PyPI changelog events, not releases: one release is several events (the release plus
+one per uploaded file). While a backlog is waiting (a `--recent` start, or a restart after downtime), `watch`
+scans back-to-back and sleeps only once it has caught up. `--model` / `--endpoint` (default
+`http://localhost:8000/v1`) override the config's reviewer with an OpenAI-compatible server; no API key needed.
+
+`--interval N` sets the seconds between scans once caught up (default 300); `--out`/`--port` work as above. A failed scan
 (network blip, endpoint down) is logged and the daemon keeps going; Ctrl-C stops cleanly. The dashboard's
 status strip shows whether your model endpoint is reachable and how long ago the last scan ran — start your
 model server (§2) before `watch --serve`, or reviews fall back to heuristics until it's up.

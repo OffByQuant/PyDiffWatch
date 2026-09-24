@@ -56,28 +56,36 @@ two-tier idea in a nutshell — a frontier model can **orchestrate** while a che
 
 ## 🛠️ Get started — by hand
 
-No agent required. Plain commands poll the firehose and still use your local LLM for every review:
+No agent required. Clone, install, and start scanning with your model server's model name:
 
 ```bash
 git clone https://github.com/OffByQuant/PyDiffWatch pydiffwatch && cd pydiffwatch
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e .                                # requires Python 3.11+
 
-cp examples/local-qwen.toml pydiffwatch.toml    # point at your local model endpoint
-pydiffwatch -c pydiffwatch.toml seed-now        # start watching "from now"
-pydiffwatch -c pydiffwatch.toml run             # process new releases (repeat on a schedule)
-pydiffwatch -c pydiffwatch.toml pending         # see suspicious releases awaiting your verdict
+pydiffwatch --model qwen-singleshot watch --serve --recent 500
+# → scans PyPI, reviews flagged releases with your model, dashboard at http://127.0.0.1:8787/dashboard.html
+```
+
+- `--model` is the model name your OpenAI-compatible server expects (llama.cpp, llama-swap, Ollama, vLLM).
+  No API key needed.
+- `--endpoint` is where that server listens. Leave it out for `http://localhost:8000/v1`, or point it at
+  another machine: `--endpoint http://192.168.1.20:8000/v1`.
+- `--recent 500` starts 500 PyPI changelog events back, so results show up within minutes. One release is
+  several events (the release plus one per uploaded file), so that is fewer than 500 releases. Leave it out
+  to watch only what's published from now on. Once scanning has started, a restart resumes where it
+  stopped, and while a backlog is waiting `watch` scans back-to-back, sleeping only once it has caught up.
+
+For everything else (a frontier API with a key, reasoning-model settings, webhooks) use a config file:
+`cp examples/local-qwen.toml pydiffwatch.toml`, then pass `-c pydiffwatch.toml`. Other commands:
+
+```bash
+pydiffwatch -c pydiffwatch.toml run             # one scan tick (for cron, systemd, CI)
+pydiffwatch -c pydiffwatch.toml pending         # suspicious releases awaiting your verdict
 pydiffwatch -c pydiffwatch.toml review-pending  # review what the LLM couldn't (e.g. with a bigger model)
 ```
 
-Prefer one command that scans continuously **and** shows you a live results page? Use the built-in daemon:
-
-```bash
-pydiffwatch -c pydiffwatch.toml watch --serve   # scan on a loop + serve the dashboard (↓)
-```
-
-Drop `run` into a cron job, `systemd` timer, container, or CI schedule to monitor continuously. You can
-also run with **no model at all** (rules-only heuristic alerts) when you have no GPU or budget.
+You can also run with **no model at all** (rules-only heuristic alerts) when you have no GPU or budget.
 
 **→ Full setup — endpoints, API keys, scheduling, heuristic-only mode, troubleshooting:
 [GETTING-STARTED.md](GETTING-STARTED.md)**

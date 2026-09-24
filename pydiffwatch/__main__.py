@@ -1,4 +1,5 @@
 import argparse
+import dataclasses
 from . import egress, store
 from .config import Config, load_config
 from .orchestrator import (run_once, seed_now, list_pending, adjudicate, get_evidence,
@@ -7,12 +8,15 @@ from .orchestrator import (run_once, seed_now, list_pending, adjudicate, get_evi
 
 
 def _cfg(args):
-    if not args.config:
-        return Config()
     try:
-        return load_config(args.config)
+        cfg = load_config(args.config) if args.config else Config()
     except FileNotFoundError as e:
         raise SystemExit(f"pydiffwatch: {e}")
+    if args.model or args.endpoint:       # an OpenAI-compatible server (llama.cpp, llama-swap, Ollama, vLLM)
+        rc = dataclasses.replace(cfg.reviewer, provider="openai", model=args.model or cfg.reviewer.model,
+                                 base_url=args.endpoint or cfg.reviewer.base_url)
+        cfg = dataclasses.replace(cfg, reviewer=rc, reviewer_enabled=True)
+    return cfg
 
 
 def _reach(host):
@@ -35,11 +39,20 @@ def main():
     p = argparse.ArgumentParser(prog="pydiffwatch")
     p.add_argument("-c", "--config", default=None,
                    help="path to a pydiffwatch.toml config file (see examples/); defaults to built-ins")
+    p.add_argument("--model", default=None,
+                   help="reviewer model name on an OpenAI-compatible server (llama.cpp, llama-swap, Ollama, "
+                        "vLLM); no API key needed. Overrides the config file")
+    p.add_argument("--endpoint", default=None,
+                   help="that server's URL (default: http://localhost:8000/v1), e.g. "
+                        "http://192.168.1.20:8000/v1 for a model on another machine")
     sub = p.add_subparsers(dest="cmd", required=True)
     runp = sub.add_parser("run", help="process new releases since the cursor (one tick)")
     runp.add_argument("--backfill", action="store_true",
                       help="process from the cursor as-is (PyPI genesis on a fresh DB) instead of "
                            "seeding a fresh cursor to now")
+    runp.add_argument("--recent", type=int, default=None, metavar="N",
+                      help="on a fresh database, start N PyPI changelog events back instead of now (one "
+                           "release is several events: the release plus one per uploaded file)")
     sub.add_parser("seed-now",
                    help="set the cursor to PyPI's current serial and exit (start monitoring from now)")
     sub.add_parser("pending",
@@ -79,8 +92,13 @@ def main():
     wp = sub.add_parser("watch",
                         help="daemon loop: scan for new releases on an interval, refresh the "
                              "dashboard each tick, and (with --serve) serve it on localhost")
-    wp.add_argument("--interval", type=int, default=300, help="seconds between scans (default: 300)")
+    wp.add_argument("--interval", type=int, default=300,
+                    help="seconds between scans once caught up (default: 300)")
     wp.add_argument("--out", default=None, help="dashboard HTML path (default: <db dir>/dashboard.html)")
+    wp.add_argument("--recent", type=int, default=None, metavar="N",
+                    help="on a fresh database, start N PyPI changelog events back instead of now (one "
+                         "release is several events), so the dashboard fills within minutes (ignored once "
+                         "scanning has started)")
     wp.add_argument("--serve", action="store_true",
                     help="also serve the dashboard on 127.0.0.1 (localhost only) while watching")
     wp.add_argument("--port", type=int, default=8787, help="port for --serve (default: 8787)")
@@ -93,7 +111,7 @@ def main():
     # mutates global socket state, so it stays a CLI-entry concern (see egress.py docstring).
     egress.install_guard(cfg)   # default-deny host allowlist for the whole process (see egress.py)
     if args.cmd == "run":
-        n = run_once(cfg, seed_if_fresh=not args.backfill)
+        n = run_once(cfg, seed_if_fresh=not args.backfill, recent=args.recent)
         print(f"[pydiffwatch] processed {n} releases")
     elif args.cmd == "seed-now":
         s = seed_now(cfg)
@@ -172,7 +190,7 @@ def main():
             threading.Thread(target=httpd.serve_forever, daemon=True).start()
             print(f"[pydiffwatch] serving http://{args.host}:{args.port}/{out.name} ({_reach(args.host)})")
         print(f"[pydiffwatch] watching — scanning every {args.interval}s, Ctrl-C to stop")
-        n = watch(cfg, interval=args.interval, out_path=args.out)
+        n = watch(cfg, interval=args.interval, out_path=args.out, recent=args.recent)
         if httpd:
             httpd.server_close()
         print(f"\n[pydiffwatch] stopped after {n} scan(s)")

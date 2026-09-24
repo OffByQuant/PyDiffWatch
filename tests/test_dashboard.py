@@ -55,7 +55,7 @@ def test_watch_refreshes_dashboard_each_tick_and_is_bounded(tmp_path, monkeypatc
     cfg = _cfg(tmp_path)
     # don't hit PyPI: stub the scan so watch() only exercises its loop + dashboard refresh
     ticks = {"n": 0}
-    monkeypatch.setattr(orchestrator, "run_once", lambda c: ticks.__setitem__("n", ticks["n"] + 1))
+    monkeypatch.setattr(orchestrator, "run_once", lambda c, **k: ticks.__setitem__("n", ticks["n"] + 1))
     sleeps = []
     n = orchestrator.watch(cfg, interval=42, iterations=3, sleep_fn=sleeps.append)
     assert n == 3
@@ -66,7 +66,7 @@ def test_watch_refreshes_dashboard_each_tick_and_is_bounded(tmp_path, monkeypatc
 
 def test_watch_survives_a_failing_scan(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
-    def boom(c):
+    def boom(c, **k):
         raise RuntimeError("scan exploded")
     monkeypatch.setattr(orchestrator, "run_once", boom)
     n = orchestrator.watch(cfg, iterations=2, sleep_fn=lambda _: None)

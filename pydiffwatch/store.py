@@ -263,10 +263,11 @@ def pending_adjudication(conn):
     labelled. Joined with the release so the caller can re-fetch the diff."""
     return conn.execute(
         """SELECT r.id AS release_id, r.package, r.version, r.serial, r.triage_score, r.triage_rules,
-                  r.evidence,
+                  r.evidence, r.stage,
                   v.classification, v.confidence, v.attack_type, v.reasoning, v.cited_hunk, v.model
            FROM releases r JOIN verdicts v ON v.release_id = r.id
-           WHERE r.stage = 'needs_adjudication' AND v.human_label IS NULL
+           WHERE r.stage IN ('needs_adjudication', 'refused_to_extract', 'refused_to_fetch')
+             AND v.human_label IS NULL
            ORDER BY r.id""").fetchall()
 
 def adjudicate(conn, release_id, label, note):
