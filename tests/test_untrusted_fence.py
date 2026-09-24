@@ -52,3 +52,36 @@ def test_member_names_with_control_characters_are_refused():
         t.addfile(ti, io.BytesIO(b"x=1"))
     with pytest.raises(fetcher.RefusedToExtract, match="member-name"):
         fetcher.extract_sdist(buf.getvalue(), Config())
+
+
+# Both author-controlled context blocks (locations, then description) open the fenced body together.
+_DESC = "a harmless date formatter " * 12
+
+
+def _both(path, line, max_chars):
+    d = Diff("p", "1.0.1", False, [FileDiff(path, "modified", [Hunk((0, 1), (0, 1), [line], [])])], [],
+             description=_DESC.strip())
+    return reviewer.build_review_input(d, TriageResult(60.0, [FiredRule("py-exec", 60.0, path, (1, 1))], True),
+                                       max_chars=max_chars)
+
+
+def test_locations_and_description_together_are_not_reviewable_content():
+    text = _both("a.py", "x" * 5_000, 2_000)
+    assert "flagged_locations: a.py:1-1" in text and reviewer._DESC_HEADING in text
+    assert "--- file:" not in text
+    assert not reviewer._has_reviewable_content(text)
+
+
+def test_a_path_naming_the_description_heading_stays_fenced_and_hides_no_content():
+    text = _both(f"pkg/{reviewer._DESC_HEADING}.py", "exec(x)", 10_000)
+    trusted, _ = _zones(text)
+    assert reviewer._DESC_HEADING not in trusted
+    assert reviewer._has_reviewable_content(text)
+
+
+def test_input_size_accounting_counts_locations_and_description():
+    full = len(_both("a.py", "exec(x)", 100_000))
+    for max_chars in range(full - 400, full + 100):
+        text = _both("a.py", "exec(x)", max_chars)
+        if "--- file:" in text:
+            assert len(text) <= max_chars, max_chars
