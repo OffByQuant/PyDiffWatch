@@ -1,5 +1,7 @@
 import ast
 
+import pytest
+
 from pydiffwatch.facts import build_facts
 from pydiffwatch.models import Diff, FileDiff, Hunk
 
@@ -240,3 +242,22 @@ def test_pth_invalid_utf8_later_on_import_line_does_not_crash():
         [Hunk((0, 0), (0, 1), added, [])], new_text)], [])
     f = build_facts(d).files[0]   # must not raise
     assert "process" in f.autoexec_categories
+
+
+@pytest.mark.parametrize("full", [
+    "import os\n\n@deco(os.system('x'))\ndef f():\n    pass\n",                     # decorator argument
+    "import os\n\ndef f(x=os.system('y')):\n    pass\n",                          # default argument
+    "import os\n\ndef f(*, x=os.system('y')):\n    pass\n",                       # keyword-only default
+    "import os\n\ndef f(x: os.system('y')):\n    pass\n",                         # argument annotation
+    "import os\n\ndef f() -> os.system('y'):\n    pass\n",                        # return annotation
+    "import os\n\ng = lambda x=os.system('y'): x\n",                             # lambda default
+])
+def test_a_call_in_a_function_header_runs_at_import_time(full):
+    # Decorators, defaults and annotations are evaluated when the `def` runs, i.e. at import; only the body waits.
+    f = build_facts(_wholefile("pkg/__init__.py", full)).files[0]
+    assert "process" in f.autoexec_categories
+
+
+def test_a_call_in_a_function_body_still_does_not_run_at_import_time():
+    full = "import os\n\n@staticmethod\ndef f(x=1) -> int:\n    os.system('y')\n"
+    assert "process" not in build_facts(_wholefile("pkg/__init__.py", full)).files[0].autoexec_categories

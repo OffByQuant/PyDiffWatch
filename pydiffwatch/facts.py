@@ -145,7 +145,17 @@ def _importtime_call_ids(tree) -> set:
         while stack:
             child = stack.pop()
             if isinstance(child, _FUNC_NODES):
-                continue                              # a function/lambda body runs on call, not at import
+                # Its body runs on call, not at import; its header runs with the `def`/`lambda`: decorators,
+                # defaults and annotations.
+                a = child.args
+                stack.extend(getattr(child, "decorator_list", ()))
+                stack.extend(a.defaults)
+                stack.extend(d for d in a.kw_defaults if d is not None)
+                stack.extend(x.annotation for x in (*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg)
+                             if x is not None and x.annotation is not None)
+                if getattr(child, "returns", None) is not None:
+                    stack.append(child.returns)
+                continue
             if isinstance(child, ast.Call):
                 yield child
             stack.extend(ast.iter_child_nodes(child))
