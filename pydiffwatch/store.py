@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS verdicts(id INTEGER PRIMARY KEY,
 CREATE TABLE IF NOT EXISTS reviewer_stats(endpoint TEXT, model TEXT, tok_s REAL, chars_per_token REAL,
   samples INTEGER, state TEXT, detail TEXT, paused_until REAL, slow_streak INTEGER, updated_at TEXT,
   PRIMARY KEY(endpoint, model));
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 """
 
 def _now(): return datetime.datetime.now(datetime.UTC).isoformat()
@@ -96,15 +97,68 @@ def update_release_metadata(conn, release_id, maintainer_metadata_json):
 def update_evidence(conn, release_id, evidence_text):
     """Persist the flagged payload code (rendered diff TEXT) for a release. Stored INERT — never
     written to an executable path, never run (§0 containment). Self-contained evidence for a PyPI
-    takedown report that survives a device move and the package being pulled from PyPI."""
-    conn.execute("UPDATE releases SET evidence=? WHERE id=?", (evidence_text, release_id))
+    takedown report that survives a device move and the package being pulled from PyPI. Compressed."""
+    conn.execute("UPDATE releases SET evidence=? WHERE id=?", (zlib.compress(evidence_text.encode()), release_id))
     conn.commit()
+
+def clear_evidence(conn, release_id):
+    conn.execute("UPDATE releases SET evidence=NULL WHERE id=?", (release_id,))
+    conn.commit()
+
+def evidence_text(value):
+    """Stored evidence as text: compressed bytes, or plain text written by older versions."""
+    if value is None or isinstance(value, str):
+        return value
+    return zlib.decompress(value).decode()
 
 def get_evidence(conn, release_id):
     """The stored flagged payload code for a release (TEXT), or None if absent. Read-only accessor for
     `diffwatch evidence <release_id>` — works for any release, not just the adjudication queue."""
     row = conn.execute("SELECT evidence FROM releases WHERE id=?", (release_id,)).fetchone()
-    return row[0] if row else None
+    return evidence_text(row[0]) if row else None
+
+def prune(conn, retention_days: int = 0):
+    """Shrink the database, keeping everything a person may act on (verdicts, alerts, the review queues and
+    their evidence):
+    - compress evidence stored as plain text by older versions;
+    - drop evidence nobody needs: releases reviewed benign, and releases below the review threshold;
+    - with retention_days > 0, delete plain release rows older than that (no verdict, no alert, not in an
+      actionable stage), except each package's newest release, and its newest release carrying maintainer
+      metadata, which get_release_metadata reads as the next release's maintainer baseline;
+    then compact the file."""
+    for rid, text in conn.execute("SELECT id, evidence FROM releases WHERE typeof(evidence)='text'").fetchall():
+        conn.execute("UPDATE releases SET evidence=? WHERE id=?", (zlib.compress(text.encode()), rid))
+    conn.execute("UPDATE releases SET evidence=NULL WHERE evidence IS NOT NULL AND (stage='triaged' OR id IN "
+                 "(SELECT release_id FROM verdicts WHERE classification='benign' "
+                 "AND COALESCE(human_label,'benign')='benign'))")
+    if retention_days > 0:
+        cutoff = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=retention_days)).isoformat()
+        # Kept stages a person may still act on: the adjudication queue, refused (never-scanned) releases, the
+        # LLM-review queue, and metadata downloads still retrying or given up on (both shown by `pending`).
+        # Partitioning by (package, has metadata) keeps the newest row overall and the newest with metadata:
+        # PyPI's predecessor skips versions without an sdist, which have no maintainer metadata.
+        conn.execute("DELETE FROM releases WHERE processed_at < ? "
+                     "AND stage NOT IN ('pending_review','needs_adjudication','refused_to_extract',"
+                     "'refused_to_fetch','metadata_retry','gave_up') "
+                     "AND id NOT IN (SELECT release_id FROM verdicts WHERE release_id IS NOT NULL) "
+                     "AND id NOT IN (SELECT release_id FROM alerts WHERE release_id IS NOT NULL) "
+                     "AND id NOT IN (SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY package, "
+                     "maintainer_metadata IS NULL ORDER BY processed_at DESC, id DESC) AS n FROM releases) "
+                     "WHERE n = 1)", (cutoff,))
+    conn.commit()
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.execute("VACUUM")
+
+def maybe_prune(conn, retention_days: int, every_s: float, now: float) -> bool:
+    """prune() if the last one (recorded in the database, so cron-driven `run` counts too) is every_s old."""
+    row = conn.execute("SELECT value FROM meta WHERE key='last_prune'").fetchone()
+    if row and now - float(row[0]) < every_s:
+        return False
+    prune(conn, retention_days)
+    conn.execute("INSERT INTO meta(key, value) VALUES('last_prune', ?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(now),))
+    conn.commit()
+    return True
 
 def releases_needing_evidence(conn, release_id=None, all_flagged=False):
     """Flagged releases whose payload was never captured (evidence IS NULL) — the backfill target set.

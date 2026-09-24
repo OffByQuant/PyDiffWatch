@@ -225,6 +225,24 @@ pydiffwatch -c pydiffwatch.toml capture-evidence --release-id <id>
 pydiffwatch -c pydiffwatch.toml capture-evidence --all           # widen to every fired-rule row (more re-fetches)
 ```
 
+**Keeping the database small.** Evidence is stored compressed, and only for releases escalated to review.
+`run` and `watch` prune the database by themselves at most once every `prune_every_hours` (24). Pruning keeps
+everything a person may act on (verdicts, alerts, the review and metadata-retry queues, refused releases and
+their evidence) and:
+
+- compresses evidence stored as plain text by older versions, and drops it for releases reviewed benign or
+  never escalated to the reviewer;
+- deletes plain release rows older than `retention_days` (90; `0` keeps everything), except each package's
+  newest release and its newest release with maintainer metadata, which the next release's
+  maintainer-change check compares against;
+- compacts the file.
+
+To prune right away:
+
+```bash
+pydiffwatch -c pydiffwatch.toml prune
+```
+
 **The LLM-review queue.** Review never blocks the scan. When the reviewer can't handle a flagged release,
 the release is parked with a reason and the cursor moves on; the review input is stored (compressed) so a
 later review doesn't depend on PyPI still hosting the sdist.

