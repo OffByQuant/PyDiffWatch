@@ -306,15 +306,22 @@ def build_review_input(diff, triage, *, max_chars: int, dropped: list | None = N
     sig = getattr(diff, "signals", "")
     sig_text = _render_block(_SIG_HEADING, sig, _SIG_MAX_CHARS) if sig else ""
     body_parts = [t for t in (loc_text, desc_text, exec_text, sig_text) if t]
-    used, truncated = len(header) + len(marker) + _NOTE_RESERVE + len("\n".join(body_parts)), False
+    # Exact: text = header + "\n".join(body_parts) + "\n" + marker + a note no longer than _NOTE_RESERVE.
+    used, truncated = len(header) + len("\n".join(body_parts)) + 1 + len(marker) + _NOTE_RESERVE, False
+    weights = _file_weights(triage)
     rendered_paths = []
     for path in ranked_paths:
         rendered = _render_file(by_path[path])
-        if used + len(rendered) + 1 > max_chars:
+        add = len(rendered) + (1 if body_parts else 0)
+        if used + add > max_chars:
             truncated = True
-            break
+            # A weighted file, or the top-ranked one, that does not fit stops here (InputTooLarge keys on the top
+            # file). A zero-weight file after something rendered is skipped, so it cannot hide smaller ones.
+            if weights.get(path, 0.0) > 0.0 or not rendered_paths:
+                break
+            continue
         body_parts.append(rendered)
-        used += len(rendered) + 1
+        used += add
         rendered_paths.append(path)
 
     text = header + "\n".join(body_parts) + f"\n{marker}"
@@ -323,7 +330,6 @@ def build_review_input(diff, triage, *, max_chars: int, dropped: list | None = N
     elif len(ranked_paths) != len(diff.changed):
         text += FIRST_RELEASE_NOTE if diff.is_first_release else SELECTION_NOTE
     if dropped is not None:
-        weights = _file_weights(triage)
         rendered_set = set(rendered_paths)
         dropped.extend(sorted((p for p in by_path if p not in rendered_set and weights.get(p, 0.0) > 0.0),
                               key=lambda p: -weights[p]))
