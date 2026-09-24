@@ -255,16 +255,16 @@ Under setuptools with nothing declared, the import line lists what auto-discover
 `packages=auto-discovered: ...` (directories with an `__init__.py`, top level or under `src/`, except
 `tests`, `docs`, `examples` and similar) and `py-modules=auto-discovered: ...` (top-level or `src/` `*.py`
 files, except `setup.py` and `conftest.py`). A module is listed only when its name is a Python identifier,
-as setuptools installs only those. A package directory is listed when its name is a Python identifier
-once each `-` reads as `_`, so a flat-layout `foo-stubs`, a hyphenated `src/` directory or a non-ASCII name
-like `pkgé` still shows, while a name with `;`, `=`, `,`, a space or a dot never does. When it finds nothing it says `none found by DiffWatch
-(setuptools auto-discovery may also find modules and namespace packages)` (or, while setup.py exists,
-`none declared literally in setup.py (setup.py runs arbitrary code at build)`), never a bare "none". At
-most three `<name>.egg-info/entry_points.txt` files are parsed; the rest are named on the commands and
-plugins lines as `unknown (N more egg-info entry_points.txt not read)`. Likewise at most three
-`<name>.egg-info/top_level.txt` files are read; the rest are named first in the import line's
-`top_level.txt=` field as `unknown (N more egg-info top_level.txt not read)`, after any oversized one,
-which reads `unknown (<path> too large to scan)`, never "not found".
+as setuptools installs only those. A package directory is listed when its name is a Python identifier once
+each `-` reads as `_`, so a flat-layout `foo-stubs`, a hyphenated `src/` directory or a non-ASCII name
+like `pkgé` still shows, while a name with `;`, `=`, `,`, a space or a dot never does. When it finds
+nothing it says `none found by DiffWatch (setuptools auto-discovery may also find modules and namespace
+packages)` (or, while setup.py exists, `none declared literally in setup.py (setup.py runs arbitrary code
+at build)`), never a bare "none". At most three `<name>.egg-info/entry_points.txt` files are parsed; the
+rest are named on the commands and plugins lines as `unknown (N more egg-info entry_points.txt not read)`.
+Likewise at most three `<name>.egg-info/top_level.txt` files are read; the rest are named first in the
+import line's `top_level.txt=` field as `unknown (N more egg-info top_level.txt not read)`, after any
+oversized one, which reads `unknown (<path> too large to scan)`, never "not found".
 
 The import line is best-effort and may be incomplete: a build backend can discover or generate modules it
 doesn't list, so a module missing from it is not evidence that the module isn't shipped. A build file
