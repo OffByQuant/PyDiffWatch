@@ -302,3 +302,19 @@ def test_an_oversized_setup_py_is_unknown_in_the_block_never_absent(monkeypatch,
     ctx = differ.build_diff(art).exec_context
     assert "setup.py=unknown (too large to scan)" in ctx and "absent" not in ctx
     assert "plugins" in ctx and "unknown (setup.py too large)" in ctx
+
+
+def test_oversized_pth_and_egg_info_entry_points_are_unknown_in_the_block(monkeypatch):
+    from pydiffwatch import differ
+    pad = b"# pad\n" * 200_000                                                        # > 1 MiB max_source_file_bytes
+    monkeypatch.setattr(fetcher, "_package_json", lambda p, cfg: _meta("acme", [
+        ("1.0", "2026-01-01T00:00:00Z"), ("1.1", "2026-01-02T00:00:00Z")]))
+    blobs = {"mock://acme/1.0": make_sdist({"acme/__init__.py": b"x = 1\n"}),
+             "mock://acme/1.1": make_sdist({"acme/__init__.py": b"x = 2\n", "evil.pth": b"import os\n" + pad,
+                                            "acme.egg-info/entry_points.txt": b"[pytest11]\np = evil:hook\n" + pad})}
+    monkeypatch.setattr(fetcher, "_download", lambda url, cfg: blobs[url])
+    monkeypatch.setattr(fetcher, "_screen_added_deps", lambda *a, **k: [])
+    art = fetcher.fetch_artifacts(Config(), NewRelease("acme", "1.1", 5))
+    ctx = differ.build_diff(art).exec_context
+    assert "unknown (evil.pth too large to scan)" in ctx
+    assert "unknown (acme.egg-info/entry_points.txt too large)" in ctx

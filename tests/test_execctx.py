@@ -571,3 +571,18 @@ def test_a_setup_cfg_inline_entry_points_string_is_read():
 def test_setup_cfg_directives_on_declaring_keys_are_unknown(key, field, what, directive, src):
     ctx = _cfg(f"{key} = {directive}")
     assert f"{field}=unknown (setup.cfg reads {what} from {src})" in ctx, ctx
+
+
+# ---- fix round 4: oversized non-build sources ----
+
+def test_an_oversized_pth_is_unknown_startup():
+    ctx = execctx.build({"a.pth": b"import os\n"}, too_large=["evil.pth", "pkg/huge.py"])
+    assert _line(ctx, "startup").endswith(": a.pth: 1 import line, unknown (evil.pth too large to scan)")
+    assert "huge.py" not in ctx
+
+
+def test_an_oversized_egg_info_entry_points_txt_is_unknown():
+    ctx = execctx.build({"pyproject.toml": b"[project]\nname = 'a'\n"}, too_large=["a.egg-info/entry_points.txt"])
+    u = "unknown (a.egg-info/entry_points.txt too large)"
+    assert _line(ctx, "commands").endswith(f": {u}") and _line(ctx, "plugins").endswith(f": {u}")
+    assert "cmdclass=none" in ctx                       # entry_points.txt declares only entry points

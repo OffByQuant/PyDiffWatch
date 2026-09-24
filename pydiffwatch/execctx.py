@@ -302,11 +302,12 @@ _DYNAMIC_EPS = {"scripts", "gui-scripts", "entry-points"}
 def build(new_files: dict[str, bytes], too_large=()) -> str:
     """The execution-context block for one release, as plain lines (the reviewer escapes and fences them).
 
-    too_large: paths the extractor recorded as too large to scan (not in new_files). A build file among them is
-    unknown, never "absent". Best effort by construction: while setup.py exists, a field it could declare is
+    too_large: paths the extractor recorded as too large to scan (not in new_files). A build file, a .pth or an
+    egg-info entry_points.txt among them is unknown, never "absent" or "none". Best effort by construction: while setup.py exists, a field it could declare is
     never a bare "none", because setup.py is arbitrary code."""
     unparseable: list[str] = []
-    why: dict[str, str] = {p: "too large" for p in _BUILD_FILES if p in too_large}   # source -> why it is unknown
+    why: dict[str, str] = {p: "too large" for p in (*_BUILD_FILES, *_egg_info(too_large, "entry_points.txt"))
+                           if p in too_large}      # source -> why it is unknown
 
     def parsed(path, kind):
         if path not in new_files:
@@ -386,6 +387,7 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
 
     # startup
     pths = [_pth(p, b) for p, b in sorted(new_files.items()) if p.endswith(".pth")]
+    pths += [f"unknown ({p} too large to scan)" for p in sorted(too_large) if p.endswith(".pth")]
     startup = ("startup (.pth files; an `import` line runs at every interpreter start if the file is installed "
                f"into site-packages): {_join(pths)}")
 
@@ -445,7 +447,7 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
              f"commands (console_scripts/gui_scripts; run only when the user types them): {cmds}",
              "plugins (entry points loaded automatically by another tool, e.g. pytest11 runs on every pytest "
              f"run): {plugins}"]
-    lines += [f"{p}: unknown (too large to scan)" for p, r in why.items() if r == "too large"]   # at most 3
+    lines += [f"{p}: unknown (too large to scan)" for p in _BUILD_FILES if why.get(p) == "too large"]   # at most 3
     if unparseable:                                     # one line, however many files: bounded
         lines.append(f"unparseable: {_join(unparseable)}")
     lines.append("other: files under tests/ docs/ examples/ are not imported by the package unless listed above")
