@@ -175,7 +175,7 @@ def test_review_schema_emits_decision_fields_before_prose():
     # the schema so the decision fields land first and only the verbose prose is at risk if truncated.
     from pydiffwatch import reviewer
     keys = list(reviewer.REVIEW_SCHEMA["properties"].keys())
-    assert keys[0] == "classification"
+    assert keys[:2] == ["runs_when", "classification"]     # spec B5: when it runs, then the verdict
     for decision in ("urgent", "recommended_action", "attack_type"):
         assert keys.index(decision) < keys.index("reasoning")
         assert keys.index(decision) < keys.index("cited_hunk")

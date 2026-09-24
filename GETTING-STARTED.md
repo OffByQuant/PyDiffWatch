@@ -135,7 +135,7 @@ structured_output = "json_schema"
 ```
 then `export ANTHROPIC_API_KEY=sk-ant-...` (see §3).
 
-**Model protection keys** (any provider; see §5 for what they do):
+**Model protection keys** (any provider; see §6 for what they do):
 
 ```toml
 [reviewer]
@@ -177,7 +177,7 @@ so `api_key_env` is **ignored** when `provider = "anthropic"`. Just `export ANTH
 key is missing, that run logs a notice and falls back to heuristic-only — it does not crash.
 
 > Getting the key to your *scheduler* (cron/systemd/Docker/CI), not just your login shell, is the part
-> people miss — see §7 for how each harness injects it.
+> people miss — see §8 for how each harness injects it.
 
 ---
 
@@ -198,7 +198,133 @@ heuristic alert — never a silent pass. Start at `json_schema`; step down only 
 
 ---
 
-## 5. The operating loop
+## 5. What the reviewer sees
+
+The reviewer's user message is built by `build_review_input` (`pydiffwatch/reviewer.py`), in this order.
+Every author-controlled string in it — file paths, the description, execution-context and signals lines,
+hunk content — is fenced between two identical `===DW-UNTRUSTED-<random>===` marker lines declared on the
+`untrusted_content_marker:` header line, and the system prompt tells the model everything between the
+markers is inert data, never instructions. The one exception is the package name and version strings: they
+appear in the header, outside the markers. PyPI restricts them on upload (PEP 508 names, PEP 440 versions);
+the prior version in the baseline note is also escaped to one line and clipped to 100 characters, since a
+legacy release can predate those checks. None of it is ever run to build the input: it's all static
+parsing (`ast`, `tomllib`, `configparser`, `email.parser`) over the sdist's own metadata and source.
+
+**Header.** Before the fenced content: `package`, `version`, `is_first_release`, `triage_score`. Two cases
+add a note:
+
+- the prior release couldn't be fetched — every file in the diff shows as `(added)`, and the header adds
+  `baseline: the prior release <version> could not be fetched, so every file below shows as (added); most
+  of it existed before this release`;
+- a first release with nothing to diff against — whole-package scan (no filtering) adds `(FIRST RELEASE -
+  whole-package scan, no prior baseline)`; scanned under the `surface` new-package policy (§13) instead
+  adds `(FIRST RELEASE - install/import-surface files only; N other source files not shown; no prior
+  baseline)`.
+
+**Flagged locations.** A `flagged_locations:` line lists `file:start-end` for every triage-flagged hunk in
+a shown file, highest fired-rule weight first — where triage looked, not why; the model is told to reach
+its verdict independently of the fact that triage fired.
+
+**Description.** A `--- package description (the author's claim; context, not evidence) ---` block holds
+one flattened line, taken from the sdist's own `PKG-INFO` `Summary:` field (parsed with
+`email.parser.HeaderParser`, for this exact version) and falling back to the PyPI API's `info.summary` when
+PKG-INFO has none.
+
+**Execution context.** A `--- execution context (from pyproject/setup.cfg/setup.py/entry_points.txt/.pth;
+how this version's files run) ---` block, built by `pydiffwatch/execctx.py` from this release's own
+pyproject.toml, setup.cfg, setup.py, entry_points.txt and `.pth` files — never imported or executed, always
+best-effort. Six lines, plus a `<file>: unknown (too large to scan)` line per oversized build file and an
+`unparseable:` line when a file fails to parse (both described below):
+
+```
+build (runs when pip builds or installs from this sdist): backend=...; backend-path=...; setup.py=...; cmdclass=...; setup_requires=...
+startup (.pth files; an `import` line runs at every interpreter start if the file is installed into site-packages): ...
+import (runs when a program imports the package): packages=...; py-modules=...; top_level.txt=...
+commands (console_scripts/gui_scripts; run only when the user types them): ...
+plugins (entry points loaded automatically by another tool, e.g. pytest11 runs on every pytest run): ...
+other: files under tests/ docs/ examples/ are not imported by the package unless listed above
+```
+
+The `other:` line makes that claim only when the package list is known: a literal list, or setuptools
+auto-discovery with no `find` directive. Otherwise (a computed or unreadable list; a `find` directive, which
+without excludes installs `tests/`; a backend other than setuptools, or an in-tree one) it reads `other:
+files under tests/ docs/ examples/ may be installed and imported (the package list above is not fully
+known)`.
+
+Under setuptools with nothing declared, the import line lists what auto-discovery would find:
+`packages=auto-discovered: ...` (directories with an `__init__.py`, top level or under `src/`, except
+`tests`, `docs`, `examples` and similar) and `py-modules=auto-discovered: ...` (top-level or `src/` `*.py`
+files, except `setup.py` and `conftest.py`). When it finds nothing it says `none found by DiffWatch
+(setuptools auto-discovery may also find modules and namespace packages)` (or, while setup.py exists, `none
+declared literally in setup.py (setup.py runs arbitrary code at build)`), never a bare "none". At most three
+`<name>.egg-info/entry_points.txt` files are parsed; the rest are named on the commands and plugins lines as
+`unknown (N more egg-info entry_points.txt not read)`.
+
+The import line is best-effort and may be incomplete: a build backend can discover or generate modules it
+doesn't list, so a module missing from it is not evidence that the module isn't shipped. A build file
+(`setup.py`, `pyproject.toml`, `setup.cfg`) recorded as too large to scan gets its own `<file>: unknown (too
+large to scan)` line instead of being folded into the other lines' fields. A file that fails to parse never
+raises and is never silently dropped: its name is added to an `unparseable: a, b, …` line, and every field
+it would have declared reads `unknown (<file> unparseable)` instead of a bare "none" (while setup.py exists
+at all, "none" means "none declared *literally* in setup.py" — setup.py is arbitrary code).
+
+**Signals.** A `--- dependency / binary / ownership signals (PyPI metadata and the sdist's file list;
+context, not code) ---` block lists Requires-Dist changes and each dependency finding (typosquat /
+nonexistent / brand-new), added binaries (path, size, reason) and a maintainer-set change — PyDiffWatch's
+own heuristic screening of metadata, not code for the model to weigh on its own; a dependency-only fire no
+longer dumps every changed file, only the build files and any code lines that name the flagged dependency.
+
+**Hunks.** Each selected file's diff follows, one `@@ new L<start>-<end>` line per hunk giving the new-file
+line range its added/removed lines occupy — the same `file:line-range` shape the model is asked to answer in
+`cited_hunk`. Positions count lines as DiffWatch splits them (Python's `str.splitlines()`), which also breaks
+on form feed (`\x0c`), `\x1c`–`\x1e`, `\x85`, U+2028 and U+2029; in a file containing those characters they
+can differ from an editor's or Python's own line numbers. A hunk that only removes lines has no new-file range
+to give instead: `@@ new (none; removed after L<n>)`, or `@@ new (none; removed before L1)` when the removal
+is at the very start of the file. A modified `setup.py` or `__init__.py` under about 4,000 rendered characters
+is shown whole instead (`@@ whole file, new L1-<n> (unchanged lines start with two spaces)`), so the model has
+full context for build- and import-time files without hunting across hunks.
+
+**Truncation and selection notes.** At most one trailing note: `[TRUNCATED: lowest-risk hunks omitted to
+fit the input cap.]` when the input cap dropped a file; `[SELECTED: only the 40 highest-risk files are
+shown.]` on a first release with more than 40 ranked files; `[SELECTED: changed files unrelated to flags
+are not shown.]` otherwise, whenever fewer files are shown than changed.
+
+### The verdict
+
+`runs_when` is emitted before `classification`, so the model settles when the cited code runs before
+judging it: one of `build`, `startup`, `import`, `user-command`, `plugin-host`, `runtime-call`,
+`not-shipped`, `unknown`.
+
+**Confidence anchors.** The system prompt gives 1.0 only when the cited hunk shows the whole chain from
+source to sink (secrets read and sent off the machine, or a payload fetched or decoded and executed) *and*
+the execution context shows it runs unasked (`build`, `startup`, `import` or `plugin-host`); at most 0.6 if
+any link — the source, the sink, the flow between them, or when it runs — is inferred rather than shown.
+
+**Weak-malicious downgrade.** A `malicious` verdict is weak, and never alerts as malicious, when the cited
+code runs only on a user command or isn't shipped (`runs_when` is `user-command` or `not-shipped`), or
+confidence is missing, or confidence is below `reviewer.malicious_min_confidence`:
+
+```toml
+[reviewer]
+malicious_min_confidence = 0.8   # a weaker malicious verdict alerts as suspicious and waits for manual review
+```
+
+(default `0.8`, range 0–1). A weak verdict is recorded and alerted as `suspicious` instead, with `urgent`
+cleared — kind `suspicious`, one alert, deduped separately from any first alert on the release — with `model
+said malicious (downgraded: <reason>); needs manual review` prepended to the reasoning, where `<reason>` is
+`runs_when=user-command`, `runs_when=not-shipped`, `no confidence`, or `confidence <value> < <floor>`. It
+waits in `pending` for a human like any other suspicious verdict; the model's own classification stays visible
+in the reasoning, appended as `. Model: <the model's reasoning>`.
+
+**Schema defaults.** Only `classification` is mandatory; every other field a truncated reply never reaches
+takes a safe default (`runs_when` → `unknown`, `confidence` → unknown, `urgent` → `false`,
+`recommended_action` → `monitor`, `attack_type` → `none`) rather than sinking the verdict. A `malicious`
+classification always carries `recommended_action: report-to-pypi`, whatever the model itself chose — a
+strong malicious verdict always recommends reporting to PyPI.
+
+---
+
+## 6. The operating loop
 
 **First time only** — set the starting point so you process *new* releases, not all of PyPI history:
 
@@ -253,7 +379,7 @@ prints the payload code captured **at detection time** and stored in the DB, so 
 later being pulled from PyPI. A release pydiffwatch **refused** to download or unpack (over-size, a
 malformed archive) is never scanned, so it can't get a model verdict either — it lands in `pending` too,
 labelled `(not scanned: <stage>)` with an `UNREVIEWED` note explaining what happened and why, for you to
-inspect by hand — see §9 for the full list of unscanned outcomes and their exact wording. To backfill
+inspect by hand — see §10 for the full list of unscanned outcomes and their exact wording. To backfill
 evidence for older flagged rows captured before evidence storage existed:
 
 ```bash
@@ -334,13 +460,13 @@ show the guard's current state, e.g. `reviews on · 85 tok/s · input cap 52,020
 **Evidence standard.** The reviewer is told to classify a release "malicious" only when the shown code
 concretely exfiltrates secrets, executes remote or decoded/deobfuscated code, or destroys/persists itself
 — never on powerful-but-unused primitives (`subprocess`, `exec`, network, file writes) alone; "suspicious"
-covers a real-but-partial match. It cites the exact hunk backing its verdict. The prompt also carries the
-release's PyPI `info.summary` (the author-written one-line description) as a fenced description block
-alongside the diff, for context, not as evidence on its own.
+covers a real-but-partial match. It cites the exact hunk backing its verdict. See §5 for the full review
+input — the description, the execution-context and signals blocks, and how a weak malicious verdict routes
+to manual review.
 
 ---
 
-## 6. The dashboard & the `watch` daemon
+## 7. The dashboard & the `watch` daemon
 
 Two extras make PyDiffWatch easier to run and easier to *act on*: a built-in daemon loop and a local HTML
 dashboard of verdicts with one-click "report to PyPI" links.
@@ -352,7 +478,7 @@ self-contained HTML file with no JavaScript; every untrusted string (package nam
 cited code) is HTML-escaped, so a package literally named `<script>…</script>` can't attack the page.
 
 **Your own `adjudicate` call is the final word.** Once you've adjudicated a release with
-`pydiffwatch pending` / `pydiffwatch adjudicate <id> ...` (§5), the dashboard shows *your* label, not the
+`pydiffwatch pending` / `pydiffwatch adjudicate <id> ...` (§6), the dashboard shows *your* label, not the
 model's, for that card: a human `benign` clears the flag for good — no highlight, no "Report malware"
 button, and it drops out of the flagged count in the status strip — even if the model called it
 malicious or suspicious. Conversely, a human `malicious` or `suspicious` label keeps the card flagged
@@ -382,7 +508,7 @@ pydiffwatch -c pydiffwatch.toml dashboard --serve --host 0.0.0.0   # reachable a
 > endpoints, but `--host 0.0.0.0` makes it reachable by anyone who can reach this host. Only do it on a
 > network you trust, and keep the default `127.0.0.1` otherwise. The same `--host` flag works on `watch`.
 
-**The `watch` daemon** is the built-in alternative to wiring up cron/systemd (§7): it scans on an interval,
+**The `watch` daemon** is the built-in alternative to wiring up cron/systemd (§8): it scans on an interval,
 refreshes the dashboard after each tick, and — with `--serve` — serves it the whole time. One command gives
 you a running monitor plus a live results page:
 
@@ -406,11 +532,11 @@ model server (§2) before `watch --serve`, or reviews fall back to heuristics un
 
 It is a **foreground** process — keep the terminal open, or run it under your agent harness, which will run
 it as a background task and hand you back the dashboard URL. For unattended, machine-level scheduling,
-prefer the harness patterns in §7.
+prefer the harness patterns in §8.
 
 ---
 
-## 7. Running on a harness (cron / systemd / Docker / CI)
+## 8. Running on a harness (cron / systemd / Docker / CI)
 
 PyDiffWatch is a plain CLI over a local SQLite DB; "running it" means invoking `run` on a schedule under
 whatever runtime you already operate. All four patterns below are equivalent — pick one. Concurrent runs
@@ -522,7 +648,7 @@ jobs:
 
 ---
 
-## 8. State, persistence & containment
+## 9. State, persistence & containment
 
 All state lives under `.diffwatch/` (paths configurable via `db_path`, `lock_path`):
 
@@ -543,7 +669,7 @@ proxy / `systemd` IP allowlist / `nftables`) and [`parse-sandbox.md`](docs/harde
 
 ---
 
-## 9. Alerts
+## 10. Alerts
 
 Set `webhook_url` (top-level, not under `[reviewer]`) to receive each new alert as a JSON POST —
 `{"text": "..."}`, Slack-incoming-webhook compatible:
@@ -571,7 +697,7 @@ except `metadata_gone`, which alerts only — the release then waits in `pending
 | Review input exceeds the endpoint's cap | `(not scanned: too_large)` | `` UNREVIEWED: its review input is too large for the model (<detail>); run `review-pending` with a larger-context model. Not scanned. Needs manual review. `` |
 | Review failed `max_review_attempts` (3) times running | `(not scanned: review_failed)` | `` UNREVIEWED: the model failed to review it <n> times (last error: <last error>); retries are used up. Run `review-pending` to try again, e.g. with another model. Not scanned. Needs manual review. `` |
 | With the reviewer on, triage fired only on signals with no text to show the model (a dependency, binary or maintainer change) | `(not scanned: no_content)` | `UNREVIEWED: triage fired (<rules>) but none of the flagged content could be shown to the reviewer. Needs a human.` |
-| A release switches to wheel-only (see §13) after `wheel_only_grace_minutes` | `(not scanned: no_sdist)` | `UNREVIEWED: switched to wheel-only: the previous release <prev> shipped an sdist and this one ships only wheels, which pydiffwatch does not scan. Not scanned. Needs manual review.` |
+| A release switches to wheel-only (see §14) after `wheel_only_grace_minutes` | `(not scanned: no_sdist)` | `UNREVIEWED: switched to wheel-only: the previous release <prev> shipped an sdist and this one ships only wheels, which pydiffwatch does not scan. Not scanned. Needs manual review.` |
 
 The refused-to-download/-unpack `<reason>` is one of `decompressed-size`, `members`, `member-name` (a name
 too long **or** containing a control character), `member-size`, `total-size`, `download-size`, or
@@ -585,9 +711,15 @@ adjudication instead of saved silently, with `reviewed partially: <files> not sh
 (`model: benign conf=... attack=...`), not as `(not scanned: ...)` — it *was* reviewed, just not on every
 file.
 
+**A weak malicious verdict alerts as suspicious, not malicious.** See §5 for what makes a `malicious`
+verdict weak. It alerts with kind `suspicious` (one alert, deduped separately from any first alert on the
+release) and `reasoning` starting `model said malicious (downgraded: <reason>); needs manual review`; it
+waits in `pending` like any other suspicious verdict, and the model's own classification and reasoning stay
+visible after it.
+
 ---
 
-## 10. Heuristic-only mode (no LLM)
+## 11. Heuristic-only mode (no LLM)
 
 To run with no model at all — rules and weights only, no endpoint required — set:
 
@@ -600,7 +732,7 @@ GPU and no API budget, or to keep monitoring when your endpoint is down.
 
 ---
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
@@ -616,7 +748,7 @@ GPU and no API budget, or to keep monitoring when your endpoint is down.
 
 ---
 
-## 12. Detection scope on brand-new packages
+## 13. Detection scope on brand-new packages
 
 The pipeline's core signal is the **version-to-version diff**, so a package's first-ever release has no
 prior version to diff against. `new_package_policy` controls how those are handled:
@@ -633,7 +765,7 @@ if you want complete coverage of first releases and can absorb the extra volume.
 
 ---
 
-## 13. Known limit: wheel-only releases
+## 14. Known limit: wheel-only releases
 
 PyDiffWatch reads **sdists** only. A release that ships no sdist for that version — a wheel-only upload —
 has nothing to diff or scan; it's recorded with stage `no_sdist` and skipped, not treated as an error.
@@ -646,7 +778,7 @@ release shipped an sdist and this one doesn't, that's worth a warning — except
 uploading before the sdist does, so an immediate check would false-positive on a release that's still
 mid-upload. To cover that, a detected switch waits `wheel_only_grace_minutes` (default 60) and is
 re-checked once that grace period is up. Only if the sdist still hasn't shown up does it warn (the
-`no_sdist` row in §9's table above) and settle into `no_sdist`; if the sdist shows up first, the release
+`no_sdist` row in §10's table above) and settle into `no_sdist`; if the sdist shows up first, the release
 is scanned normally and no warning fires. Set it in the config file:
 
 ```toml

@@ -3,7 +3,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from .config import Config
 from .models import NewRelease, ArtifactSet
-from . import quarantine, deps, egress
+from . import quarantine, deps, egress, execctx
 
 class RefusedToExtract(Exception): ...
 class RefusedToFetch(Exception): ...
@@ -142,8 +142,25 @@ def _download(url: str, cfg: Config) -> bytes:
 # Mirrors triage.classify_location's 3x-weighted set; a genuinely new package is scanned ONLY here.
 _SURFACE_NAMES = {"setup.py", "setup.cfg", "pyproject.toml", "__init__.py",
                   "conftest.py", "sitecustomize.py"}
+# The egg-info files the execution-context block reads (execctx._egg_info: `<x>.egg-info/` at the top level or
+# under `src/`), each a few names long. Without them the block would tell the reviewer "none" about entry points
+# and top-level names the sdist does declare. PKG-INFO stays out: its body is the whole README, and nothing
+# here reads it.
+_SURFACE_METADATA = {"entry_points.txt", "top_level.txt"}
 def _is_surface(path: str) -> bool:
-    return posixpath.basename(path) in _SURFACE_NAMES or path.endswith(".pth")
+    parts = path.split("/")
+    egg_info = (parts[-1] in _SURFACE_METADATA and parts[-2:-1] and parts[-2].endswith(".egg-info")
+                and (len(parts) == 2 or (len(parts) == 3 and parts[0] == "src")))
+    return (posixpath.basename(path) in _SURFACE_NAMES or path.endswith(".pth") or bool(egg_info)
+            or path == "entry_points.txt")          # old-style flit's entry-points-file default, read by execctx
+
+def _pkginfo_summary(files: dict[str, bytes]) -> str | None:
+    """`Summary:` from the sdist's own top-level PKG-INFO: this exact version's claim (spec B4). Parsed header-only
+    by execctx's never-raise parser; unparseable, absent, blank or old setuptools' "UNKNOWN" is None."""
+    data = files.get("PKG-INFO")
+    m = execctx.parse_mapping(data, execctx.KINDS["PKG-INFO"]) if data is not None else None
+    v = next((v for k, v in (m or {}).items() if k.lower() == "summary"), None)
+    return v if isinstance(v, str) and v.strip() not in ("", "UNKNOWN") else None
 
 def _package_json(package: str, cfg: Config) -> dict:
     url = f"{cfg.pypi_base}/pypi/{package}/json"
@@ -161,15 +178,17 @@ def _corpus() -> set:
         _CORPUS = deps.load_corpus()
     return _CORPUS
 
-def _requires_dist(package: str, version: str, cfg: Config) -> list:
-    """`info.requires_dist` for an EXACT version (the package-level JSON only carries the latest's)."""
+def _requires_dist(package: str, version: str, cfg: Config) -> list | None:
+    """`info.requires_dist` for an EXACT version (the package-level JSON only carries the latest's); [] when it
+    declares none, None when the lookup failed. Never raises."""
     try:
         url = f"{cfg.pypi_base}/pypi/{package}/{version}/json"
         egress.assert_web_scheme(url)
         with urllib.request.urlopen(url, timeout=cfg.fetch_timeout_s) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
-            return (_read_json(r, cfg).get("info") or {}).get("requires_dist") or []
+            reqs = (_read_json(r, cfg).get("info") or {}).get("requires_dist") or []
+            return reqs if isinstance(reqs, list) else None    # a string would read as one dep per character
     except Exception:
-        return []   # can't resolve predecessor deps -> screen nothing rather than false-flag
+        return None   # unknown, not empty: the caller screens nothing rather than false-flag
 
 def _dep_json(name: str, cfg: Config):
     """A candidate dependency's PyPI JSON, or None if it does not exist (404 -> dependency-confusion)."""
@@ -185,15 +204,30 @@ def _dep_json(name: str, cfg: Config):
     except Exception:
         return {}
 
-def _screen_added_deps(meta: dict, package: str, pred_version: str | None, cfg: Config) -> list[dict]:
+def _screen_added_deps(meta: dict, package: str, pred_version: str | None, cfg: Config,
+                       change: dict | None = None, version: str | None = None) -> list[dict]:
     """Diff the new version's declared deps against the predecessor's and flag suspicious additions.
-    new-side deps come free from the package-level `info` (the firehose release is normally the latest;
-    a rare lag mis-reads them, an accepted v1 approximation). Empty additions -> zero network."""
-    new_reqs = deps.parse_requires_dist((meta.get("info") or {}).get("requires_dist") or [])
+    The new side comes free from the package-level `info` when it is this `version`'s (the latest); for any
+    other release (backfill, retry, --recent, superseded) it is read from the exact version's JSON, and when
+    that is unavailable nothing is screened. No new deps -> no predecessor lookup.
+    `change`, when passed, receives the added and removed Requires-Dist lines as written (for the reviewer)."""
+    info = meta.get("info") or {}
+    if version is not None and info.get("version") not in (None, version):
+        new_lines = _requires_dist(package, version, cfg) or []   # unknown or empty: screen nothing
+    else:
+        new_lines = info.get("requires_dist") or []
+        new_lines = new_lines if isinstance(new_lines, list) else []
+    new_reqs = deps.parse_requires_dist(new_lines)
     if not new_reqs:
         return []
-    prior_reqs = deps.parse_requires_dist(_requires_dist(package, pred_version, cfg)) if pred_version else set()
+    prior_lines = _requires_dist(package, pred_version, cfg) if pred_version else []
+    if prior_lines is None:
+        return []           # the predecessor's list is unknown: every dep would read as "added"
+    prior_reqs = deps.parse_requires_dist(prior_lines)
     added = new_reqs - prior_reqs
+    if change is not None:
+        change["added"] = [ln for ln in new_lines if deps.parse_requires_dist([ln]) & added]
+        change["removed"] = [ln for ln in prior_lines if deps.parse_requires_dist([ln]) & (prior_reqs - new_reqs)]
     if not added:
         return []
     return deps.screen_added_deps(added, _corpus(), fetch_json=lambda n: _dep_json(n, cfg),
@@ -287,15 +321,23 @@ def fetch_artifacts(cfg, rel: NewRelease, attempt: int = 1) -> ArtifactSet | NoS
                            is_new_package=True, maintainer_metadata=mtmeta, description=summary)
 
     new_files, new_bins = extract_sdist(_download(new_sd["url"], slow), cfg)
+    summary = _pkginfo_summary(new_files) or summary     # before the surface filter drops PKG-INFO
+    # Before the prior comparison drops unchanged ones: the execution context must know an oversized
+    # setup.py is there even when it did not change (padding it must not read as "absent").
+    too_large = tuple(b["path"] for b in new_bins if b.get("reason") == "source-too-large")
     prior_files: dict[str, bytes] = {}
     prior_bins = None
     prior_ver = None
     prior_error = None
     dep_findings: list[dict] = []
+    surface_omitted = None
+    req_change: dict = {}
     if is_new:
         if cfg.new_package_policy == "surface":
             # Scan only the install/import-time surface — small, never truncated, high-value.
+            n = len(new_files)
             new_files = {p: b for p, b in new_files.items() if _is_surface(p)}
+            surface_omitted = n - len(new_files)          # the reviewer is told these exist (B11)
         # "full": keep the whole tree (legacy whole-codebase scan)
     else:
         prior_ver, prior_url = pred
@@ -309,8 +351,10 @@ def fetch_artifacts(cfg, rel: NewRelease, attempt: int = 1) -> ArtifactSet | NoS
             same = {(b["path"], b.get("sha256")) for b in prior_bins if b.get("sha256")}
             new_bins = [b for b in new_bins if (b["path"], b.get("sha256")) not in same]
         # signal 5: flag suspicious newly-added dependencies vs the predecessor (update path only).
-        dep_findings = _screen_added_deps(meta, rel.package, prior_ver, cfg)
+        dep_findings = _screen_added_deps(meta, rel.package, prior_ver, cfg, change=req_change, version=rel.version)
     return ArtifactSet(rel.package, rel.version, prior_ver, "sdist",
                        new_files, prior_files, {}, _cap_foreign(new_bins, cfg),
                        is_new_package=is_new, maintainer_metadata=mtmeta,
-                       added_dep_findings=dep_findings, prior_error=prior_error, description=summary)
+                       added_dep_findings=dep_findings, prior_error=prior_error, description=summary,
+                       too_large=too_large, surface_omitted=surface_omitted,
+                       requires_dist_change=req_change if any(req_change.values()) else None)

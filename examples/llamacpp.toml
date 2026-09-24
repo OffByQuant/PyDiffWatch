@@ -5,3 +5,4 @@ provider = "openai"
 base_url = "http://localhost:8080/v1"
 model = "local"          # replace with a model id your server lists at <base_url>/models
 structured_output = "json_schema"
+# malicious_min_confidence = 0.8   # a weaker malicious verdict alerts as suspicious and waits for manual review
