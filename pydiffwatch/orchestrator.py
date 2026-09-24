@@ -116,7 +116,7 @@ def _attempt_review(cfg, conn, rvw, rid, package, version, score, fired_rules, t
     if guard is not None:
         why = guard.admit()
         if why:
-            store.park_for_review(conn, rid, "model_busy", why, text)
+            _park_auto(conn, rid, "model_busy", why, text)
             return False
     attempt = store.review_attempts(conn, rid) + 1
     t0 = time.monotonic()
@@ -127,19 +127,16 @@ def _attempt_review(cfg, conn, rvw, rid, package, version, score, fired_rules, t
     except reviewer.ReviewUnavailable as e:
         logger.warning("LLM review failed for %s==%s (attempt %d): %s", package, version, attempt, e)
         if _endpoint_down(e):     # an outage, not this release's fault: don't spend an attempt
-            store.park_for_review(conn, rid, "endpoint_unreachable", str(e), text)
+            _park_auto(conn, rid, "endpoint_unreachable", str(e), text)
             return False
-        n = store.bump_review_attempts(conn, rid)
-        store.park_for_review(conn, rid, "review_failed", f"{n} failed attempt(s): {e}", text)
-        if n == cfg.reviewer.max_review_attempts:      # the auto-drain stops retrying it from here on
-            _alert_unscanned(cfg, conn, rid, package, version,
-                             f"UNREVIEWED: the model failed to review it {n} times (last error: {e}); "
-                             f"retries are used up. Run `review-pending` to try again, e.g. with another "
-                             f"model. Not scanned. Needs manual review.",
-                             stage="review_failed", score=score, fired_rules=fired_rules)
+        _review_failed(cfg, conn, rid, package, version, score, fired_rules, text, str(e))
         if guard is not None and _is_timeout(e):
             guard.record_timeout()
             return False
+        return True
+    except Exception as e:        # D20: e.g. a malformed reply. A failed attempt of this release, never a failed tick
+        logger.exception("LLM review raised for %s==%s (attempt %d)", package, version, attempt)
+        _review_failed(cfg, conn, rid, package, version, score, fired_rules, text, f"{type(e).__name__}: {e}")
         return True
     if guard is not None and verdict.model == rvw.backend.primary_model:
         # Only a single primary-model call is a speed sample: an escalation spans two models (and a swap).
@@ -148,6 +145,32 @@ def _attempt_review(cfg, conn, rvw, rid, package, version, score, fired_rules, t
                              len(reviewer.SYSTEM_PROMPT) + len(text))
     _record(cfg, conn, rid, verdict, score, dropped=dropped)
     return True
+
+
+def _park_auto(conn, rid, reason, detail, text):
+    """Park for a reason the auto-drain retries on its own. A stale UNREVIEWED verdict (e.g. from an earlier
+    too_large park) goes: the release is not waiting for a person while the auto-drain owns it."""
+    store.park_for_review(conn, rid, reason, detail, text)
+    store.clear_unscanned_verdict(conn, rid)
+
+
+def _review_failed(cfg, conn, rid, package, version, score, fired_rules, text, err):
+    """Count a failed review attempt and park it as review_failed. With attempts left the auto-drain retries
+    it; once they are used up (>=, so a lowered max_review_attempts counts too) it warns, once."""
+    n = store.bump_review_attempts(conn, rid)
+    if n >= cfg.reviewer.max_review_attempts:      # the auto-drain stops retrying it from here on
+        store.park_for_review(conn, rid, "review_failed", f"{n} failed attempt(s): {err}", text)
+        _alert_review_exhausted(cfg, conn, rid, package, version, n, err, score, fired_rules)
+    else:
+        _park_auto(conn, rid, "review_failed", f"{n} failed attempt(s): {err}", text)
+
+
+def _alert_review_exhausted(cfg, conn, rid, package, version, n, err, score, fired_rules):
+    _alert_unscanned(cfg, conn, rid, package, version,
+                     f"UNREVIEWED: the model failed to review it {n} times (last error: {err}); "
+                     f"retries are used up. Run `review-pending` to try again, e.g. with another "
+                     f"model. Not scanned. Needs manual review.",
+                     stage="review_failed", score=score, fired_rules=fired_rules)
 
 
 def _review_escalated(cfg, conn, rvw, d, tr, rid, *, offline=False, guard=None):
@@ -165,7 +188,7 @@ def _review_escalated(cfg, conn, rvw, d, tr, rid, *, offline=False, guard=None):
     else:
         dropped = getattr(rvw, "dropped_files", ())   # spec U2: weighted files prepare()'s cap dropped
         if offline:
-            store.park_for_review(conn, rid, "endpoint_unreachable", "reviewer endpoint unreachable", text)
+            _park_auto(conn, rid, "endpoint_unreachable", "reviewer endpoint unreachable", text)
         else:
             _attempt_review(cfg, conn, rvw, rid, d.package, d.version, tr.score, tr.fired_rules, text, guard,
                             dropped=dropped)
@@ -185,9 +208,12 @@ def drain_pending(cfg, conn, rvw, *, auto: bool, reasons=None, limit=None, guard
     elif not reasons:
         reasons = ("too_large", "review_failed")
     cap = guard.input_cap_chars() if guard is not None else cfg.reviewer.max_input_chars
+    provisional = guard is not None and guard.cap_is_provisional()
     rows = store.pending_reviews(conn, reasons)
     if auto:      # oversized for an earlier cap (cold start, a smaller max_input_chars) but fits this one
         rows += store.pending_reviews(conn, ("too_large",), max_chars=cap)
+        if not provisional:   # parked silently over the cold-start cap, and over the measured one too: warn now
+            rows += store.pending_reviews(conn, ("too_large",), over_chars=cap, without_verdict=True)
     rows = sorted(rows,
                   key=lambda r: (r["pending_reason"] != "model_busy", r["release_id"]))
     done = tried = 0
@@ -196,14 +222,20 @@ def drain_pending(cfg, conn, rvw, *, auto: bool, reasons=None, limit=None, guard
             break
         if auto and row["pending_reason"] == "review_failed" and \
                 row["review_attempts"] >= cfg.reviewer.max_review_attempts:
+            if not row["has_verdict"]:     # e.g. max_review_attempts was lowered after its last attempt
+                _alert_review_exhausted(cfg, conn, row["release_id"], row["package"], row["version"],
+                                        row["review_attempts"], (row["pending_detail"] or "").split(": ", 1)[-1],
+                                        row["triage_score"], _rules_from_json(row["triage_rules"]))
             continue
         text = store.review_input(row)
         rid = row["release_id"]
         if len(text) > cap:
             if auto:
                 explain = guard.cap_explain() if guard is not None else f"cap {cap}"
+                # Over the provisional cold-start cap it may fit once the endpoint is measured: park silently.
                 _park_too_large(cfg, conn, rid, row["package"], row["version"], row["triage_score"],
-                                _rules_from_json(row["triage_rules"]), f"needs {len(text)} chars; {explain}", text)
+                                _rules_from_json(row["triage_rules"]), f"needs {len(text)} chars; {explain}", text,
+                                alert=not provisional)
             continue
         tried += 1
         fired_rules = _rules_from_json(row["triage_rules"])
@@ -271,12 +303,13 @@ def _alert_unscanned(cfg, conn, rid, package, version, note, *, stage, score=0.0
                          dedupe_suffix=f"unscanned:{stage}")
 
 
-def _park_too_large(cfg, conn, rid, package, version, score, fired_rules, detail, text):
+def _park_too_large(cfg, conn, rid, package, version, score, fired_rules, detail, text, alert=True):
     store.park_for_review(conn, rid, "too_large", detail, text)
-    _alert_unscanned(cfg, conn, rid, package, version,
-                     f"UNREVIEWED: its review input is too large for the model ({detail}); run `review-pending` "
-                     f"with a larger-context model. Not scanned. Needs manual review.",
-                     stage="too_large", score=score, fired_rules=fired_rules)
+    if alert:
+        _alert_unscanned(cfg, conn, rid, package, version,
+                         f"UNREVIEWED: its review input is too large for the model ({detail}); run "
+                         f"`review-pending` with a larger-context model. Not scanned. Needs manual review.",
+                         stage="too_large", score=score, fired_rules=fired_rules)
 
 
 def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=None) -> bool:
@@ -364,7 +397,15 @@ def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=
         if ev:      # below the review threshold nobody acts on the release, so its code isn't kept
             store.update_evidence(conn, rid, ev)
         if tr.escalate:
-            _review_escalated(cfg, conn, rvw, d, tr, rid, offline=offline, guard=guard)
+            try:
+                _review_escalated(cfg, conn, rvw, d, tr, rid, offline=offline, guard=guard)
+            except Exception as e:   # D20: the scan is done, only the review failed: park it, never refetch
+                logger.exception("review failed for %s==%s; parked for review", rel.package, rel.version)
+                text = reviewer.build_review_input(d, tr, max_chars=cfg.reviewer.max_input_chars)
+                _review_failed(cfg, conn, rid, d.package, d.version, tr.score, tr.fired_rules, text,
+                               f"{type(e).__name__}: {e}")
+                notifier.emit(cfg, conn, Verdict(d.package, d.version, "suspicious-heuristic",
+                                                 tr.score, tr.fired_rules, False), rid)
         return True   # terminal: an unfinished LLM review is parked in the pending-review queue
     except Exception as e:
         logger.exception("processing failed for %s==%s", rel.package, rel.version)

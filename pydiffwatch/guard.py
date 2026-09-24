@@ -148,6 +148,11 @@ class ReviewerGuard:
     def input_cap_chars(self):
         return max(min(c for c, _ in self._cap_terms()), 0)
 
+    def cap_is_provisional(self):
+        """True while the cap is the cold-start cap: the endpoint's speed isn't measured yet, so an input over
+        it may well fit once it is."""
+        return self.measured and self.tok_s is None and self.input_cap_chars() == COLD_START_CAP
+
     def cap_explain(self):
         cap, why = min(self._cap_terms(), key=lambda t: t[0])
         return f"this endpoint's cap is {max(cap, 0):,} chars ({why})"

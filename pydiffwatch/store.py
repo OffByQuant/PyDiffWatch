@@ -230,9 +230,13 @@ def clear_pending(conn, release_id):
                  (release_id,))
     conn.commit()
 
-def pending_reviews(conn, reasons=None, max_chars=None):
+def pending_reviews(conn, reasons=None, max_chars=None, over_chars=None, without_verdict=False):
+    """Rows parked for review, optionally only those with `reasons`, input at most `max_chars` or over
+    `over_chars`, or `without_verdict` (never given the UNREVIEWED verdict, nor labelled by a person).
+    `has_verdict` says whether a row has a verdict."""
     sql = ("SELECT id AS release_id, package, version, triage_score, triage_rules, pending_reason, "
-           "pending_detail, COALESCE(review_attempts,0) AS review_attempts, review_input "
+           "pending_detail, COALESCE(review_attempts,0) AS review_attempts, review_input, "
+           "EXISTS(SELECT 1 FROM verdicts v WHERE v.release_id = releases.id) AS has_verdict "
            "FROM releases WHERE stage='pending_review'")
     params = list(reasons or [])
     if params:
@@ -240,6 +244,11 @@ def pending_reviews(conn, reasons=None, max_chars=None):
     if max_chars is not None:
         sql += " AND review_input_chars <= ?"
         params.append(max_chars)
+    if over_chars is not None:
+        sql += " AND review_input_chars > ?"
+        params.append(over_chars)
+    if without_verdict:
+        sql += " AND NOT EXISTS(SELECT 1 FROM verdicts v WHERE v.release_id = releases.id)"
     return conn.execute(sql + " ORDER BY id", params).fetchall()
 
 def review_input(row) -> str:

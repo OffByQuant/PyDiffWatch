@@ -3,13 +3,17 @@
 and a later tick never repeats the alert. `metadata_gone` also alerts, but stays out of `pending`: the files
 are gone, so nobody can review it."""
 import dataclasses
+import json
 import sqlite3
 import sys
 
+import pytest
+
 from pydiffwatch import __main__ as cli
-from pydiffwatch import fetcher, ingest, orchestrator, reviewer, store
-from pydiffwatch.models import NewRelease
-from tests.test_pending_queue import _Backend, _T, _TIMEOUT, _diff, _setup
+from pydiffwatch import differ, engine, fetcher, ingest, orchestrator, reviewer, store
+from pydiffwatch import guard as guard_mod
+from pydiffwatch.models import ArtifactSet, NewRelease
+from tests.test_pending_queue import _Backend, _REFUSED, _T, _TIMEOUT, _diff, _setup
 
 
 def _alerts(conn, package):
@@ -219,3 +223,102 @@ def test_old_verdictless_refusals_get_the_unreviewed_verdict_once(tmp_cfg, monke
     assert [i["package"] for i in orchestrator.list_pending(tmp_cfg)] == ["old-extract", "old-fetch"]
     out = _pending_cli(tmp_cfg, monkeypatch, capsys)
     assert "(not scanned: refused_to_extract)" in out and "(not scanned: refused_to_fetch)" in out
+
+
+# --- Task 8: the review queue ---------------------------------------------------------------------------
+
+def _big(cfg, **rv):
+    return dataclasses.replace(cfg, reviewer=dataclasses.replace(cfg.reviewer, **rv))
+
+
+@pytest.mark.parametrize("fail, reason", [(_TIMEOUT, "review_failed"), (_REFUSED, "endpoint_unreachable")])
+def test_a_row_back_on_an_auto_retried_reason_drops_its_stale_unreviewed_verdict(tmp_path, capsys, fail, reason):
+    # (a): too_large waits in `pending`; once a bigger cap lets the auto-drain try it and the try fails with an
+    # auto-retried reason, the auto-drain owns it again, so the stale "too large" verdict must go.
+    cfg, conn, rid, rvw = _setup(tmp_path, _Backend(), max_input_chars=10_000)
+    orchestrator._review_escalated(cfg, conn, rvw, _diff("x" * 50_000), _T, rid)
+    assert [i["not_scanned"] for i in orchestrator.list_pending(cfg)] == ["too_large"]
+    big = _big(cfg, max_input_chars=800_000)
+    orchestrator.drain_pending(big, conn, reviewer.Reviewer(big, backend=_Backend(fail=fail)), auto=True)
+    assert store.pending_reviews(conn)[0]["pending_reason"] == reason
+    assert orchestrator.list_pending(cfg) == []
+
+
+def _parked(conn, rid, text, reason="endpoint_unreachable"):
+    store.update_stage(conn, rid, "triaged", _T.score, json.dumps([r.__dict__ for r in _T.fired_rules]))
+    store.park_for_review(conn, rid, reason, "down", text)
+
+
+def test_a_cold_start_re_park_as_too_large_is_silent_until_the_cap_is_measured(tmp_path, capsys):
+    # (b): the 40,000-char cold-start cap is provisional. Re-parking over it must not claim the release needs a
+    # manual review; once the endpoint is measured and the row is still over the real cap, it warns, once.
+    be = _Backend()
+    cfg, conn, rid, rvw = _setup(tmp_path, be)
+    _parked(conn, rid, "x" * 60_000)
+    gd = guard_mod.ReviewerGuard(cfg, be, conn, memory=None, out=lambda m: None)
+    assert gd.tok_s is None and gd.input_cap_chars() == guard_mod.COLD_START_CAP
+    orchestrator.drain_pending(cfg, conn, rvw, auto=True, guard=gd)
+    assert store.pending_reviews(conn)[0]["pending_reason"] == "too_large"
+    assert capsys.readouterr().out == "" and _alerts(conn, "pkg") == []
+    gd.tok_s = 50.0                                          # measured: cap ~30,600 chars, still under 60,000
+    for _ in range(2):
+        orchestrator.drain_pending(cfg, conn, rvw, auto=True, guard=gd)
+    out = capsys.readouterr().out
+    assert _unreviewed(out) and "too large" in out and len(_alerts(conn, "pkg")) == 1
+    assert [i["not_scanned"] for i in orchestrator.list_pending(cfg)] == ["too_large"] and be.calls == []
+
+
+def test_lowering_max_review_attempts_still_warns_once(tmp_path, capsys):
+    # (c): 2 failed attempts under max 5, then the config drops to 2. The row is now exhausted; it must warn.
+    be = _Backend(fail=_TIMEOUT)
+    cfg, conn, rid, rvw = _setup(tmp_path, be, max_review_attempts=5)
+    orchestrator._review_escalated(cfg, conn, rvw, _diff(), _T, rid)
+    orchestrator.drain_pending(cfg, conn, rvw, auto=True)
+    capsys.readouterr()
+    low = _big(cfg, max_review_attempts=2)
+    for _ in range(2):
+        orchestrator.drain_pending(low, conn, rvw, auto=True)
+    out = capsys.readouterr().out
+    assert _unreviewed(out) and "2 times" in out and "boom" in out
+    assert len(be.calls) == 2 and len(_alerts(conn, "pkg")) == 2               # first park + exhaustion, once
+    assert [i["not_scanned"] for i in orchestrator.list_pending(cfg)] == ["review_failed"]
+
+
+def _escalating(monkeypatch):
+    monkeypatch.setattr(differ, "build_diff", lambda art: _diff())
+    monkeypatch.setattr(engine, "triage", lambda *a, **k: _T)
+    return ArtifactSet("pkg", "1.0.0", "0.9", "sdist", {}, {}, {})
+
+
+def test_a_late_review_exception_parks_the_release_and_later_exhausts(tmp_path, capsys, monkeypatch):
+    # D20: the download and scan succeeded, so an exception in the review must not refetch the release. It is
+    # parked as a failed review attempt; the auto-drain retries it and the exhaustion alert still fires.
+    be = _Backend(fail=_TIMEOUT)
+    cfg, conn, rid, rvw = _setup(tmp_path, be)
+    art = _escalating(monkeypatch)
+    real = rvw.review_text
+    monkeypatch.setattr(rvw, "review_text", lambda *a, **k: (_ for _ in ()).throw(KeyError("confidence")))
+    assert orchestrator._process_fetched(cfg, conn, rvw, None, NewRelease("pkg", "1.0.0", 1), art)
+    row = conn.execute("SELECT stage, pending_reason, review_attempts, fetch_attempts FROM releases").fetchone()
+    assert tuple(row) == ("pending_review", "review_failed", 1, 0)
+    assert "suspicious-heuristic" in capsys.readouterr().out                  # the first-park alert
+    for _ in range(3):                                                         # exceptions and timeouts alike
+        orchestrator.drain_pending(cfg, conn, rvw, auto=True)
+        monkeypatch.setattr(rvw, "review_text", real)
+    out = capsys.readouterr().out
+    assert _unreviewed(out) and "3 times" in out and len(_alerts(conn, "pkg")) == 2
+    assert store.get_stage(conn, "pkg", "1.0.0") == "pending_review" and len(be.calls) == 1
+
+
+def test_an_exception_while_preparing_the_review_parks_instead_of_refetching(tmp_path, capsys, monkeypatch):
+    # D20, outside the model call: the parked row carries a review input the auto-drain can re-drive.
+    cfg, conn, rid, rvw = _setup(tmp_path, _Backend())
+    art = _escalating(monkeypatch)
+    monkeypatch.setattr(rvw, "prepare", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("prepare broke")))
+    assert orchestrator._process_fetched(cfg, conn, rvw, None, NewRelease("pkg", "1.0.0", 1), art)
+    [row] = store.pending_reviews(conn)
+    assert (row["pending_reason"], row["review_attempts"]) == ("review_failed", 1)
+    assert "RuntimeError: prepare broke" in row["pending_detail"] and "exec(x)" in store.review_input(row)
+    assert store.fetch_attempts(conn, rid) == 0
+    orchestrator.drain_pending(cfg, conn, rvw, auto=True)
+    assert store.get_stage(conn, "pkg", "1.0.0") == "reviewed"
