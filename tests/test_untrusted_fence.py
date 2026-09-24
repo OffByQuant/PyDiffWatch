@@ -47,6 +47,8 @@ def test_flagged_locations_alone_are_not_reviewable_content():
 def test_member_names_with_control_characters_are_refused():
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as t:
-        ti = tarfile.TarInfo(_EVIL); ti.size = 3; t.addfile(ti, io.BytesIO(b"x=1"))
+        ti = tarfile.TarInfo(_EVIL)
+        ti.size = 3
+        t.addfile(ti, io.BytesIO(b"x=1"))
     with pytest.raises(fetcher.RefusedToExtract, match="member-name"):
         fetcher.extract_sdist(buf.getvalue(), Config())
