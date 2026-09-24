@@ -150,23 +150,33 @@ def _file_weights(triage) -> dict:
     return w
 
 
-def _render_file(fd) -> str:
+def _render_file(fd, whole: bool = True) -> str:
+    """One file's heading and hunks. A modified setup.py / __init__.py is shown whole when `whole` is set and the
+    whole render stays within _WHOLE_FILE_MAX_CHARS (spec H); otherwise, and with whole=False, hunks only."""
+    if whole and _whole_candidate(fd) and (new_lines := fd.new_text.splitlines()):
+        rendered = _render_lines(fd, new_lines)             # the differ's own split: positions line up
+        if len(rendered) <= _WHOLE_FILE_MAX_CHARS:
+            return rendered
+    return _render_lines(fd, None)
+
+
+def _render_lines(fd, new_lines) -> str:
     # fd.path is an author-chosen sdist member name: escaped (_one_line) so it can never smuggle a
     # raw newline into the heading and forge an extra, unprefixed line that looks like another file's
     # heading (dropped_from_text below parses headings back out of already-rendered text).
     # Every author line keeps a two-character prefix ("+ ", "- ", or "  " for an unchanged line of a whole file),
     # so none can pose as a heading, a marker or a context line; "@@" lines are ours.
     lines = [f"--- file: {_one_line(fd.path)} ({fd.change_kind}) ---"]
-    whole = _shown_whole(fd)
-    new_lines = fd.new_text.splitlines() if whole else []   # the differ's own split: positions line up
-    if whole:
+    if new_lines:
         lines.append(f"@@ whole file, new L1-{len(new_lines)} (unchanged lines start with two spaces)")
+    new_lines = new_lines or []
     pos = 0
     for h in fd.hunks:
         j1, j2 = h.new_range
         lines += [f"  {ln}" for ln in new_lines[pos:j1]]
         # 1-indexed like FiredRule.lines (facts._file_facts), so cited_hunk and the flagged locations agree
-        lines.append(f"@@ new L{j1 + 1}-{j2}" if j2 > j1 else f"@@ new (none; removed before L{j1 + 1})")
+        lines.append(f"@@ new L{j1 + 1}-{j2}" if j2 > j1 else
+                     f"@@ new (none; removed after L{j1})" if j1 else "@@ new (none; removed before L1)")
         lines += [f"- {ln}" for ln in h.removed]
         lines += [f"+ {ln}" for ln in h.added]
         pos = j2
@@ -174,12 +184,12 @@ def _render_file(fd) -> str:
     return "\n".join(lines)
 
 
-_WHOLE_FILE_MAX_CHARS = 4_000
+_WHOLE_FILE_MAX_CHARS = 4_000     # on the rendered whole-file block (a blank line renders 3x its raw size)
 
 
-def _shown_whole(fd) -> bool:
-    """A modified setup.py (build time) or __init__.py (import time) small enough to show with its context (spec H)."""
-    return (fd.change_kind == "modified" and fd.new_text is not None and len(fd.new_text) < _WHOLE_FILE_MAX_CHARS
+def _whole_candidate(fd) -> bool:
+    """A modified setup.py (build time) or __init__.py (import time): shown with its context when small (spec H)."""
+    return (fd.change_kind == "modified" and fd.new_text is not None
             and (fd.path == "setup.py" or fd.path == "__init__.py" or fd.path.endswith("/__init__.py")))
 
 
@@ -334,6 +344,9 @@ def build_review_input(diff, triage, *, max_chars: int, dropped: list | None = N
     for path in ranked_paths:
         rendered = _render_file(by_path[path])
         add = len(rendered) + (1 if body_parts else 0)
+        if used + add > max_chars:               # a whole file that does not fit falls back to its hunks
+            rendered = _render_file(by_path[path], whole=False)
+            add = len(rendered) + (1 if body_parts else 0)
         if used + add > max_chars:
             truncated = True
             # A weighted file, or the top-ranked one, that does not fit stops here (InputTooLarge keys on the top
@@ -486,7 +499,7 @@ class Reviewer:
         text = build_review_input(diff, triage, max_chars=cap, dropped=self.dropped_files)
         ranked_paths, by_path = _rank_files(diff, triage)
         if not _has_reviewable_content(text) and ranked_paths:
-            top = len(_render_file(by_path[ranked_paths[0]]))
+            top = len(_render_file(by_path[ranked_paths[0]], whole=False))   # the smallest render that fits
             if top:
                 needed = len(text) + _NOTE_RESERVE + top + 1
                 raise InputTooLarge(needed, cap, build_review_input(diff, triage, max_chars=needed))

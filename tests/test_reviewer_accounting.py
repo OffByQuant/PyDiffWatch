@@ -3,6 +3,8 @@ zero-weight file that does not fit is skipped rather than hiding the smaller fil
 only; nothing is executed."""
 import dataclasses
 
+import pytest
+
 from pydiffwatch import differ, reviewer
 from pydiffwatch.models import ArtifactSet, Diff, FileDiff, FiredRule, Hunk, TriageResult
 
@@ -34,6 +36,10 @@ def _sweep(d, tr, span=6_000):
         assert len(text) <= cap, (cap, len(text))
         assert reviewer.dropped_from_text(tr.fired_rules, text) == dropped, cap
         out.append((cap, text))
+    # Tight, not just <=: at the cap where a file first fits exactly, only the note's unused reserve is left over.
+    # A double-counted newline would leave 1 more char of slack on every such cap.
+    slack = [cap - len(t) for cap, t in out if _headings(t) and t.endswith(reviewer.TRUNCATION_NOTE)]
+    assert slack and min(slack) == reviewer._NOTE_RESERVE - len(reviewer.TRUNCATION_NOTE)
     return out
 
 
@@ -90,8 +96,6 @@ def test_input_too_large_needed_renders_the_top_file():
     tr = TriageResult(50.0, [FiredRule("r", 50.0, "a.py", (1, 200))], True)
     from pydiffwatch.config import Config, ReviewerConfig
     rvw = reviewer.Reviewer(Config(reviewer=ReviewerConfig(max_input_chars=500)), backend=object())
-    try:
+    with pytest.raises(reviewer.InputTooLarge) as e:
         rvw.prepare(d, tr)
-        raise AssertionError("expected InputTooLarge")
-    except reviewer.InputTooLarge as e:
-        assert "--- file: a.py (modified) ---" in e.text and len(e.text) <= e.needed
+    assert "--- file: a.py (modified) ---" in e.value.text and len(e.value.text) <= e.value.needed
