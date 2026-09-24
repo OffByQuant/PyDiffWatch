@@ -4,6 +4,10 @@ from .models import ArtifactSet, Diff, FileDiff, Hunk
 def _lines(b: bytes) -> list[str]:
     return b.decode("utf-8", errors="replace").splitlines()
 
+def _description(summary) -> str:
+    return " ".join(summary.split())[:500] if isinstance(summary, str) else ""   # one line: it must not pose as a hunk
+
+
 def build_diff(a: ArtifactSet) -> Diff:
     changed: list[FileDiff] = []
     for path in sorted(set(a.new_files) | set(a.prior_files)):
@@ -21,4 +25,4 @@ def build_diff(a: ArtifactSet) -> Diff:
             new_text = new.decode("utf-8", errors="replace") if new is not None else None
             changed.append(FileDiff(path, kind, hunks, new_text))
     return Diff(a.package, a.version, a.prior_version is None, changed,
-                list(a.added_binaries), list(a.added_dep_findings))
+                list(a.added_binaries), list(a.added_dep_findings), _description(a.description))

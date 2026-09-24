@@ -238,12 +238,15 @@ def fetch_artifacts(cfg, rel: NewRelease) -> ArtifactSet | None:
     pred = _pick_predecessor(meta, rel.version)
     is_new = pred is None
     mtmeta = _maintainer_metadata(meta, new_sd)
+    info = meta.get("info") or {}
+    # The package-level JSON carries the LATEST version's info; another version's claim is not this one's.
+    summary = info.get("summary") if info.get("version") == rel.version else None
 
     if is_new and cfg.new_package_policy == "skip":
         # New package, skip policy: don't even download — but still record who shipped it, so a later
         # version of this package has a maintainer baseline to diff against (maintainer-set-change).
         return ArtifactSet(rel.package, rel.version, None, "sdist", {}, {}, {}, [],
-                           is_new_package=True, maintainer_metadata=mtmeta)
+                           is_new_package=True, maintainer_metadata=mtmeta, description=summary)
 
     new_files, new_bins = extract_sdist(_download(new_sd["url"], cfg), cfg)
     prior_files: dict[str, bytes] = {}
@@ -272,4 +275,4 @@ def fetch_artifacts(cfg, rel: NewRelease) -> ArtifactSet | None:
     return ArtifactSet(rel.package, rel.version, prior_ver, "sdist",
                        new_files, prior_files, {}, new_bins,
                        is_new_package=is_new, maintainer_metadata=mtmeta,
-                       added_dep_findings=dep_findings, prior_error=prior_error)
+                       added_dep_findings=dep_findings, prior_error=prior_error, description=summary)
