@@ -4,6 +4,7 @@ The summary is author-written: it is escaped to one line, sits between the untru
 under a heading that labels it the author's claim, and is never reviewable content on its own.
 """
 import json
+import pytest
 import re
 
 from pydiffwatch import differ, fetcher, reviewer
@@ -142,3 +143,71 @@ def test_summary_with_real_code_is_still_reviewed():
                                        TriageResult(40.0, [FiredRule("r", 40.0, "setup.py", (1, 1))], True),
                                        max_chars=10_000)
     assert reviewer._has_reviewable_content(text) and "exec(x)" in text
+
+
+# ---- task 11 (B4): the summary comes from the sdist's own PKG-INFO, exact version ----
+
+def _fetch(monkeypatch, pkginfo, info=None, versions=(("1.0", "2026-01-01T00:00:00Z"), ("1.1", "2026-02-01T00:00:00Z"),
+                                                        ("2.0", "2026-03-01T00:00:00Z")), version="1.1", cfg=None):
+    meta = {"info": info or {"version": "2.0", "summary": "the latest release's claim"},
+            "releases": {v: [{"packagetype": "sdist", "url": f"mock://acme/{v}", "upload_time_iso_8601": ts}]
+                         for v, ts in versions}}
+    monkeypatch.setattr(fetcher, "_package_json", lambda p, cfg: meta)
+    members = {"acme/__init__.py": b"x = 1\n"}
+    if pkginfo is not None:
+        members["PKG-INFO"] = pkginfo
+    monkeypatch.setattr(fetcher, "_download", lambda url, cfg: make_sdist(members))
+    return fetcher.fetch_artifacts(cfg or Config(), NewRelease("acme", version, 5))
+
+
+def test_a_non_latest_release_gets_its_summary_from_pkg_info(monkeypatch):
+    art = _fetch(monkeypatch, b"Metadata-Version: 2.1\nName: acme\nVersion: 1.1\nSummary: formats dates\n\nREADME\n")
+    assert art.description == "formats dates"
+
+
+def test_pkg_info_wins_over_info_summary_for_the_latest_release(monkeypatch):
+    art = _fetch(monkeypatch, b"Metadata-Version: 2.1\nsummary: this version's own claim\n",
+                 info={"version": "1.1", "summary": "the JSON claim"})
+    assert art.description == "this version's own claim"
+
+
+@pytest.mark.parametrize("pkginfo", [
+    None,                                                                   # no PKG-INFO at all
+    b"Metadata-Version: 2.1\nName: acme\n",                                 # no Summary header
+    b"Metadata-Version: 1.0\nSummary: UNKNOWN\n",                           # old setuptools' placeholder
+    b"Metadata-Version: 2.1\nSummary:   \n",                                # blank
+    b"Summary: caf\xe9 \xff\xfe\n",                                         # invalid UTF-8
+], ids=["absent", "no-summary", "UNKNOWN", "blank", "invalid-utf8"])
+def test_no_usable_pkg_info_summary_falls_back_to_info_summary(monkeypatch, pkginfo):
+    art = _fetch(monkeypatch, pkginfo, info={"version": "1.1", "summary": "the JSON claim"})
+    assert art.description == "the JSON claim"
+
+
+@pytest.mark.parametrize("pkginfo, expect", [
+    (b"\xef\xbb\xbfMetadata-Version: 2.1\nSummary: with a BOM\n", "with a BOM"),
+    (b"Metadata-Version 2.1\n: no name\n\x00\x01garbage\nSummary: after junk\n", None),     # broken headers
+    (b"Summary: big body\n\n" + b"README line\n" * 60_000, "big body"),                    # a huge body
+    (b"Summary: folded\n  over two lines\n", "folded\n  over two lines"),
+    (b"\n\n\n", None),
+    (b"", None),
+], ids=["bom", "broken-headers", "huge-body", "folded", "blank-lines", "empty"])
+def test_pkg_info_parsing_never_raises(monkeypatch, pkginfo, expect):
+    art = _fetch(monkeypatch, pkginfo, info={"version": "2.0"})             # no JSON fallback for 1.1
+    assert art.description == expect
+
+
+def test_a_surface_first_release_keeps_its_pkg_info_summary(monkeypatch):
+    # PKG-INFO stays out of the surface files (its body is the README), but its Summary is still read.
+    art = _fetch(monkeypatch, b"Metadata-Version: 2.1\nSummary: a brand-new tool\n", info={"version": "9"},
+                 versions=(("1.0", "2026-01-01T00:00:00Z"),), version="1.0")
+    assert art.is_new_package and "PKG-INFO" not in art.new_files
+    assert art.description == "a brand-new tool"
+
+
+def test_only_the_top_level_pkg_info_is_read(monkeypatch):
+    meta = {"info": {"version": "2.0"}, "releases": {"1.1": [{"packagetype": "sdist", "url": "mock://a",
+                                                              "upload_time_iso_8601": "2026-02-01T00:00:00Z"}]}}
+    monkeypatch.setattr(fetcher, "_package_json", lambda p, cfg: meta)
+    monkeypatch.setattr(fetcher, "_download", lambda url, cfg: make_sdist(
+        {"acme.egg-info/PKG-INFO": b"Summary: nested\n", "vendor/x/PKG-INFO": b"Summary: vendored\n"}))
+    assert fetcher.fetch_artifacts(Config(), NewRelease("acme", "1.1", 5)).description is None

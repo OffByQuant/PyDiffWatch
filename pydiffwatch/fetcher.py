@@ -3,7 +3,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from .config import Config
 from .models import NewRelease, ArtifactSet
-from . import quarantine, deps, egress
+from . import quarantine, deps, egress, execctx
 
 class RefusedToExtract(Exception): ...
 class RefusedToFetch(Exception): ...
@@ -154,6 +154,14 @@ def _is_surface(path: str) -> bool:
     return (posixpath.basename(path) in _SURFACE_NAMES or path.endswith(".pth") or bool(egg_info)
             or path == "entry_points.txt")          # old-style flit's entry-points-file default, read by execctx
 
+def _pkginfo_summary(files: dict[str, bytes]) -> str | None:
+    """`Summary:` from the sdist's own top-level PKG-INFO: this exact version's claim (spec B4). Parsed header-only
+    by execctx's never-raise parser; unparseable, absent, blank or old setuptools' "UNKNOWN" is None."""
+    data = files.get("PKG-INFO")
+    m = execctx.parse_mapping(data, execctx.KINDS["PKG-INFO"]) if data is not None else None
+    v = next((v for k, v in (m or {}).items() if k.lower() == "summary"), None)
+    return v if isinstance(v, str) and v.strip() not in ("", "UNKNOWN") else None
+
 def _package_json(package: str, cfg: Config) -> dict:
     url = f"{cfg.pypi_base}/pypi/{package}/json"
     egress.assert_web_scheme(url)
@@ -296,6 +304,7 @@ def fetch_artifacts(cfg, rel: NewRelease, attempt: int = 1) -> ArtifactSet | NoS
                            is_new_package=True, maintainer_metadata=mtmeta, description=summary)
 
     new_files, new_bins = extract_sdist(_download(new_sd["url"], slow), cfg)
+    summary = _pkginfo_summary(new_files) or summary     # before the surface filter drops PKG-INFO
     # Before the prior comparison drops unchanged ones: the execution context must know an oversized
     # setup.py is there even when it did not change (padding it must not read as "absent").
     too_large = tuple(b["path"] for b in new_bins if b.get("reason") == "source-too-large")
