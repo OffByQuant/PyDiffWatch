@@ -298,9 +298,9 @@ def _discovered(files) -> list[str]:
         if parts[-1] != "__init__.py":
             continue
         if len(parts) == 2 or (len(parts) == 3 and parts[0] == "src"):
-            # an identifier only, so no name can pose as a field; setuptools may still install a src/ or
-            # -stubs directory with another name (the import line is best effort)
-            if parts[-2] not in _NOT_PACKAGES and parts[-2].isidentifier():
+            # letters, digits, "_" and "-" only: no separator (";", "=", ",", space, ".") can pose as a field,
+            # and a flat-layout -stubs or any src/ directory setuptools installs under such a name is still listed
+            if parts[-2] not in _NOT_PACKAGES and re.fullmatch(r"[A-Za-z0-9_-]+", parts[-2]):
                 pkgs.append(parts[-2])
     return pkgs
 
@@ -488,9 +488,12 @@ def build(new_files: dict[str, bytes], too_large=()) -> str:
     egg_tops, tops = _egg_info(new_files, "top_level.txt"), [[], 0]
     for p in egg_tops[:_MAX_EGG_EPS]:                   # bounded, as entry_points.txt: read lazily, kept capped
         _collect(tops, (m.group() for m in re.finditer(r"\S+", new_files[p].decode("utf-8", errors="replace"))))
-    # unread sources first: past the cap they would fold into "+N more"
-    tops_unread = ([f"unknown ({len(egg_tops) - _MAX_EGG_EPS} more egg-info top_level.txt not read)"]
-                   if len(egg_tops) > _MAX_EGG_EPS else [])
+    # oversized and unread sources first: past the cap they would fold into "+N more". An oversized one never
+    # reaches new_files, so it is not in egg_tops and not counted as unread.
+    big_tops = _egg_info(too_large, "top_level.txt")
+    tops_unread = ([f"unknown ({_join(big_tops)} too large to scan)"] if big_tops else []) + (
+        [f"unknown ({len(egg_tops) - _MAX_EGG_EPS} more egg-info top_level.txt not read)"]
+        if len(egg_tops) > _MAX_EGG_EPS else [])
     tops = _join(tops_unread + tops[0], extra=tops[1]) if tops_unread or tops[0] else "not found in scanned files"
     import_line = (f"import (runs when a program imports the package): packages={pkgs}; py-modules={mods}; "
                    f"top_level.txt={tops}")

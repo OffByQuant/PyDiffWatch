@@ -880,11 +880,38 @@ def test_identifier_modules_are_still_listed_beside_a_non_identifier_one():
     assert _field(ctx, "py-modules") == "auto-discovered: good"
 
 
-def test_a_non_identifier_package_directory_is_not_listed():
-    ctx = execctx.build({"pyproject.toml": _ST, "x; py-modules=none/__init__.py": b"", "pkg/__init__.py": b""})
+@pytest.mark.parametrize("bad", ["x; py-modules=none", "a=b", "a,b", "a b", "a.b"])
+def test_a_package_directory_with_a_separator_is_not_listed(bad):
+    ctx = execctx.build({"pyproject.toml": _ST, f"{bad}/__init__.py": b"", "pkg/__init__.py": b""})
     assert _field(ctx, "packages") == "auto-discovered: pkg"
-    ctx = execctx.build({"pyproject.toml": _ST, "bad-name/__init__.py": b""})
+    ctx = execctx.build({"pyproject.toml": _ST, f"{bad}/__init__.py": b""})
     assert _field(ctx, "packages") == f"auto-discovered: {_AUTO_NONE}"
+
+
+# ---- residuals round 1: package directories setuptools installs under another name are listed ----
+
+def test_hyphenated_src_layout_package_directories_are_listed():
+    ctx = execctx.build({"pyproject.toml": _ST, "src/pkg/__init__.py": b"", "src/evil-x/__init__.py": b""})
+    assert _field(ctx, "packages") == "auto-discovered: evil-x, pkg"
+
+
+def test_a_flat_layout_stubs_package_is_listed():
+    ctx = execctx.build({"pyproject.toml": _ST, "foo-stubs/__init__.py": b""})
+    assert _field(ctx, "packages") == "auto-discovered: foo-stubs"
+
+
+# ---- residuals round 1: an oversized egg-info top_level.txt is unknown, never "not found" ----
+
+def test_an_oversized_top_level_txt_is_unknown_never_not_found():
+    ctx = execctx.build({"pyproject.toml": _ST, "a/__init__.py": b""}, too_large=("a.egg-info/top_level.txt",))
+    assert _field(ctx, "top_level.txt") == "unknown (a.egg-info/top_level.txt too large to scan)"
+
+
+def test_an_oversized_top_level_txt_comes_first_and_is_not_counted_as_unread():
+    files = {f"a{j:02d}.egg-info/top_level.txt": b"t%d\n" % j for j in range(4)}
+    ctx = execctx.build(files, too_large=("big.egg-info/top_level.txt",))
+    assert _field(ctx, "top_level.txt") == ("unknown (big.egg-info/top_level.txt too large to scan), "
+                                            "unknown (1 more egg-info top_level.txt not read), t0, t1, t2")
 
 
 # ---- residual R4: computed and unknown entry-point markers come first, never folded into "+N more" ----
