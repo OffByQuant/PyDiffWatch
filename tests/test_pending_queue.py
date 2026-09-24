@@ -220,3 +220,27 @@ def test_the_auto_drain_starts_no_new_review_once_its_time_budget_is_spent(tmp_p
     orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=be), auto=False,
                                reasons=("endpoint_unreachable",), clock=lambda: next(ticks))
     assert len(be.calls) == 3 and _pending(conn) == {}      # `review-pending` is run by hand: no budget
+
+
+def test_the_auto_drain_neither_selects_exhausted_rows_nor_loads_input_it_does_not_review(tmp_path, monkeypatch):
+    be = _Backend(fail=_TIMEOUT)
+    cfg, conn, rid, rvw = _setup(tmp_path, be)
+    orchestrator._review_escalated(cfg, conn, rvw, _diff(), _T, rid)
+    for _ in range(2):
+        orchestrator.drain_pending(cfg, conn, rvw, auto=True)             # attempt 3: exhausted, warned
+    assert _pending(conn)["pkg"]["review_attempts"] == cfg.reviewer.max_review_attempts
+    big = store.record_release(conn, "big", "1.0.0", 2, False, None, "tgz")
+    store.park_for_review(conn, big, "too_large", "big", "x" * (cfg.reviewer.max_input_chars + 1))
+    ok = store.record_release(conn, "ok", "1.0.0", 3, False, None, "tgz")
+    orchestrator._review_escalated(cfg, conn, rvw, dataclasses.replace(_diff(), package="ok"), _T, ok, offline=True)
+    selected, loaded = [], []
+    real_select, real_load = store.pending_reviews, store.review_input
+    monkeypatch.setattr(store, "pending_reviews",
+                        lambda *a, **k: selected.extend(real_select(*a, **k)) or real_select(*a, **k))
+    monkeypatch.setattr(store, "review_input", lambda row, *a: loaded.append(row["package"]) or real_load(row, *a))
+    orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=_Backend()), auto=True)
+    assert "pkg" not in [r["package"] for r in selected]                   # exhausted: never selected
+    assert all("review_input" not in r.keys() for r in selected)           # no blob until a row is reviewed
+    assert loaded == ["ok"] and store.get_stage(conn, "ok", "1.0.0") == "reviewed"
+    [row] = [r for r in real_select(conn) if r["package"] == "big"]         # re-parked over the cap, input kept
+    assert row["pending_reason"] == "too_large" and len(real_load(row)) == cfg.reviewer.max_input_chars + 1

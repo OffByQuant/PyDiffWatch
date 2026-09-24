@@ -240,17 +240,25 @@ def clear_pending(conn, release_id):
                  (release_id,))
     conn.commit()
 
-def pending_reviews(conn, reasons=None, max_chars=None, over_chars=None, without_verdict=False):
+def pending_reviews(conn, reasons=None, max_chars=None, over_chars=None, without_verdict=False,
+                    max_attempts=None, with_input=True):
     """Rows parked for review and not labelled by a person, optionally only those with `reasons`, input at most
-    `max_chars` or over `over_chars`, or `without_verdict` (never given the UNREVIEWED verdict).
-    `has_verdict` says whether a row has a verdict."""
+    `max_chars` or over `over_chars`, or `without_verdict` (never given the UNREVIEWED verdict). With
+    `max_attempts`, a review_failed row with that many attempts that has already warned (has a verdict) is left
+    out: the auto-drain never retries it. `with_input=False` leaves the stored input out (review_input(row, conn)
+    loads it). `has_verdict` says whether a row has a verdict; `review_input_chars` is the input's length."""
     sql = ("SELECT id AS release_id, package, version, triage_score, triage_rules, pending_reason, "
-           "pending_detail, COALESCE(review_attempts,0) AS review_attempts, review_input, "
+           "pending_detail, COALESCE(review_attempts,0) AS review_attempts, review_input_chars, "
+           + ("review_input, " if with_input else "") +
            "EXISTS(SELECT 1 FROM verdicts v WHERE v.release_id = releases.id) AS has_verdict "
            f"FROM releases WHERE stage='pending_review' AND {_UNLABELLED}")
     params = list(reasons or [])
     if params:
         sql += f" AND pending_reason IN ({','.join('?' * len(params))})"
+    if max_attempts is not None:
+        sql += (" AND NOT (pending_reason='review_failed' AND COALESCE(review_attempts,0) >= ? "
+                "AND EXISTS(SELECT 1 FROM verdicts v WHERE v.release_id = releases.id))")
+        params.append(max_attempts)
     if max_chars is not None:
         sql += " AND review_input_chars <= ?"
         params.append(max_chars)
@@ -261,8 +269,11 @@ def pending_reviews(conn, reasons=None, max_chars=None, over_chars=None, without
         sql += " AND NOT EXISTS(SELECT 1 FROM verdicts v WHERE v.release_id = releases.id)"
     return conn.execute(sql + " ORDER BY id", params).fetchall()
 
-def review_input(row) -> str:
-    return zlib.decompress(row["review_input"]).decode()
+def review_input(row, conn=None) -> str:
+    """A parked row's stored review input; read from `conn` when the row was selected without it."""
+    blob = row["review_input"] if "review_input" in row.keys() else \
+        conn.execute("SELECT review_input FROM releases WHERE id=?", (row["release_id"],)).fetchone()[0]
+    return zlib.decompress(blob).decode()
 
 METADATA_ATTEMPTS = 4    # failed attempts (metadata, sdist download, or diff/triage) before a release is given up on
 

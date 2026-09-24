@@ -239,11 +239,14 @@ def drain_pending(cfg, conn, rvw, *, auto: bool, reasons=None, limit=None, guard
         reasons = ("too_large", "review_failed")
     cap = guard.input_cap_chars() if guard is not None else cfg.reviewer.max_input_chars
     provisional = guard is not None and guard.cap_is_provisional()
-    rows = store.pending_reviews(conn, reasons)
+    # No stored input here: it is read only for a row that is reviewed. The auto-drain skips exhausted retries.
+    rows = store.pending_reviews(conn, reasons, max_attempts=cfg.reviewer.max_review_attempts if auto else None,
+                                 with_input=False)
     if auto:      # oversized for an earlier cap (cold start, a smaller max_input_chars) but fits this one
-        rows += store.pending_reviews(conn, ("too_large",), max_chars=cap)
+        rows += store.pending_reviews(conn, ("too_large",), max_chars=cap, with_input=False)
         if not provisional:   # parked silently over the cold-start cap, and over the measured one too: warn now
-            rows += store.pending_reviews(conn, ("too_large",), over_chars=cap, without_verdict=True)
+            rows += store.pending_reviews(conn, ("too_large",), over_chars=cap, without_verdict=True,
+                                          with_input=False)
     rows = sorted(rows,
                   key=lambda r: (r["pending_reason"] != "model_busy", r["release_id"]))
     done = tried = 0
@@ -284,16 +287,17 @@ def _drain_one(cfg, conn, rvw, row, *, auto, cap, provisional, guard):
                                     row["review_attempts"], (row["pending_detail"] or "").split(": ", 1)[-1],
                                     row["triage_score"], _rules_from_json(row["triage_rules"]))
         return False, True
-    text = store.review_input(row)
     rid = row["release_id"]
-    if len(text) > cap:
+    chars = row["review_input_chars"]
+    if chars > cap:
         if auto:
             explain = guard.cap_explain() if guard is not None else f"cap {cap}"
             # Over the provisional cold-start cap it may fit once the endpoint is measured: park silently.
             _park_too_large(cfg, conn, rid, row["package"], row["version"], row["triage_score"],
-                            _rules_from_json(row["triage_rules"]), f"needs {len(text)} chars; {explain}", text,
+                            _rules_from_json(row["triage_rules"]), f"needs {chars} chars; {explain}", None,
                             alert=not provisional)
         return False, True
+    text = store.review_input(row, conn)
     fired_rules = _rules_from_json(row["triage_rules"])
     dropped = reviewer.dropped_from_text(fired_rules, text)   # spec U2: recovered from stored text
     go_on = _attempt_review(cfg, conn, rvw, rid, row["package"], row["version"], row["triage_score"],
@@ -358,7 +362,7 @@ def _alert_unscanned(cfg, conn, rid, package, version, note, *, stage, score=0.0
 
 
 def _park_too_large(cfg, conn, rid, package, version, score, fired_rules, detail, text, alert=True):
-    store.park_for_review(conn, rid, "too_large", detail, text)
+    _park(conn, rid, "too_large", detail, text)
     if alert:
         _alert_unscanned(cfg, conn, rid, package, version,
                          f"UNREVIEWED: its review input is too large for the model ({detail}); run "
