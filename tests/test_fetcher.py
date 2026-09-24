@@ -234,3 +234,24 @@ def test_extracts_pth_and_entry_points_and_top_level():
     assert "evil.pth" in files
     assert "pkg.egg-info/entry_points.txt" in files
     assert "pkg.egg-info/top_level.txt" in files
+
+
+def test_new_package_surface_keeps_the_metadata_the_execution_context_reads(monkeypatch):
+    # The block must not tell the reviewer "commands: none" for a first release whose egg-info lists them.
+    from pydiffwatch import differ
+    monkeypatch.setattr(fetcher, "_package_json", lambda p, cfg: _meta("brandnew", [
+        ("1.0", "2026-01-01T00:00:00Z")]))
+    monkeypatch.setattr(fetcher, "_download", lambda url, cfg: make_sdist({
+        "setup.py": b"from setuptools import setup\nsetup()\n",
+        "PKG-INFO": b"Metadata-Version: 2.1\nName: brandnew\n",
+        "brandnew/__init__.py": b"",
+        "brandnew/cli.py": b"def main(): pass\n",
+        "brandnew.egg-info/entry_points.txt": b"[console_scripts]\nbn = brandnew.cli:main\n\n[pytest11]\nbn = brandnew.plug\n",
+        "brandnew.egg-info/top_level.txt": b"brandnew\n",
+        "brandnew.egg-info/SOURCES.txt": b"x\n"}))
+    art = fetcher.fetch_artifacts(Config(), NewRelease("brandnew", "1.0", 5))   # default policy=surface
+    assert set(art.new_files) == {"setup.py", "PKG-INFO", "brandnew/__init__.py",
+                                  "brandnew.egg-info/entry_points.txt", "brandnew.egg-info/top_level.txt"}
+    ctx = differ.build_diff(art).exec_context
+    assert "bn -> brandnew.cli:main" in ctx and "pytest11: bn -> brandnew.plug" in ctx
+    assert "top_level.txt=brandnew" in ctx

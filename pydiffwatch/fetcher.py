@@ -142,8 +142,13 @@ def _download(url: str, cfg: Config) -> bytes:
 # Mirrors triage.classify_location's 3x-weighted set; a genuinely new package is scanned ONLY here.
 _SURFACE_NAMES = {"setup.py", "setup.cfg", "pyproject.toml", "__init__.py",
                   "conftest.py", "sitecustomize.py"}
+# Small metadata the execution-context block reads; without it the block would tell the reviewer "none"
+# about entry points and top-level names the sdist does declare.
+_SURFACE_METADATA = {"entry_points.txt", "top_level.txt"}
 def _is_surface(path: str) -> bool:
-    return posixpath.basename(path) in _SURFACE_NAMES or path.endswith(".pth")
+    base = posixpath.basename(path)
+    return (base in _SURFACE_NAMES or path.endswith(".pth") or base == "PKG-INFO"
+            or (base in _SURFACE_METADATA and posixpath.dirname(path).endswith(".egg-info")))
 
 def _package_json(package: str, cfg: Config) -> dict:
     url = f"{cfg.pypi_base}/pypi/{package}/json"
