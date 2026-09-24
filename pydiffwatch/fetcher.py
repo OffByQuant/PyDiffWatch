@@ -142,13 +142,16 @@ def _download(url: str, cfg: Config) -> bytes:
 # Mirrors triage.classify_location's 3x-weighted set; a genuinely new package is scanned ONLY here.
 _SURFACE_NAMES = {"setup.py", "setup.cfg", "pyproject.toml", "__init__.py",
                   "conftest.py", "sitecustomize.py"}
-# Small metadata the execution-context block reads; without it the block would tell the reviewer "none"
-# about entry points and top-level names the sdist does declare.
+# The egg-info files the execution-context block reads (execctx._egg_info: `<x>.egg-info/` at the top level or
+# under `src/`), each a few names long. Without them the block would tell the reviewer "none" about entry points
+# and top-level names the sdist does declare. PKG-INFO stays out: its body is the whole README, and nothing
+# here reads it.
 _SURFACE_METADATA = {"entry_points.txt", "top_level.txt"}
 def _is_surface(path: str) -> bool:
-    base = posixpath.basename(path)
-    return (base in _SURFACE_NAMES or path.endswith(".pth") or base == "PKG-INFO"
-            or (base in _SURFACE_METADATA and posixpath.dirname(path).endswith(".egg-info")))
+    parts = path.split("/")
+    egg_info = (parts[-1] in _SURFACE_METADATA and parts[-2:-1] and parts[-2].endswith(".egg-info")
+                and (len(parts) == 2 or (len(parts) == 3 and parts[0] == "src")))
+    return posixpath.basename(path) in _SURFACE_NAMES or path.endswith(".pth") or bool(egg_info)
 
 def _package_json(package: str, cfg: Config) -> dict:
     url = f"{cfg.pypi_base}/pypi/{package}/json"

