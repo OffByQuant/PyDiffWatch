@@ -7,7 +7,12 @@ from .orchestrator import (run_once, seed_now, list_pending, adjudicate, get_evi
 
 
 def _cfg(args):
-    return load_config(args.config) if args.config else Config()
+    if not args.config:
+        return Config()
+    try:
+        return load_config(args.config)
+    except FileNotFoundError as e:
+        raise SystemExit(f"pydiffwatch: {e}")
 
 
 def _reach(host):

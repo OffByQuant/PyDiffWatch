@@ -71,11 +71,12 @@ class Config:
 
 
 def load_config(path) -> Config:
-    """Load config from a TOML file, falling back to defaults for a missing file or absent keys.
-    Unknown keys are ignored. API keys are NEVER read from the file — only the env-var name is."""
+    """Load config from a TOML file, falling back to defaults for absent keys. A missing file raises
+    FileNotFoundError (never silently run on defaults). Unknown keys are ignored. API keys are NEVER
+    read from the file — only the env-var name is."""
     path = Path(path)
     if not path.exists():
-        return Config()
+        raise FileNotFoundError(f"config file not found: {path}")
     raw = tomllib.loads(path.read_text())
     rv = raw.pop("reviewer", {})
     default_rv = ReviewerConfig()
