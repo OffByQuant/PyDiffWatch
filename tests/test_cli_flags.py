@@ -53,3 +53,24 @@ def test_recent_help_counts_changelog_events_not_releases(cmd, monkeypatch, caps
     recent = help_text[help_text.index("--recent N"):]
     assert "changelog events" in recent
     assert "N releases" not in recent and "N PyPI releases" not in recent
+
+
+def _keyed(tmp_path):
+    p = tmp_path / "c.toml"
+    p.write_text('[reviewer]\nbase_url = "https://api.example.com/v1"\napi_key_env = "OPENAI_API_KEY"\n')
+    return str(p)
+
+
+def test_endpoint_to_another_host_does_not_carry_the_configs_api_key(tmp_path):
+    # Final review: dataclasses.replace kept api_key_env, so --endpoint sent the config's key to the new host.
+    rc = cli._cfg(_args(config=_keyed(tmp_path), endpoint="http://192.0.2.10:8000/v1")).reviewer
+    assert rc.base_url == "http://192.0.2.10:8000/v1" and rc.api_key_env is None
+
+
+def test_endpoint_equal_to_the_configs_keeps_its_api_key(tmp_path):
+    rc = cli._cfg(_args(config=_keyed(tmp_path), endpoint="https://api.example.com/v1", model="m")).reviewer
+    assert rc.api_key_env == "OPENAI_API_KEY"
+
+
+def test_model_alone_keeps_the_configs_api_key(tmp_path):
+    assert cli._cfg(_args(config=_keyed(tmp_path), model="m")).reviewer.api_key_env == "OPENAI_API_KEY"
