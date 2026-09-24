@@ -44,7 +44,8 @@ def migrate_schema(conn):
     except sqlite3.OperationalError:
         conn.execute("ALTER TABLE releases ADD COLUMN evidence TEXT"); conn.commit()
     for col, typ in (("review_attempts", "INTEGER DEFAULT 0"), ("pending_reason", "TEXT"),
-                     ("pending_detail", "TEXT"), ("review_input", "BLOB")):
+                     ("pending_detail", "TEXT"), ("review_input", "BLOB"),
+                     ("fetch_attempts", "INTEGER DEFAULT 0"), ("fetch_note", "TEXT")):
         try:
             conn.execute(f"SELECT {col} FROM releases LIMIT 1")
         except sqlite3.OperationalError:
@@ -169,6 +170,33 @@ def pending_reviews(conn, reasons=None, max_chars=None):
 
 def review_input(row) -> str:
     return zlib.decompress(row["review_input"]).decode()
+
+METADATA_ATTEMPTS = 4    # failed metadata downloads before a release is given up on (visibly, in `pending`)
+
+
+def note_metadata_failure(conn, release_id, detail) -> str:
+    """Count a failed metadata download; the release waits in `metadata_retry` (retried each tick, off the
+    cursor) until it has failed METADATA_ATTEMPTS times, then `gave_up`. Returns the new stage."""
+    conn.execute("UPDATE releases SET fetch_attempts=COALESCE(fetch_attempts,0)+1, fetch_note=? WHERE id=?",
+                 (detail, release_id))
+    n = conn.execute("SELECT fetch_attempts FROM releases WHERE id=?", (release_id,)).fetchone()[0]
+    stage = "gave_up" if n >= METADATA_ATTEMPTS else "metadata_retry"
+    conn.execute("UPDATE releases SET stage=? WHERE id=?", (stage, release_id))
+    conn.commit()
+    return stage
+
+def set_fetch_note(conn, release_id, note):
+    conn.execute("UPDATE releases SET fetch_note=? WHERE id=?", (note, release_id))
+    conn.commit()
+
+def metadata_retries_due(conn, limit=20):
+    return conn.execute("SELECT package, version, serial FROM releases WHERE stage='metadata_retry' "
+                        "ORDER BY serial LIMIT ?", (limit,)).fetchall()
+
+def metadata_retry_counts(conn) -> dict:
+    r = conn.execute("SELECT COALESCE(SUM(stage='metadata_retry'),0), COALESCE(SUM(stage='gave_up'),0) "
+                     "FROM releases").fetchone()
+    return {"retrying": r[0], "gave_up": r[1]}
 
 def get_reviewer_stats(conn, endpoint, model):
     row = conn.execute("SELECT tok_s, chars_per_token, samples, state, detail, paused_until, slow_streak "

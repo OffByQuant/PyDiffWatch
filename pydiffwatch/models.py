@@ -15,6 +15,7 @@ class ArtifactSet:
     is_new_package: bool = False   # True = no prior version on PyPI (genuinely new codebase)
     maintainer_metadata: dict | None = None   # author/maintainer/ownership captured from PyPI JSON
     added_dep_findings: list[dict] = field(default_factory=list)   # signal 5: suspicious added deps
+    prior_error: str | None = None   # the prior sdist couldn't be fetched, so this was diffed against nothing
 
 @dataclass(frozen=True)
 class Hunk:

@@ -6,6 +6,8 @@ from . import quarantine, deps, egress
 
 class RefusedToExtract(Exception): ...
 class RefusedToFetch(Exception): ...
+class MetadataGone(Exception): ...          # PyPI's JSON metadata 404s: the project was removed
+class MetadataUnavailable(Exception): ...   # any other metadata failure: retried on later ticks
 
 class _BoundedReader:
     """Forward-only wrapper over a decompressed stream that refuses once cumulative bytes read
@@ -211,7 +213,16 @@ def fetch_artifacts(cfg, rel: NewRelease) -> ArtifactSet | None:
         # Confirmed supply-chain malware — refuse before any byte is pulled. Maps to a terminal
         # 'refused_to_fetch' stage upstream; DiffWatch never re-ingests it. (§6 / quarantine.py)
         raise RefusedToFetch(f"quarantined: {rel.package}")
-    meta = _package_json(rel.package, cfg)
+    try:
+        meta = _package_json(rel.package, cfg)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise MetadataGone(f"{rel.package}: PyPI metadata returned 404") from e
+        raise MetadataUnavailable(f"{rel.package}: PyPI metadata returned HTTP {e.code}") from e
+    except RefusedToFetch:
+        raise                                         # over the size cap: a deterministic refusal
+    except Exception as e:
+        raise MetadataUnavailable(f"{rel.package}: {type(e).__name__}: {e}") from e
     new_sd = _sdist(meta.get("releases", {}).get(rel.version))
     if not new_sd:
         return None                                   # no sdist for this version (wheel-only; Phase 3)
@@ -228,6 +239,7 @@ def fetch_artifacts(cfg, rel: NewRelease) -> ArtifactSet | None:
     new_files, new_bins = extract_sdist(_download(new_sd["url"], cfg), cfg)
     prior_files: dict[str, bytes] = {}
     prior_ver = None
+    prior_error = None
     dep_findings: list[dict] = []
     if is_new:
         if cfg.new_package_policy == "surface":
@@ -236,10 +248,13 @@ def fetch_artifacts(cfg, rel: NewRelease) -> ArtifactSet | None:
         # "full": keep the whole tree (legacy whole-codebase scan)
     else:
         prior_ver, prior_url = pred
-        prior_files, _ = extract_sdist(_download(prior_url, cfg), cfg)
+        try:
+            prior_files, _ = extract_sdist(_download(prior_url, cfg), cfg)
+        except Exception as e:     # as npm does: diff against nothing (every file reported), and say so
+            prior_error = f"prior {prior_ver} sdist unavailable ({type(e).__name__}: {e}); diffed against nothing"
         # signal 5: flag suspicious newly-added dependencies vs the predecessor (update path only).
         dep_findings = _screen_added_deps(meta, rel.package, prior_ver, cfg)
     return ArtifactSet(rel.package, rel.version, prior_ver, "sdist",
                        new_files, prior_files, {}, new_bins,
                        is_new_package=is_new, maintainer_metadata=mtmeta,
-                       added_dep_findings=dep_findings)
+                       added_dep_findings=dep_findings, prior_error=prior_error)

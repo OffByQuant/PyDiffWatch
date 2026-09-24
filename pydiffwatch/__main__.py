@@ -1,9 +1,9 @@
 import argparse
-from . import egress
+from . import egress, store
 from .config import Config, load_config
 from .orchestrator import (run_once, seed_now, list_pending, adjudicate, get_evidence,
                            backfill_evidence, export_dashboard, watch, review_pending,
-                           pending_review_counts)
+                           pending_review_counts, metadata_retry_counts)
 
 
 def _cfg(args):
@@ -109,6 +109,10 @@ def main():
         gs = guard_status(cfg)
         if gs:
             print(f"[pydiffwatch] reviewer: {describe(gs)}")
+        mr = metadata_retry_counts(cfg)
+        if mr["retrying"] or mr["gave_up"]:
+            print(f"[pydiffwatch] PyPI metadata failed to download: {mr['retrying']} release(s) being retried, "
+                  f"{mr['gave_up']} given up on after {store.METADATA_ATTEMPTS} attempts (not scanned)")
         queued = pending_review_counts(cfg)
         if queued:
             print(f"[pydiffwatch] {sum(queued.values())} release(s) queued for LLM review ("

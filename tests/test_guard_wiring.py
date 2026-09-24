@@ -121,7 +121,7 @@ def test_hung_endpoint_costs_one_timeout_and_the_cursor_advances(tmp_path, monke
     conn = store.connect(cfg); store.init_schema(conn); store.set_last_serial(conn, 5000); conn.close()
     rels = [NewRelease(p, "1.0.0", 5001 + i) for i, p in enumerate(["a", "b", "c"])]
     monkeypatch.setattr(ingest, "changes_since", lambda *a, **k: rels)
-    art = SimpleNamespace(prior_version="0.9.0", is_new_package=False, maintainer_metadata=None,
+    art = SimpleNamespace(prior_version="0.9.0", is_new_package=False, maintainer_metadata=None, prior_error=None,
                           scripts_field=None, has_lockfile=False, has_shrinkwrap=False)
     monkeypatch.setattr(fetcher, "fetch_artifacts", lambda cfg, rel: art)
     monkeypatch.setattr(orchestrator.differ, "build_diff", lambda a: _diff("x"))

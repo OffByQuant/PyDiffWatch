@@ -135,7 +135,7 @@ def test_unreachable_model_does_not_pin_the_cursor(tmp_path, monkeypatch):
     rel = NewRelease("pkg", "1.0.0", 5050)
     monkeypatch.setattr(ingest, "changes_since", lambda *a, **k: [rel])
     from types import SimpleNamespace
-    art = SimpleNamespace(prior_version="0.9.0", is_new_package=False, maintainer_metadata=None)
+    art = SimpleNamespace(prior_version="0.9.0", is_new_package=False, maintainer_metadata=None, prior_error=None)
     monkeypatch.setattr(fetcher, "fetch_artifacts", lambda cfg, rel: art)
     monkeypatch.setattr(orchestrator.differ, "build_diff", lambda art: _diff())
     monkeypatch.setattr(orchestrator.engine, "triage", lambda *a, **k: _T)
