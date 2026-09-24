@@ -134,6 +134,14 @@ def _rank_files(diff, triage):
     return ranked_paths, by_path
 
 
+_LOC_HEADING = "flagged_locations:"
+
+
+def _one_line(s: str) -> str:
+    """An author-chosen string with control characters escaped, so it stays on one line."""
+    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in s)
+
+
 def build_review_input(diff, triage, *, max_chars: int) -> str:
     """Assemble the user-message text for the reviewer. Pure and deterministic.
 
@@ -151,19 +159,22 @@ def build_review_input(diff, triage, *, max_chars: int) -> str:
     # straight into attack_type. Pointers preserve "where to look"; the model concludes independently.
     seen: list[str] = []
     for r in sorted(triage.fired_rules, key=lambda r: -r.weight):
-        loc = f"{r.file}:{r.lines[0]}-{r.lines[1]}"
+        loc = f"{_one_line(r.file)}:{r.lines[0]}-{r.lines[1]}"
         if r.file in ranked_set and loc not in seen:
             seen.append(loc)
     header = (
         f"package: {diff.package}\nversion: {diff.version}\n"
         f"is_first_release: {diff.is_first_release}"
         + (" (FIRST RELEASE - whole-package scan, no prior baseline)" if diff.is_first_release else "")
-        + f"\ntriage_score: {triage.score:.0f}\nflagged_locations: {', '.join(seen)}\n"
+        + f"\ntriage_score: {triage.score:.0f}\n"
         + f"untrusted_content_marker: {marker}\n"
         + f"\n{marker}\n"
     )
 
-    body_parts, used, truncated = [], len(header) + len(marker) + len(TRUNCATION_NOTE), False
+    # File paths are author-chosen (sdist member names), so the flagged locations are fenced too.
+    loc_text = f"{_LOC_HEADING} {', '.join(seen)}" if seen else ""
+    body_parts = [loc_text] if loc_text else []
+    used, truncated = len(header) + len(marker) + len(TRUNCATION_NOTE) + len(loc_text), False
     for path in ranked_paths:
         rendered = _render_file(by_path[path])
         if used + len(rendered) + 1 > max_chars:
@@ -235,8 +246,12 @@ def refresh_marker(review_input: str) -> str:
 
 
 def _has_reviewable_content(review_input: str) -> bool:
-    """True if any file content was rendered between the injection markers."""
-    return bool(review_input.split(_marker_of(review_input), 3)[2].strip())
+    """True if any file content was rendered between the injection markers. The flagged-locations line
+    (where triage looked) is not content."""
+    body = review_input.split(_marker_of(review_input), 3)[2].lstrip()
+    if body.startswith(_LOC_HEADING):
+        body = body.split("\n", 1)[1] if "\n" in body else ""
+    return bool(body.strip())
 
 
 def _clamp01(x) -> float:
