@@ -152,7 +152,7 @@ def test_guard_status_reads_stored_stats(tmp_path):
 
 def test_chars_per_token_counts_the_system_prompt_too(tmp_path):
     """The server's prompt_tokens include the system prompt, so the chars measured against it must too;
-    otherwise chars/token reads ~1.8 instead of ~3.4 on real reviews (seen live on Gemma)."""
+    otherwise chars/token reads ~1.8 instead of ~3.4 on real reviews."""
     class _Sized(Backend):
         def complete(self, **kw):
             self.last_usage = {"prompt_tokens": round((len(kw["system"]) + len(kw["user_text"])) / 3.4),

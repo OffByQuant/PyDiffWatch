@@ -52,9 +52,9 @@ def test_system_prompt_names_pypi_install_time_execution_not_npm_lifecycle_scrip
 
 def test_summary_is_context_inside_the_markers():
     d = Diff("p", "1.0.1", False, [FileDiff("p/a.py", "modified", [Hunk((0, 1), (0, 1), ["x()"], [])])], [],
-             description="CLI for the Fleetbo vibe-coding platform")
+             description="CLI for the Acme app platform")
     trusted, untrusted = _zones(d)
-    assert "CLI for the Fleetbo vibe-coding platform" in untrusted and "Fleetbo" not in trusted
+    assert "CLI for the Acme app platform" in untrusted and "Acme" not in trusted
     assert "--- package description (the author's claim; context, not evidence) ---" in untrusted
 
 

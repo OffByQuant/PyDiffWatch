@@ -104,22 +104,10 @@ processed (the diff basis, the triage score, and which rules fired), an **alerts
 sent, and a **verdicts** row with the reviewer's call — classification, confidence, attack type, reasoning,
 and model — plus your own `human_label` once you adjudicate it with `pending`.
 
-A `releases` × `verdicts` slice from a real run (triage score is an unbounded sum of fired-rule weights;
-the default escalation threshold is 40, so anything below it never reaches the reviewer):
-
-```text
-package  version  triage_score  attack_type       classification
--------  -------  ------------  ----------------  --------------
-pkg-a    9.1.0          21135   install-hook-rce  malicious
-pkg-b    2.9.32         16400   typosquat         malicious
-pkg-c    0.7.2           5975   dropper           malicious
-pkg-d    1.0.44          2510   typosquat         suspicious
-pkg-e    3.13.0        167740   none              benign
-```
-
-*(Package names anonymized.)* The last row is why the LLM reviewer earns its place: a brand-new package can
-rack up a huge heuristic score yet be correctly cleared as benign on inspection — catching the false
-positive before it ever becomes an alert.
+The triage score is the sum of the weights of the rules that fired; the default escalation threshold is 40,
+so anything below it never reaches the reviewer. A high score is not a verdict: a large brand-new package
+can rack up a huge score and still be cleared as benign on inspection, which is why the reviewer, not the
+score, decides what becomes an alert.
 
 ---
 

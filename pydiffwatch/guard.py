@@ -1,8 +1,7 @@
 """ReviewerGuard: decides whether a review may be sent to the model endpoint now, and how large it may be.
 
-Design: docs/superpowers/specs/2026-09-24-model-protection-design.md. A guard is rebuilt at the start of
-every batch from its reviewer_stats row, so the measured speed and the breaker state survive restarts (a
-cron-driven `run` is a new process every tick)."""
+A guard is rebuilt at the start of every batch from its reviewer_stats row, so the measured speed and the
+breaker state survive restarts (a cron-driven `run` is a new process every tick)."""
 import logging
 import time
 
@@ -14,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 MIN_SAMPLE_TOKENS = 2000     # smaller prompts are dominated by fixed overhead, not reading speed
 COLD_START_CAP = 40_000      # chars allowed per review until the endpoint's speed is measured
-DEFAULT_CPT = 3.4            # chars per token, measured on review inputs (2026-09-24)
+DEFAULT_CPT = 3.4            # chars per token, typical of review inputs
 EWMA = 0.3
 PROBE_TEXT = "Reply with OK."
 CALIBRATION_TEXT = "The quick brown fox jumps over the lazy dog. " * 400   # ~4k tokens; never package content

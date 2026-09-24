@@ -1,6 +1,6 @@
 """urlopen's timeout bounds each socket read, not the download: a connection that trickles bytes never
-trips it and holds a scan tick forever (seen live on npmDiffWatch, 2026-09-24). Every PyPI download gets a
-total deadline, JSON metadata a longer one plus a size cap, and XML-RPC calls a socket timeout."""
+trips it, so it could hold a scan tick forever. Every PyPI download gets a total deadline, JSON metadata a
+longer one plus a size cap, and XML-RPC calls a socket timeout."""
 import dataclasses
 import logging
 

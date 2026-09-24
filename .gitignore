@@ -23,3 +23,12 @@ artifact_cache/
 
 # stray empty file from a shell-redirect mishap (e.g. a lost `2>` target); never track it
 /2
+
+# Internal notes and local run data: never published
+internal/
+docs/superpowers/
+/CLAUDE.md
+.superpowers/
+.worktrees/
+.diffwatch*/
+results-showcase/

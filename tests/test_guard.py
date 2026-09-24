@@ -279,7 +279,7 @@ def test_cap_explain_names_the_binding_limit(tmp_path):
 
 
 def test_default_probe_timeout_covers_a_llama_swap_cold_load():
-    # Live: llama-swap loading Gemma 4 12B from cold took longer than 60 s, failing calibration.
+    # A llama-swap cold load of a mid-size model can take longer than 60 s; calibration must not fail on it.
     assert Config().reviewer.probe_timeout == 180.0
 
 
