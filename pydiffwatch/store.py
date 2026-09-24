@@ -318,17 +318,26 @@ def get_stage(conn, package, version):
                        (package, version)).fetchone()
     return row[0] if row else None
 
+# Stages at which a release can be left unscanned. Carrying the UNREVIEWED verdict (model 'none'), such a
+# release waits in `pending`, which labels it `(not scanned: <stage>)`; for pending_review the label is the
+# pending_reason (too_large, review_failed).
+UNSCANNED_STAGES = ("refused_to_extract", "refused_to_fetch", "gave_up", "pending_review")
+
 def pending_adjudication(conn):
-    """Suspicious LLM verdicts queued for agent review (§8.1): stage 'needs_adjudication' and not yet
-    labelled. Joined with the release so the caller can re-fetch the diff."""
-    return conn.execute(
-        """SELECT r.id AS release_id, r.package, r.version, r.serial, r.triage_score, r.triage_rules,
-                  r.evidence, r.stage,
+    """Releases queued for agent review (§8.1), not yet labelled: suspicious LLM verdicts
+    ('needs_adjudication'), and releases left unscanned with the UNREVIEWED verdict (refused, given up on, or
+    parked for review with the model unable to review it). Joined with the release so the caller can re-fetch
+    the diff."""
+    # The f-string only inserts `?` placeholders; the stages are bound params (sqlite3, not SQLAlchemy).
+    return conn.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+        f"""SELECT r.id AS release_id, r.package, r.version, r.serial, r.triage_score, r.triage_rules,
+                  r.evidence, r.stage, r.pending_reason,
                   v.classification, v.confidence, v.attack_type, v.reasoning, v.cited_hunk, v.model
            FROM releases r JOIN verdicts v ON v.release_id = r.id
-           WHERE r.stage IN ('needs_adjudication', 'refused_to_extract', 'refused_to_fetch')
+           WHERE (r.stage = 'needs_adjudication'
+                  OR (r.stage IN ({','.join('?' * len(UNSCANNED_STAGES))}) AND v.model = 'none'))
              AND v.human_label IS NULL
-           ORDER BY r.id""").fetchall()
+           ORDER BY r.id""", UNSCANNED_STAGES).fetchall()
 
 def adjudicate(conn, release_id, label, note):
     """Record the agent's adjudication on a verdict; returns the release row (for alerting) or None."""

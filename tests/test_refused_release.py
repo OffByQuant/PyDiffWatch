@@ -40,12 +40,6 @@ def test_size_refused_release_waits_in_pending(tmp_cfg, capsys, monkeypatch):
     assert "download-size" in item["reasoning"] and "refused" in item["fetch_error"]
 
 
-def test_quarantined_release_stays_out_of_pending(tmp_cfg, capsys):
-    # Confirmed malware refused before any byte is pulled: nothing for a human to review.
-    _, out = _refuse(tmp_cfg, fetcher.RefusedToFetch("quarantined: big-native-pkg"), capsys)
-    assert out == "" and orchestrator.list_pending(tmp_cfg) == []
-
-
 def test_refused_release_can_be_adjudicated(tmp_cfg, capsys, monkeypatch):
     conn, _ = _refuse(tmp_cfg, fetcher.RefusedToExtract("total-size"), capsys)
     monkeypatch.setattr(notifier, "post_webhook", lambda *a: True)

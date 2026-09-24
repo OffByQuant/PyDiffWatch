@@ -1,6 +1,6 @@
 import dataclasses, datetime, fcntl, json, logging, os, sqlite3, time
 from concurrent.futures import ThreadPoolExecutor
-from . import ingest, fetcher, differ, engine, rules, notifier, store, reviewer, egress, dashboard
+from . import ingest, fetcher, differ, engine, rules, notifier, store, reviewer, egress, dashboard, quarantine
 from . import guard as guard_mod
 from .config import Config
 from .models import Verdict, NewRelease, FiredRule
@@ -96,6 +96,12 @@ def _attempt_review(cfg, conn, rvw, rid, package, version, score, fired_rules, t
             return False
         n = store.bump_review_attempts(conn, rid)
         store.park_for_review(conn, rid, "review_failed", f"{n} failed attempt(s): {e}", text)
+        if n == cfg.reviewer.max_review_attempts:      # the auto-drain stops retrying it from here on
+            _alert_unscanned(cfg, conn, rid, package, version,
+                             f"UNREVIEWED: the model failed to review it {n} times (last error: {e}); "
+                             f"retries are used up. Run `review-pending` to try again, e.g. with another "
+                             f"model. Not scanned. Needs manual review.",
+                             stage="review_failed", score=score, fired_rules=fired_rules)
         if guard is not None and _is_timeout(e):
             guard.record_timeout()
             return False
@@ -119,7 +125,8 @@ def _review_escalated(cfg, conn, rvw, d, tr, rid, *, offline=False, guard=None):
         text = rvw.prepare(d, tr, cap=guard.input_cap_chars() if guard is not None else None)
     except reviewer.InputTooLarge as e:
         detail = f"{e}; {guard.cap_explain()}" if guard is not None else str(e)
-        store.park_for_review(conn, rid, "too_large", detail, e.text)
+        _park_too_large(cfg, conn, rid, d.package, d.version, tr.score, tr.fired_rules, detail, e.text)
+        return      # its one alert is the unscanned one, with the score and rules
     else:
         if offline:
             store.park_for_review(conn, rid, "endpoint_unreachable", "reviewer endpoint unreachable", text)
@@ -158,7 +165,8 @@ def drain_pending(cfg, conn, rvw, *, auto: bool, reasons=None, limit=None, guard
         if len(text) > cap:
             if auto:
                 explain = guard.cap_explain() if guard is not None else f"cap {cap}"
-                store.park_for_review(conn, rid, "too_large", f"needs {len(text)} chars; {explain}", text)
+                _park_too_large(cfg, conn, rid, row["package"], row["version"], row["triage_score"],
+                                _rules_from_json(row["triage_rules"]), f"needs {len(text)} chars; {explain}", text)
             continue
         tried += 1
         if not _attempt_review(cfg, conn, rvw, rid, row["package"], row["version"], row["triage_score"],
@@ -197,12 +205,34 @@ def _refusal_note(action: str, reason: str) -> str:
             f"Needs manual review.")
 
 
-def _queue_refusal(cfg, conn, rid, rel, note):
-    """Never unpacked, so never scanned: queue it for a human (`pending`) and say why in the alert."""
-    v = Verdict(rel.package, rel.version, "suspicious", 0.0, [], False, confidence=0.0, attack_type="none",
-                reasoning=note, cited_hunk="", recommended_action="monitor", model="none")
-    store.record_verdict(conn, rid, v)
-    notifier.emit(cfg, conn, dataclasses.replace(v, classification="suspicious-heuristic"), rid)
+def _alert_unscanned(cfg, conn, rid, package, version, note, *, stage, score=0.0, fired_rules=(),
+                     queue=True) -> bool:
+    """The one path for an outcome that leaves a release unscanned: alert once, and queue it for a person.
+
+    - `note` is the alert's reasoning. By convention it starts `UNREVIEWED:` and ends `Not scanned. Needs
+      manual review.` (refusals and `metadata_gone` keep their own endings).
+    - `stage` names the outcome (`refused_to_fetch`, `too_large`, `gave_up`, ...). The alert is
+      `suspicious-heuristic`, deduped on package|version|suspicious-heuristic|unscanned:<stage>, so it fires
+      once per outcome even after the first-park heuristic alert, and never again on a re-tick.
+    - `queue=True` records the UNREVIEWED verdict (`suspicious`, model `none`), so the release waits in
+      `pending` until a person adjudicates it or a model review replaces the verdict. `queue=False` alerts
+      only (nothing is left to review).
+    - `score` / `fired_rules` carry the triage result into the alert when there is one.
+    Never classifies the release `malicious`. Returns True iff the alert was new."""
+    v = Verdict(package, version, "suspicious", score or 0.0, list(fired_rules), False, confidence=0.0,
+                attack_type="none", reasoning=note, cited_hunk="", recommended_action="monitor", model="none")
+    if queue:
+        store.record_verdict(conn, rid, v)
+    return notifier.emit(cfg, conn, dataclasses.replace(v, classification="suspicious-heuristic"), rid,
+                         dedupe_suffix=f"unscanned:{stage}")
+
+
+def _park_too_large(cfg, conn, rid, package, version, score, fired_rules, detail, text):
+    store.park_for_review(conn, rid, "too_large", detail, text)
+    _alert_unscanned(cfg, conn, rid, package, version,
+                     f"UNREVIEWED: its review input is too large for the model ({detail}); run `review-pending` "
+                     f"with a larger-context model. Not scanned. Needs manual review.",
+                     stage="too_large", score=score, fired_rules=fired_rules)
 
 
 def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=None) -> bool:
@@ -213,22 +243,31 @@ def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=
     rid = store.record_release(conn, rel.package, rel.version, rel.serial, False, None, "sdist")
     if isinstance(result, fetcher.RefusedToFetch):
         store.update_stage(conn, rid, "refused_to_fetch")
-        if not str(result).startswith("quarantined"):   # confirmed malware needs no second look
-            _queue_refusal(cfg, conn, rid, rel, _refusal_note("download it", str(result)))
-        return True   # deterministic refusal (over-size) — terminal
+        if str(result).startswith("quarantined"):
+            # A new release of a quarantined project: never downloaded, so never cleared either. The list
+            # holds unconfirmed entries too, so this is a cue to look, not a `malicious` verdict.
+            note = (f"UNREVIEWED: this project is on pydiffwatch's quarantine list "
+                    f"({quarantine.reason(rel.package) or result}), so this release was not downloaded. "
+                    f"Not scanned. Needs manual review.")
+        else:
+            note = _refusal_note("download it", str(result))
+        _alert_unscanned(cfg, conn, rid, rel.package, rel.version, note, stage="refused_to_fetch")
+        return True   # deterministic refusal (over-size, quarantine) — terminal
     if isinstance(result, fetcher.RefusedToExtract):
         store.update_stage(conn, rid, "refused_to_extract")
-        _queue_refusal(cfg, conn, rid, rel, _refusal_note("unpack its sdist", str(result)))
+        _alert_unscanned(cfg, conn, rid, rel.package, rel.version, _refusal_note("unpack its sdist", str(result)),
+                         stage="refused_to_extract")
         return True   # terminal: permanent suspicious decision recorded
     if isinstance(result, fetcher.MetadataGone):
-        # PyPI pulls malware fast; a release gone before we read it is worth a look, and never a cursor pin.
+        # PyPI pulls malware fast; a release gone before we read it is worth knowing about, and never a cursor
+        # pin. Not queued: with the files gone, a person can't review it either.
         store.update_stage(conn, rid, "metadata_gone")
-        notifier.emit(cfg, conn, Verdict(rel.package, rel.version, "suspicious-heuristic", 0.0, [], False,
-                      confidence=0.0, attack_type="none", cited_hunk="", model="none",
-                      reasoning="removed from PyPI before it could be scanned (its metadata returns 404)"), rid)
+        _alert_unscanned(cfg, conn, rid, rel.package, rel.version,
+                         "UNREVIEWED: removed from PyPI before it could be scanned (its metadata returns 404); "
+                         "the files are gone, so there is nothing to review.", stage="metadata_gone", queue=False)
         return True
     if isinstance(result, Exception):   # metadata or sdist download failed (incl. a deadline expiry)
-        return _retry_later(conn, rid, rel, result)
+        return _retry_later(cfg, conn, rid, rel, result)
     if result is None:
         store.update_stage(conn, rid, "no_sdist")   # no sdist for this version — permanent
         return True
@@ -258,14 +297,21 @@ def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=
         return True   # terminal: an unfinished LLM review is parked in the pending-review queue
     except Exception as e:
         logger.exception("processing failed for %s==%s", rel.package, rel.version)
-        return _retry_later(conn, rid, rel, e)
+        return _retry_later(cfg, conn, rid, rel, e)
 
 
-def _retry_later(conn, rid, rel, e) -> bool:
+def _retry_later(cfg, conn, rid, rel, e) -> bool:
     """Queue a failed release for retry from its row (store.note_metadata_failure: bounded, then gave_up,
-    both shown by `pending`). The cursor moves on: a failure that never clears must not pin it."""
-    stage = store.note_metadata_failure(conn, rid, f"{type(e).__name__}: {e}")
-    logger.warning("scan failed for %s==%s (%s): %s: %s", rel.package, rel.version, stage, type(e).__name__, e)
+    both shown by `pending`). The cursor moves on: a failure that never clears must not pin it. The move to
+    gave_up alerts once, with the last error (the release's fetch_note)."""
+    was = store.get_stage(conn, rel.package, rel.version)
+    note = f"{type(e).__name__}: {e}"
+    stage = store.note_metadata_failure(conn, rid, note)
+    logger.warning("scan failed for %s==%s (%s): %s", rel.package, rel.version, stage, note)
+    if stage == "gave_up" and was != "gave_up":
+        _alert_unscanned(cfg, conn, rid, rel.package, rel.version,
+                         f"UNREVIEWED: pydiffwatch failed to download or scan it {store.METADATA_ATTEMPTS} times "
+                         f"and gave up (last error: {note}). Not scanned. Needs manual review.", stage="gave_up")
     return True
 
 
@@ -449,8 +495,12 @@ def list_pending(cfg: Config):
     for row in store.pending_adjudication(conn):
         stored = store.evidence_text(row["evidence"])
         diff_text, err = stored, None
+        not_scanned = (row["pending_reason"] if row["stage"] == "pending_review" else row["stage"]) \
+            if row["stage"] in store.UNSCANNED_STAGES else None
         if row["stage"] in ("refused_to_extract", "refused_to_fetch"):
             err = "refused, never scanned (see reason); inspect it by hand"
+        elif not_scanned and not stored:
+            err = "never scanned (see reason); inspect it by hand"
         elif not stored:                                  # older row with no captured payload -> re-fetch
             try:
                 art = fetcher.fetch_artifacts(cfg, NewRelease(row["package"], row["version"], row["serial"]))
@@ -464,7 +514,7 @@ def list_pending(cfg: Config):
                       "classification": row["classification"], "confidence": row["confidence"],
                       "attack_type": row["attack_type"], "reasoning": row["reasoning"],
                       "cited_hunk": row["cited_hunk"], "diff_text": diff_text, "fetch_error": err,
-                      "evidence_stored": stored is not None})
+                      "evidence_stored": stored is not None, "not_scanned": not_scanned})
     conn.close()
     return items
 

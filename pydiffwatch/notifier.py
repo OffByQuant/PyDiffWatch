@@ -29,8 +29,13 @@ def post_webhook(cfg, text) -> bool:
         return False
 
 
-def emit(cfg, conn, verdict: Verdict, release_id: int):
+def emit(cfg, conn, verdict: Verdict, release_id: int, dedupe_suffix: str = ""):
+    """Print and post one alert, at most once per package|version|classification[|dedupe_suffix]. The suffix
+    lets a second, different alert for the same release through (e.g. an unscanned outcome after the
+    first-park heuristic alert) while a re-tick of either is still deduped."""
     dedupe_key = f"{verdict.package}|{verdict.version}|{verdict.classification}"
+    if dedupe_suffix:
+        dedupe_key += f"|{dedupe_suffix}"
     rules_json = json.dumps([r.__dict__ for r in verdict.fired_rules])
     is_new = store.record_alert(conn, release_id, verdict.classification,
                                 verdict.score, rules_json, dedupe_key)

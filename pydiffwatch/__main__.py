@@ -155,9 +155,10 @@ def main():
             print("[pydiffwatch] no suspicious verdicts awaiting adjudication"); return
         print(f"[pydiffwatch] {len(items)} suspicious verdict(s) awaiting adjudication:\n")
         for it in items:
-            print(f"=== release_id={it['release_id']}  {it['package']}=={it['version']}  "
-                  f"(model: {it['classification']} conf={it['confidence']} attack={it['attack_type']}) ===")
-            print(f"  model reason: {it['reasoning']}")
+            why = (f"not scanned: {it['not_scanned']}" if it["not_scanned"] else
+                   f"model: {it['classification']} conf={it['confidence']} attack={it['attack_type']}")
+            print(f"=== release_id={it['release_id']}  {it['package']}=={it['version']}  ({why}) ===")
+            print(f"  {'reason' if it['not_scanned'] else 'model reason'}: {it['reasoning']}")
             print(f"  cited_hunk: {it['cited_hunk']}")
             if it["diff_text"] is not None:
                 label = "stored payload evidence" if it["evidence_stored"] else "diff under review (re-fetched)"
