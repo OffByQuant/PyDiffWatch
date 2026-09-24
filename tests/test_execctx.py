@@ -292,3 +292,82 @@ def test_default_section_keys_do_not_leak_into_other_sections():
     assert execctx.parse_mapping(cfg, "ini")["options.entry_points"] == {"console_scripts": "\nfoo = a:main"}
     ctx = execctx.build({"setup.cfg": cfg})
     assert "zz" not in _line(ctx, "plugins") and "foo -> a:main" in _line(ctx, "commands")
+
+
+# ---- fix round 2: every indirect setup() makes every keyword computed ----
+
+def _all_computed(ctx):
+    return ("cmdclass=<computed>" in ctx and "setup_requires=<computed>" in ctx
+            and "<computed>" in _line(ctx, "commands") and "<computed>" in _line(ctx, "plugins"))
+
+
+def test_a_decoy_plus_a_getattr_setup_is_computed():
+    ctx = execctx.build({"setup.py": b"import setuptools\nif False:\n    setuptools.setup(name='x')\n"
+                                     b"getattr(setuptools, 'se'+'tup')(entry_points={'pytest11': ['p = evil']})\n"})
+    assert _all_computed(ctx)
+
+
+def test_a_called_call_or_subscript_is_computed():
+    for src in (b"from setuptools import setup\nsetup(name='a')\nmk()(entry_points={'pytest11': ['p = e']})\n",
+                b"from setuptools import setup\nsetup(name='a')\nfns['s'](entry_points={'pytest11': ['p = e']})\n"):
+        assert _all_computed(execctx.build({"setup.py": src})), src
+
+
+def test_getattr_dict_or_import_on_setuptools_is_computed():
+    for src in (b"import setuptools\nsetuptools.setup(name='a')\nf = getattr(setuptools, 'setup')\n",
+                b"import setuptools as st\nst.setup(name='a')\nf = st.__dict__['setup']\n",
+                b"from distutils import core\ncore.setup(name='a')\nf = vars(core)\n",
+                b"import setuptools\nsetuptools.setup(name='a')\nm = __import__('setup' + 'tools')\n"):
+        assert _all_computed(execctx.build({"setup.py": src})), src
+
+
+def test_a_local_def_or_assignment_of_setup_is_computed():
+    for src in (b"import setuptools\ndef setup(**kw):\n    kw['entry_points'] = {'pytest11': ['p = evil']}\n"
+                b"    return setuptools.__dict__['se'+'tup'](**kw)\nsetup(name='x')\n",
+                b"import setuptools\nsetup = make_setup()\nsetup(name='x')\n",
+                b"from evil import setup\nsetup(name='x')\n",
+                b"from setuptools import setup\nrun = setup\nrun(name='x')\nsetup(name='y')\n"):
+        assert _all_computed(execctx.build({"setup.py": src})), src
+
+
+def test_plain_setuptools_and_distutils_setup_calls_are_still_literal():
+    for src in (b"from setuptools import setup\nsetup(cmdclass={'build_py': B})\n",
+                b"import setuptools\nsetuptools.setup(cmdclass={'build_py': B})\n",
+                b"from distutils.core import setup\nsetup(cmdclass={'build_py': B})\n"):
+        assert "cmdclass=build_py" in execctx.build({"setup.py": src}), src
+
+
+# ---- fix round 2: a source that failed to parse makes its fields unknown, never "none" ----
+
+def test_an_unparseable_pyproject_makes_its_fields_unknown():
+    ctx = execctx.build({"pyproject.toml": b"[project\nname='x'\n[project.entry-points.pytest11]\np='evil'\n"})
+    u = "unknown (pyproject.toml unparseable)"
+    assert f"commands (console_scripts/gui_scripts; run only when the user types them): {u}" in ctx
+    assert _line(ctx, "plugins").endswith(u) and f"backend-path={u}" in ctx and f"cmdclass={u}" in ctx
+    assert f"py-modules={u}" in ctx and "setup_requires=none" in ctx      # pyproject cannot declare setup_requires
+
+
+def test_an_unparseable_setup_py_makes_its_fields_unknown():
+    ctx = execctx.build({"setup.py": b"from setuptools import setup\nsetup(name='x', entry_points={'pytest11': ['p = e']}\n",
+                         "a.egg-info/entry_points.txt": b"[console_scripts]\nc = a:main\n"})
+    u = "unknown (setup.py unparseable)"
+    assert _line(ctx, "commands").endswith(f"c -> a:main, {u}") and _line(ctx, "plugins").endswith(u)
+    assert f"cmdclass={u}" in ctx and f"setup_requires={u}" in ctx and f"py-modules={u}" in ctx
+    assert "backend-path=none" in ctx                                    # only pyproject declares it
+
+
+def test_an_unparseable_setup_cfg_and_entry_points_txt_make_their_fields_unknown():
+    ctx = execctx.build({"setup.cfg": b"no header\n", "a.egg-info/entry_points.txt": b"broken\n"})
+    assert _line(ctx, "commands").endswith("unknown (setup.cfg, a.egg-info/entry_points.txt unparseable)")
+    assert "setup_requires=unknown (setup.cfg unparseable)" in ctx and "cmdclass=unknown (setup.cfg unparseable)" in ctx
+
+
+def test_an_entry_point_item_without_equals_is_not_dropped():
+    ctx = execctx.build({"setup.py": b"setup(entry_points={'console_scripts': ['foo=a:main', 'junk'], 'g': ['bad']})\n"})
+    assert "foo -> a:main" in _line(ctx, "commands") and "<computed>" in _line(ctx, "commands")
+    assert "g: <computed>" in _line(ctx, "plugins")
+
+
+def test_a_non_string_group_key_is_not_dropped():
+    ctx = execctx.build({"setup.py": b"setup(entry_points={5: ['a = b:c']})\n"})
+    assert "<computed>" in _line(ctx, "plugins") and "<computed>" in _line(ctx, "commands")

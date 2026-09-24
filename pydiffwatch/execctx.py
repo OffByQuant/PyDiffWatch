@@ -4,8 +4,9 @@ import, when the user types a command, and when a host tool loads plugins.
 Pure, no I/O. Built from the new release's extracted top-level metadata: pyproject.toml (tomllib), setup.cfg
 and entry_points.txt (configparser), setup.py (ast: literal setup() keywords only, anything else is
 "<computed>"), top_level.txt and .pth lines. Nothing is imported or executed. Every value here is
-author-written: the reviewer fences the block as untrusted. A file that does not parse renders as the line
-`<file>: unparseable`; nothing in here raises on package content."""
+author-written: the reviewer fences the block as untrusted. Files that do not parse are named on one capped
+line, `unparseable: a, b, … (+N more)`, and every field they could declare reads `unknown (<file> unparseable)`
+instead of "none"; nothing in here raises on package content."""
 import ast
 import configparser
 import email.parser
@@ -33,7 +34,7 @@ def _ini(text: str, delimiters=("=", ":")) -> dict:
 def parse_mapping(data: bytes, kind: str) -> dict | None:
     """The one parser for author-written structured files (npm #25 parity). kind: toml | ini | entry_points
     | pkginfo | json. A UTF-8 BOM is accepted; a top level that is not a mapping is {}; a parse failure is
-    None (rendered `<file>: unparseable`). Never raises on content."""
+    None (named on the block's `unparseable: a, b, …` line). Never raises on content."""
     try:
         text = data.decode("utf-8-sig")
         if kind == "toml":
@@ -99,20 +100,68 @@ def _lit(node, depth=0):
     return COMPUTED
 
 
+_BUILD_MODULES = ("setuptools", "distutils")
+_DYNAMIC_IMPORT = {"__import__", "import_module"}
+
+
+def _root(node):
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def _indirect_setup(tree) -> bool:
+    """True when setup() may be reached some way other than the one literal call we read: a called call or
+    subscript (`getattr(...)(...)`, `fns[k](...)`), getattr/vars/`__dict__` on setuptools or distutils, a dynamic
+    import, or the name `setup` defined, assigned, imported from elsewhere or passed around as a value."""
+    mods = set()                                        # local names bound to setuptools / distutils modules
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            mods.update((a.asname or a.name).split(".")[0] for a in node.names
+                        if a.name.split(".")[0] in _BUILD_MODULES)
+        elif isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] in _BUILD_MODULES:
+            mods.update(a.asname or a.name for a in node.names if a.name != "setup")
+    callee_names = value_names = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            f = node.func
+            if isinstance(f, (ast.Call, ast.Subscript)):
+                return True
+            if (isinstance(f, ast.Name) and f.id in ("getattr", "vars") and node.args
+                    and _root(node.args[0]) in mods):
+                return True
+            callee_names += isinstance(f, ast.Name) and f.id == "setup"
+        elif isinstance(node, ast.Attribute):
+            if node.attr in _DYNAMIC_IMPORT or (node.attr == "__dict__" and _root(node.value) in mods):
+                return True
+        elif isinstance(node, ast.Name):
+            if node.id in _DYNAMIC_IMPORT or (node.id == "setup" and not isinstance(node.ctx, ast.Load)):
+                return True
+            value_names += node.id == "setup"
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "setup":
+            return True
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            build = isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] in _BUILD_MODULES
+            for a in node.names:
+                if (a.asname or a.name) == "setup" and not (build and a.name == "setup"):
+                    return True                         # `from evil import setup`, `import x as setup`
+                if a.name == "setup" and a.asname not in (None, "setup"):
+                    return True                         # `from setuptools import setup as s`
+    return value_names > callee_names                   # `run = setup`: setup used as a value
+
+
 def _setup_kwargs(tree) -> tuple[dict, bool]:
     """(literal keywords of the setup() call, whether any keyword it lacks may still be computed).
 
     Only a single `setup(...)` / `x.setup(...)` call is read. None, several (a decoy under `if False:` can
-    precede the real call), or `setup` imported under another name: every keyword is unknown."""
-    calls, aliased = [], False
+    precede the real call), or any indirect route to setup (_indirect_setup): every keyword is unknown."""
+    calls = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             f = node.func
             if (f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None) == "setup":
                 calls.append(node)
-        elif isinstance(node, ast.ImportFrom):
-            aliased |= any(a.name == "setup" and a.asname not in (None, "setup") for a in node.names)
-    if len(calls) != 1 or aliased:
+    if len(calls) != 1 or _indirect_setup(tree):
         return {}, True
     return ({k.arg: _lit(k.value) for k in calls[0].keywords if k.arg is not None},
             any(k.arg is None for k in calls[0].keywords))
@@ -134,12 +183,13 @@ def _ep_lines(v) -> list[tuple[str, str]]:
         return [_UNKNOWN_EP]
     out = []
     for line in v:
-        if not isinstance(line, str) or line == COMPUTED:
-            out.append(_UNKNOWN_EP)
-        elif "=" in line:
+        if isinstance(line, str) and (not line.strip() or line.lstrip().startswith(("#", ";"))):
+            continue                                    # blank or comment line of an INI-style value
+        if not isinstance(line, str) or line == COMPUTED or "=" not in line or not line.split("=", 1)[0].strip():
+            out.append(_UNKNOWN_EP)                     # never dropped silently
+        else:
             name, target = line.split("=", 1)
-            if name.strip():
-                out.append((name.strip(), target.strip()))
+            out.append((name.strip(), target.strip()))
     return out
 
 
@@ -153,22 +203,24 @@ def _add_groups(eps: dict, groups) -> None:
     if not isinstance(groups, dict):
         eps.setdefault(COMPUTED, [])
         return
-    for group, v in _dict(groups).items():
-        if isinstance(group, str) and v is not None:
+    for group, v in groups.items():
+        if not isinstance(group, str):
+            eps.setdefault(COMPUTED, [])                # a group we cannot name: unknown, not dropped
+        elif v is not None:
             eps.setdefault(group.strip(), []).extend(_ep_lines(v))
 
 
 _COMMAND_GROUPS = ("console_scripts", "gui_scripts")
 
 
-def _entry_points_lines(eps: dict) -> tuple[str, str]:
+def _entry_points_lines(eps: dict, unknown: list) -> tuple[str, str]:
     cmds = [n if n == COMPUTED else f"{n} -> {t}" for g in _COMMAND_GROUPS for n, t in eps.get(g, [])]
     plugins = [f"{g}: {n}" if n == COMPUTED else f"{g}: {n} -> {t}"
                for g, lst in eps.items() if g not in _COMMAND_GROUPS and g != COMPUTED for n, t in lst]
     if COMPUTED in eps:
         cmds.append(f"entry points={COMPUTED}")
         plugins.append(f"entry points={COMPUTED}")
-    return _join(cmds), _join(plugins)
+    return _join(cmds + unknown), _join(plugins + unknown)
 
 
 # ---- discovery ----
@@ -230,6 +282,12 @@ def build(new_files: dict[str, bytes]) -> str:
     def kw(name):
         return setup_kw.get(name, COMPUTED if splat else None)
 
+    def unknown(*sources):
+        """A field some of whose declaring files failed to parse is unknown, never "none"."""
+        bad = [p for p in unparseable
+               if p in sources or ("entry_points.txt" in sources and p.endswith("/entry_points.txt"))]
+        return [f"unknown ({_join(bad)} unparseable)"] if bad else []
+
     bs, project = _dict(pp.get("build-system")), _dict(pp.get("project"))
     st = _dict(_dict(pp.get("tool")).get("setuptools"))
     options = _dict(cfg.get("options"))
@@ -261,8 +319,11 @@ def build(new_files: dict[str, bytes]) -> str:
     sreq = kw("setup_requires")
     sreq = [COMPUTED] if sreq == COMPUTED else (_strs(sreq) or [])
     sreq += _cfg_list(options.get("setup_requires", ""))
+    bpath = (_strs(bs.get("backend-path")) or []) + unknown("pyproject.toml")
+    cmdclass += unknown("pyproject.toml", "setup.py", "setup.cfg")
+    sreq += unknown("setup.py", "setup.cfg")
     build_line = (f"build (runs when pip builds or installs from this sdist): backend={shown}; "
-                  f"backend-path={_join(_strs(bs.get('backend-path')) or [])}; setup.py={setup_py}; "
+                  f"backend-path={_join(bpath)}; setup.py={setup_py}; "
                   f"cmdclass={_join(cmdclass)}; setup_requires={_join(sreq)}")
 
     # startup
@@ -285,8 +346,10 @@ def build(new_files: dict[str, bytes]) -> str:
         v = options.get(cfg_name, "").strip()
         return None if not v or v.startswith("find") else _join(_cfg_list(v))
 
-    pkgs = declared("packages", "packages", "packages") or f"auto-discovered: {_join(_discovered(new_files))}"
-    mods = declared("py_modules", "py-modules", "py_modules") or "none"
+    src_unknown = unknown("pyproject.toml", "setup.py", "setup.cfg")
+    pkgs = declared("packages", "packages", "packages") or ", ".join(
+        src_unknown + [f"auto-discovered: {_join(_discovered(new_files))}"])
+    mods = declared("py_modules", "py-modules", "py_modules") or _join(src_unknown)
     tops = [ln for p in _egg_info(new_files, "top_level.txt")
             for ln in new_files[p].decode("utf-8", errors="replace").split()]
     import_line = (f"import (runs when a program imports the package): packages={pkgs}; py-modules={mods}; "
@@ -300,7 +363,7 @@ def build(new_files: dict[str, bytes]) -> str:
     _add_groups(eps, cfg.get("options.entry_points"))
     for p in _egg_info(new_files, "entry_points.txt"):
         _add_groups(eps, parsed(p, "entry_points"))
-    cmds, plugins = _entry_points_lines(eps)
+    cmds, plugins = _entry_points_lines(eps, unknown("pyproject.toml", "setup.py", "setup.cfg", "entry_points.txt"))
 
     lines = [build_line, startup, import_line,
              f"commands (console_scripts/gui_scripts; run only when the user types them): {cmds}",
