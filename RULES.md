@@ -15,6 +15,7 @@ For each changed release the engine builds **facts**, runs every rule whose `mat
 **sums the weights** of the fired rules. If the total reaches the configured threshold (`threshold_t`,
 default 40), the release is escalated to the LLM reviewer. Weights are additive and tunable — there is no
 magic; a rule worth 45 on its own crosses the default threshold, a rule worth 20 needs a second signal.
+A rule with `max_total` adds at most that much to one release's total, however often it fires.
 
 ## Rule fields
 
@@ -27,6 +28,7 @@ magic; a rule worth 45 on its own crosses the default threshold, a rule worth 20
 | `attack_type` | no | informational label (e.g. `credential-exfil`) |
 | `location_scaled` | no | if `true`, the fired weight is multiplied by the file's location weight (code scope only); default `false` |
 | `description` | no | human/LLM-readable explanation |
+| `max_total` | no | cap on this rule's summed contribution to one release's score (positive number); default: no cap |
 
 **Evaluation scope** decides what each rule runs against:
 - `code` — evaluated once per changed `.py`/`.pyx`/`.pyi` file.
@@ -36,6 +38,14 @@ magic; a rule worth 45 on its own crosses the default threshold, a rule worth 20
 
 Rules in `binary`/`dep` scope fire **once per matching item**, and the weights sum — so two foreign-language
 files at weight 25 contribute 50 automatically.
+
+**`max_total`** caps that sum. The release score adds `min(sum of the rule's fired weights, max_total)` for
+the rule; each fired entry keeps its full per-file weight, so the reviewer still ranks files by it. Use it
+for a broad corroborating rule that fires once per file, so a large ordinary codebase can't reach
+`threshold_t` on it alone. It must be a positive finite number (int or float): a bool, string, null, 0, a
+negative number, NaN or infinity rejects the whole rule at load, with a logged warning. The shipped
+`primitives` rule (weight 5, location-scaled) has `max_total: 35`, just under the default `threshold_t`, so
+it can never escalate a release by itself.
 
 ## The `match` tree
 
@@ -116,6 +126,19 @@ ecosystem.
   attack_type: dependency-typosquat
   match:
     dep_reason: typosquat
+```
+
+**5. A per-file corroborating signal, capped so it never escalates alone:**
+```yaml
+- id: primitives
+  applies_to: code
+  weight: 5
+  max_total: 35          # 30 matching files add 35, not 150
+  location_scaled: true
+  match:
+    any:
+      - bound_call: {category: [decode, exec, process, network, credential]}
+      - blob_present: true
 ```
 
 ## Testing your rule
