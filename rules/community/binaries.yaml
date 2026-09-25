@@ -1,9 +1,9 @@
 # Signals carried from the fetcher about non-source / oversized / foreign-language members.
 # Each fires once per matching added binary; weights from multiple firings sum naturally.
 - id: binary-source-too-large
-  description: A source file exceeded the per-file size cap and was recorded as a binary (evasion via bulk).
+  description: A source file exceeded the per-file size cap and was recorded as a binary (evasion via bulk). Alone it escalates at the default threshold_t.
   applies_to: binary
-  weight: 20
+  weight: 40
   attack_type: size-evasion
   match: {binary_reason: source-too-large}
 

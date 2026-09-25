@@ -105,6 +105,13 @@ def test_unhashable_enum_arg_rejected_not_crash():
                           "match": {"dep_reason": {"k": "v"}}}) is None
 
 
+def test_file_too_large_is_accepted_as_binary_reason(tmp_path):
+    (tmp_path / "r.yaml").write_text(
+        "- id: big-file\n  description: d\n  applies_to: binary\n  weight: 1\n  attack_type: x\n"
+        "  match: {binary_reason: file-too-large}\n")
+    assert [r.id for r in load_rules(tmp_path)] == ["big-file"]
+
+
 def test_load_rules_survives_crashy_rule(tmp_path):
     # A rule whose predicate arg would crash validation must be dropped, not abort the whole load
     # (fail-closed). The good rule in the same dir must still load.

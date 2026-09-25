@@ -1,4 +1,5 @@
 import dataclasses
+import gzip, hashlib, tarfile
 from pydiffwatch import fetcher
 from pydiffwatch.config import Config
 from pydiffwatch.models import NewRelease
@@ -32,11 +33,89 @@ def test_tar_slip_rejected():
     files, _ = fetcher.extract_sdist(blob, Config())
     assert files == {}   # path-escape member ignored, nothing written anywhere
 
-def test_member_size_cap():
-    big = b"a" * (2 * 1024 * 1024)
-    blob = make_sdist({"big.py": big})
-    with pytest.raises(fetcher.RefusedToExtract):
-        fetcher.extract_sdist(blob, Config(max_member_bytes=1024 * 1024))
+_CAP = 1024 * 1024          # max_member_bytes in these tests
+
+
+def _cfg():
+    return Config(max_member_bytes=_CAP)
+
+
+def test_oversized_data_file_is_skipped_and_hashed_not_refused():
+    big = b"\x00data" * (_CAP // 5 + 10)                    # > 1 MiB, not source/binary/foreign
+    blob = make_sdist({"data/model.bin.gz": big, "ok.py": b"y=2\n"})
+    files, binaries = fetcher.extract_sdist(blob, _cfg())
+    assert files == {"ok.py": b"y=2\n"}
+    assert binaries == [{"path": "data/model.bin.gz", "size": len(big), "reason": "file-too-large",
+                         "sha256": hashlib.sha256(big).hexdigest()}]
+
+
+def test_member_exactly_at_the_cap_is_not_oversized():
+    blob = make_sdist({"data/exact.dat": b"a" * _CAP})
+    assert fetcher.extract_sdist(blob, _cfg()) == ({}, [])
+
+
+def test_oversized_py_is_source_too_large_case_insensitive():
+    big = b"x = 1\n" * (_CAP // 6 + 10)
+    for name in ("evil.py", "EVIL.PY"):
+        files, binaries = fetcher.extract_sdist(make_sdist({name: big}), _cfg())
+        assert files == {}
+        [rec] = binaries
+        assert rec["path"] == name and rec["reason"] == "source-too-large"
+        assert rec["sha256"] == hashlib.sha256(big).hexdigest()
+
+
+def test_oversized_so_is_streamed_never_read_whole(monkeypatch):
+    big = b"\x7fELF" + b"\x00" * (2 * _CAP)
+    blob = make_sdist({"pkg/LIB.SO": big})
+    sizes = []
+    real = tarfile.TarFile.extractfile
+
+    def spy(self, member):
+        f = real(self, member)
+        orig = f.read
+        def read(size=-1):
+            sizes.append(size)
+            return orig(size)
+        f.read = read
+        return f
+    monkeypatch.setattr(tarfile.TarFile, "extractfile", spy)
+    files, binaries = fetcher.extract_sdist(blob, _cfg())
+    assert binaries == [{"path": "pkg/LIB.SO", "sha256": hashlib.sha256(big).hexdigest(), "size": len(big)}]
+    assert sizes and all(0 < s <= 1 << 20 for s in sizes)       # every read is chunked, none unbounded
+
+
+def test_oversized_php_keeps_foreign_language_source():
+    big = b"<?php echo 1; ?>\n" * (_CAP // 17 + 10)
+    [rec] = fetcher.extract_sdist(make_sdist({"web/x.php": big}), _cfg())[1]
+    assert rec["reason"] == "foreign-language-source" and rec["ext"] == ".php"
+
+
+def test_skipped_members_still_count_toward_total_size():
+    big = b"\x00" * (_CAP + 1)
+    blob = make_sdist({"a.dat": big, "b.dat": big})
+    with pytest.raises(fetcher.RefusedToExtract, match="total-size"):
+        fetcher.extract_sdist(blob, Config(max_member_bytes=_CAP, max_total_bytes=2 * _CAP))
+
+
+@pytest.mark.parametrize("blob", [b"this is not a gzip tarball", gzip.compress(b"garbage, not a tar"), b""])
+def test_unreadable_blob_raises_the_stdlib_error_not_a_refusal(blob):
+    with pytest.raises(Exception) as ei:
+        fetcher.extract_sdist(blob, Config())
+    assert not isinstance(ei.value, fetcher.RefusedToExtract)
+    assert isinstance(ei.value, (gzip.BadGzipFile, tarfile.ReadError, EOFError, OSError))
+
+
+def test_truncated_gzip_raises_and_returns_nothing_partial():
+    blob = make_sdist({f"m/f{i}.py": (f"x{i} = {i}\n" * 4000).encode() for i in range(20)})
+    with pytest.raises((EOFError, tarfile.ReadError)):
+        fetcher.extract_sdist(blob[: len(blob) * 6 // 10], Config())
+
+
+@pytest.mark.parametrize("sig", [b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"])
+def test_zip_blob_is_refused_as_zip_sdist(sig):
+    with pytest.raises(fetcher.RefusedToExtract, match="^zip-sdist$"):
+        fetcher.extract_sdist(sig + b"\x00" * 64, Config())
+
 
 def test_oversized_source_recorded_not_dropped():
     big_py = b"# pad\n" + b"x = 1  # filler\n" * 200000   # > 1 MB
@@ -46,11 +125,6 @@ def test_oversized_source_recorded_not_dropped():
     assert "evil.py" not in files                      # too big to analyze...
     rec = next(b for b in binaries if b["path"] == "evil.py")
     assert rec["reason"] == "source-too-large"         # ...but recorded as a signal
-
-def test_malformed_archive_raises_refused():
-    import pytest
-    with pytest.raises(fetcher.RefusedToExtract):
-        fetcher.extract_sdist(b"this is not a gzip tarball", Config())
 
 def _pax_name_bomb(name_bytes: int) -> bytes:
     # A 0-byte file whose NAME is huge: gzips tiny (repetitive), but tarfile must materialise the

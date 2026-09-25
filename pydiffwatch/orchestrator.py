@@ -348,17 +348,16 @@ _REFUSALS = {
     "decompressed-size": "it unpacks to more than the size limit",
     "members": "it has more files than the limit",
     "member-name": "a file path is longer than the limit",
-    "member-size": "one file is over the size limit",
     "total-size": "its files add up to more than the size limit",
     "download-size": "the download is over the size limit",
+    "zip-sdist": "it is a zip archive, which pydiffwatch does not unpack",
 }
 
 
 def _refusal_note(action: str, reason: str) -> str:
-    why = _REFUSALS.get(reason) or ("it is not a readable gzip tarball" if reason.startswith("bad-archive") else "")
+    why = _REFUSALS.get(reason, "")
     return (f"UNREVIEWED: pydiffwatch refused to {action} ({reason}{': ' + why if why else ''}), so nothing "
-            f"in it was scanned. Oversized or malformed archives can hide a payload from scanners. "
-            f"Needs manual review.")
+            f"in it was scanned. Oversized archives can hide a payload from scanners. Needs manual review.")
 
 
 def _alert_unscanned(cfg, conn, rid, package, version, note, *, stage, score=0.0, fired_rules=(),

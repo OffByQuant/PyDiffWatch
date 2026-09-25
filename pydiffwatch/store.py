@@ -275,7 +275,7 @@ def review_input(row, conn=None) -> str:
         conn.execute("SELECT review_input FROM releases WHERE id=?", (row["release_id"],)).fetchone()[0]
     return zlib.decompress(blob).decode()
 
-METADATA_ATTEMPTS = 4    # failed attempts (metadata, sdist download, or diff/triage) before a release is given up on
+METADATA_ATTEMPTS = 3    # failed attempts (metadata, sdist download or unreadable archive, or diff/triage) before a release is given up on
 
 
 def note_metadata_failure(conn, release_id, detail) -> str:

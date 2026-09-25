@@ -16,7 +16,7 @@ import yaml
 logger = logging.getLogger(__name__)
 
 CATEGORIES = {"decode", "exec", "process", "network", "credential"}
-BINARY_REASONS = {"source-too-large", "foreign-language-source", "new-binary"}
+BINARY_REASONS = {"source-too-large", "foreign-language-source", "new-binary", "file-too-large"}
 DEP_REASONS = {"typosquat", "nonexistent", "brand-new"}
 SCOPES = {"code", "binary", "dep", "maintainer"}
 _BOOL = {"all", "any", "not"}

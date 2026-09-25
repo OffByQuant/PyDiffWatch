@@ -361,7 +361,7 @@ published); metadata is also capped at `max_metadata_bytes` (64 MB). A metadata 
 was pulled before it could be scanned — that's terminal (`metadata_gone`) and alerts on its own, since a
 release PyPI itself removed fast is worth a look. Any other failure on a release (a metadata timeout, 5xx
 or malformed JSON, a failed or timed-out sdist download, an error while diffing or scoring it) retries on
-later ticks without holding up the releases after it; after 4 attempts it becomes `gave_up` and shows up
+later ticks without holding up the releases after it; after 3 attempts it becomes `gave_up` and shows up
 in `pending`, with the error kept on the release row (`fetch_note`). Each retry attempt gets that many
 times `fetch_deadline_s`/`packument_deadline_s` (attempt 2 gets 240s/600s, attempt 3 360s/900s, ...), and a
 pre-ingest sweep re-fetches releases due for retry, most-tried first, before a time budget of its own
@@ -385,7 +385,7 @@ pydiffwatch -c pydiffwatch.toml evidence <id>                # print the stored 
 `adjudicate` records `benign` | `malicious` | `suspicious`; a non-benign call emits an alert. `evidence`
 prints the payload code captured **at detection time** and stored in the DB, so it survives the package
 later being pulled from PyPI. A release pydiffwatch **refused** to download or unpack (over-size, a
-malformed archive) is never scanned, so it can't get a model verdict either — it lands in `pending` too,
+zip sdist) is never scanned, so it can't get a model verdict either — it lands in `pending` too,
 labelled `(not scanned: <stage>)` with an `UNREVIEWED` note explaining what happened and why, for you to
 inspect by hand — see §10 for the full list of unscanned outcomes and their exact wording. To backfill
 evidence for older flagged rows captured before evidence storage existed:
@@ -694,6 +694,19 @@ The download/extraction caps (`max_download_bytes`, `max_member_bytes`, `max_tot
 `max_decompressed_bytes`, …) bound how much of any sdist is ever read into memory; the package is never
 installed, built, imported, or executed — see the [README invariant](README.md#the-one-hard-invariant-no-execution).
 
+**One oversized file does not refuse the sdist.** A member over `max_member_bytes` is skipped and fingerprinted
+(its hash is streamed; it is never read whole), and the rest of the sdist is scanned:
+
+| Oversized member | Recorded as | Effect |
+|---|---|---|
+| Python source or build file (`.py`, `setup.py`, `pyproject.toml`, `.pth`, …) | `source-too-large` | `binary-source-too-large` (40) — alone it escalates; with nothing readable to show the model it lands in `pending` as `(not scanned: no_content)` |
+| Compiled binary (`.so`, `.pyd`, …) | `new-binary` | `binary-new-binary` (10) |
+| Foreign-language source (`.php`, `.exe`, …) | `foreign-language-source` | `foreign-language-source` (25) |
+| Anything else | `file-too-large` | no score; listed to the reviewer after the scored signals |
+
+An unchanged oversized file (same path and hash as in the previous release) is not a signal. A zip-format sdist
+is refused as `zip-sdist`; a corrupt or truncated archive is retried like a failed download.
+
 **Hardening (defense-in-depth).** PyDiffWatch installs a process-wide default-deny egress allowlist
 (`pydiffwatch/egress.py`) so it can only contact PyPI, the configured reviewer endpoint, and an optional
 webhook. For production deployments, two guides under [`docs/hardening/`](docs/hardening/) cover the
@@ -723,19 +736,18 @@ except `metadata_gone`, which alerts only — the release then waits in `pending
 
 | Outcome | `pending` label | Alert wording |
 |---|---|---|
-| Refused to download the sdist (over-size or malformed) | `(not scanned: refused_to_fetch)` | `UNREVIEWED: pydiffwatch refused to download it (<reason>: <why>), so nothing in it was scanned. Oversized or malformed archives can hide a payload from scanners. Needs manual review.` |
+| Refused to download the sdist (over-size) | `(not scanned: refused_to_fetch)` | `UNREVIEWED: pydiffwatch refused to download it (<reason>: <why>), so nothing in it was scanned. Oversized archives can hide a payload from scanners. Needs manual review.` |
 | A new release of a project on the quarantine list | `(not scanned: refused_to_fetch)` | `UNREVIEWED: this project is on pydiffwatch's quarantine list (<reason>), so this release was not downloaded. Not scanned. Needs manual review.` |
-| Refused to unpack the sdist (over-size or malformed archive) | `(not scanned: refused_to_extract)` | `UNREVIEWED: pydiffwatch refused to unpack its sdist (<reason>: <why>), so nothing in it was scanned. Oversized or malformed archives can hide a payload from scanners. Needs manual review.` |
+| Refused to unpack the sdist (over-size archive) | `(not scanned: refused_to_extract)` | `UNREVIEWED: pydiffwatch refused to unpack its sdist (<reason>: <why>), so nothing in it was scanned. Oversized archives can hide a payload from scanners. Needs manual review.` |
 | Metadata 404s before the release could be scanned | *(alert only — not queued; the files are gone)* | `UNREVIEWED: removed from PyPI before it could be scanned (its metadata returns 404); the files are gone, so there is nothing to review.` |
-| Download/scan failed `METADATA_ATTEMPTS` (4) times running | `(not scanned: gave_up)` | `UNREVIEWED: pydiffwatch failed to download or scan it 4 times and gave up (last error: <last error>). Not scanned. Needs manual review.` |
+| Download/scan failed `METADATA_ATTEMPTS` (3) times running (including a corrupt, truncated or non-gzip sdist) | `(not scanned: gave_up)` | `UNREVIEWED: pydiffwatch failed to download or scan it 3 times and gave up (last error: <last error>). Not scanned. Needs manual review.` |
 | Review input exceeds the endpoint's cap | `(not scanned: too_large)` | `` UNREVIEWED: its review input is too large for the model (<detail>); run `review-pending` with a larger-context model. Not scanned. Needs manual review. `` |
 | Review failed `max_review_attempts` (3) times running | `(not scanned: review_failed)` | `` UNREVIEWED: the model failed to review it <n> times (last error: <last error>); retries are used up. Run `review-pending` to try again, e.g. with another model. Not scanned. Needs manual review. `` |
 | With the reviewer on, triage fired only on signals with no text to show the model (a dependency, binary or maintainer change) | `(not scanned: no_content)` | `UNREVIEWED: triage fired (<rules>) but none of the flagged content could be shown to the reviewer. Needs a human.` |
 | A release switches to wheel-only (see §14) after `wheel_only_grace_minutes` | `(not scanned: no_sdist)` | `UNREVIEWED: switched to wheel-only: the previous release <prev> shipped an sdist and this one ships only wheels, which pydiffwatch does not scan. Not scanned. Needs manual review.` |
 
 The refused-to-download/-unpack `<reason>` is one of `decompressed-size`, `members`, `member-name` (a name
-too long **or** containing a control character), `member-size`, `total-size`, `download-size`, or
-`bad-archive: ...`.
+too long **or** containing a control character), `total-size`, `download-size`, or `zip-sdist`.
 
 **A benign verdict on truncated input is not final.** When the reviewer's input cap drops a file that
 carried fired-rule weight — including a first release with more than 40 weighted (score > 0) files, since

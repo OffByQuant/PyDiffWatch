@@ -44,8 +44,8 @@ _FOREIGN_EXT = (".php", ".phtml", ".php3", ".php4", ".php5",   # PHP — the cud
                 ".ps1", ".psm1", ".bat", ".cmd",                # Windows shell / PowerShell
                 ".asp", ".aspx", ".jsp", ".exe")                # server-side web pages / bundled exe
 
-def _is_source(name): return name.endswith(_SRC_EXT) or posixpath.basename(name) in _SRC_NAMES
-def _is_binary(name): return name.endswith(_BIN_EXT)
+def _is_source(name): return name.lower().endswith(_SRC_EXT) or posixpath.basename(name) in _SRC_NAMES
+def _is_binary(name): return name.lower().endswith(_BIN_EXT)
 def _foreign_ext(name):
     low = name.lower()
     return next((e for e in _FOREIGN_EXT if low.endswith(e)), None)
@@ -62,14 +62,13 @@ def _sha256_of(fileobj) -> str:
 def extract_sdist(blob: bytes, cfg: Config):
     files: dict[str, bytes] = {}; binaries: list[dict] = []
     total = 0; count = 0
+    if blob[:2] == b"PK":            # a zip (PK\x03\x04, empty PK\x05\x06, spanned PK\x07\x08): never unpacked
+        raise RefusedToExtract("zip-sdist")
     # Decompress through a byte-ceiling and read the tar as a forward-only STREAM ("r|"): both
     # bound peak RAM so a malicious sdist cannot expand to gigabytes in memory during extraction.
+    # A corrupt or truncated archive raises the stdlib error here or mid-loop; the caller retries it.
     stream = _BoundedReader(gzip.GzipFile(fileobj=io.BytesIO(blob)), cfg.max_decompressed_bytes)
-    try:
-        tar = tarfile.open(fileobj=stream, mode="r|")  # streaming; NEVER extractall
-    except (tarfile.ReadError, OSError, EOFError) as e:
-        raise RefusedToExtract(f"bad-archive: {e}") from e
-    with tar:
+    with tarfile.open(fileobj=stream, mode="r|") as tar:  # streaming; NEVER extractall
         for m in tar:
             count += 1
             if count > cfg.max_members: raise RefusedToExtract("members")
@@ -77,7 +76,6 @@ def extract_sdist(blob: bytes, cfg: Config):
                 raise RefusedToExtract("member-name")  # name bomb, or control characters (never legitimate)
             if not m.isfile(): continue               # skip dirs/symlinks/devices
             if _unsafe(m.name): continue              # defensive: drop path-escapes
-            if m.size > cfg.max_member_bytes: raise RefusedToExtract("member-size")
             total += m.size
             if total > cfg.max_total_bytes: raise RefusedToExtract("total-size")
             rel = _strip_top(m.name)
@@ -88,9 +86,7 @@ def extract_sdist(blob: bytes, cfg: Config):
                 binaries.append({"path": rel, "size": m.size, "reason": "source-too-large",
                                  "sha256": _sha256_of(tar.extractfile(m))})
             elif _is_binary(m.name):
-                data = tar.extractfile(m).read()
-                binaries.append({"path": rel, "sha256": hashlib.sha256(data).hexdigest(),
-                                 "size": m.size})
+                binaries.append({"path": rel, "sha256": _sha256_of(tar.extractfile(m)), "size": m.size})
             elif fext := _foreign_ext(m.name):
                 # Foreign-language source: record presence (path/ext/size) as a signal. We fingerprint
                 # the bytes (to drop unchanged files vs the prior release) but never parse or analyze
@@ -99,6 +95,10 @@ def extract_sdist(blob: bytes, cfg: Config):
                 # files cannot use it up.
                 binaries.append({"path": rel, "size": m.size, "ext": fext,
                                  "reason": "foreign-language-source", "sha256": _sha256_of(tar.extractfile(m))})
+            elif m.size > cfg.max_member_bytes:
+                # One oversized file is skipped and fingerprinted, not a reason to refuse the sdist (npm #27).
+                binaries.append({"path": rel, "size": m.size, "reason": "file-too-large",
+                                 "sha256": _sha256_of(tar.extractfile(m))})
     return files, binaries
 
 def _cap_foreign(bins: list[dict], cfg: Config) -> list[dict]:

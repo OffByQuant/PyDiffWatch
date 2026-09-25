@@ -18,7 +18,7 @@ def _meta(pkg):
     }}
 
 
-def _fetch(monkeypatch, old, new, prior_fails=False):
+def _fetch(monkeypatch, old, new, prior_fails=False, cfg=None):
     monkeypatch.setattr(fetcher, "_package_json", lambda p, cfg: _meta("acme"))
     blobs = {"mock://acme/1.0": make_sdist(old), "mock://acme/1.1": make_sdist(new)}
 
@@ -27,7 +27,7 @@ def _fetch(monkeypatch, old, new, prior_fails=False):
             raise TimeoutError("download took longer than 120s")
         return blobs[url]
     monkeypatch.setattr(fetcher, "_download", download)
-    art = fetcher.fetch_artifacts(Config(), NewRelease("acme", "1.1", 2))
+    art = fetcher.fetch_artifacts(cfg or Config(), NewRelease("acme", "1.1", 2))
     return sorted(b["path"] for b in art.added_binaries)
 
 
@@ -42,6 +42,17 @@ def test_changed_oversized_source_is_still_reported(monkeypatch):
 
 def test_new_oversized_source_is_still_reported(monkeypatch):
     assert _fetch(monkeypatch, {"a.py": b"x=1\n"}, {"a.py": b"x=1\n", "evil.py": _BIG}) == ["evil.py"]
+
+
+def test_unchanged_oversized_data_file_is_not_reported(monkeypatch):
+    small_cap = Config(max_member_bytes=16)
+    data = b"x" * 32   # over max_member_bytes, not source/binary/foreign -> file-too-large
+    assert _fetch(monkeypatch, {"blob.dat": data}, {"blob.dat": data}, cfg=small_cap) == []
+
+
+def test_changed_oversized_data_file_is_still_reported(monkeypatch):
+    small_cap = Config(max_member_bytes=16)
+    assert _fetch(monkeypatch, {"blob.dat": b"x" * 32}, {"blob.dat": b"y" * 32}, cfg=small_cap) == ["blob.dat"]
 
 
 def test_unchanged_binary_and_foreign_file_are_not_reported(monkeypatch):

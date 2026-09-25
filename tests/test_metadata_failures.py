@@ -1,7 +1,7 @@
 """A release whose PyPI metadata can't be read must never pin the cursor. PyPI removes malware fast, so a 404
 on the JSON metadata is common and terminal: `metadata_gone`, with an alert saying it was removed before it
 could be scanned. Any other metadata failure is retried on later ticks (the retry lives on the release row,
-since the changelog already named the version) and given up on, visibly, after 4 attempts. A failed
+since the changelog already named the version) and given up on, visibly, after 3 attempts. A failed
 download of the PRIOR sdist diffs against nothing rather than failing the release."""
 import sys
 import urllib.error
@@ -59,7 +59,7 @@ def test_a_404_is_terminal_alerts_and_never_pins_the_cursor(tmp_cfg, monkeypatch
     assert "removed from PyPI before it could be scanned" in capsys.readouterr().out
 
 
-def test_a_repeated_5xx_gives_up_after_4_attempts_without_pinning_the_cursor(tmp_cfg, monkeypatch):
+def test_a_repeated_5xx_gives_up_after_3_attempts_without_pinning_the_cursor(tmp_cfg, monkeypatch):
     _feed(monkeypatch, [NewRelease("flaky", "1.0", 10), NewRelease("after", "1.0", 11)])
     calls = []
 
@@ -75,13 +75,13 @@ def test_a_repeated_5xx_gives_up_after_4_attempts_without_pinning_the_cursor(tmp
     assert store.get_last_serial(conn) == 11                 # one bad release can't hold the cursor
     assert store.get_stage(conn, "flaky", "1.0") == "metadata_retry"
     assert store.metadata_retry_counts(conn) == {"retrying": 1, "gave_up": 0}
-    for _ in range(3):                                       # the feed has nothing new; the retry queue does
+    for _ in range(2):                                       # the feed has nothing new; the retry queue does
         orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
-    assert calls.count("flaky") == 4
+    assert calls.count("flaky") == 3
     assert store.get_stage(conn, "flaky", "1.0") == "gave_up"
     assert store.metadata_retry_counts(conn) == {"retrying": 0, "gave_up": 1}
     orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
-    assert calls.count("flaky") == 4                         # given up: not fetched again
+    assert calls.count("flaky") == 3                         # given up: not fetched again
     assert orchestrator.metadata_retry_counts(tmp_cfg) == {"retrying": 0, "gave_up": 1, "oldest_retrying_age": None}
 
 
@@ -144,7 +144,7 @@ def test_pending_shows_metadata_retries_and_give_ups(tmp_cfg, monkeypatch, capsy
     monkeypatch.setattr(sys, "argv", ["pydiffwatch", "pending"])
     cli.main()
     out = capsys.readouterr().out
-    assert "1 release(s) being retried" in out and "2 given up on after 4 attempts" in out
+    assert "1 release(s) being retried" in out and "2 given up on after 3 attempts" in out
 
 
 def test_a_retried_release_that_then_fails_to_download_stays_in_the_retry_queue(tmp_cfg, monkeypatch):
@@ -191,10 +191,10 @@ def test_a_failed_sdist_download_is_retried_without_pinning_the_cursor(tmp_cfg, 
     row = conn.execute("SELECT stage, fetch_note FROM releases WHERE package='victim'").fetchone()
     assert row["stage"] == "metadata_retry"
     assert "TimeoutError" in row["fetch_note"] and "120s" in row["fetch_note"]
-    for _ in range(4):
+    for _ in range(3):
         orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
     assert store.get_stage(conn, "victim", "1.1") == "gave_up"
-    assert len([u for u in tries if u.endswith("/1.1")]) == 4               # bounded
+    assert len([u for u in tries if u.endswith("/1.1")]) == 3               # bounded
     assert store.metadata_retry_counts(conn) == {"retrying": 0, "gave_up": 1}
 
 
@@ -311,8 +311,8 @@ def test_each_retry_gets_a_longer_deadline_and_logs_its_attempt(tmp_cfg, monkeyp
             orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
     assert seen == list(range(1, store.METADATA_ATTEMPTS + 1))
     msgs = [r.getMessage() for r in caplog.records if "slow==1.0" in r.getMessage()]
-    assert "(TimeoutError: download took too long); will retry next tick (attempt 1 of 4)" in msgs[0]
-    assert "attempt 3 of 4" in msgs[2] and "giving up after 4 attempts" in msgs[3]
+    assert "(TimeoutError: download took too long); will retry next tick (attempt 1 of 3)" in msgs[0]
+    assert "attempt 2 of 3" in msgs[1] and "giving up after 3 attempts" in msgs[2]
 
 
 def _backlog(conn):
@@ -344,3 +344,73 @@ def test_the_dashboard_status_strip_shows_the_retry_backlog(tmp_cfg):
     store.update_stage(conn, 1, "gave_up"); store.update_stage(conn, 2, "gave_up")
     html = orchestrator.export_dashboard(tmp_cfg).read_text()
     assert "retrying" not in html and "3 scan(s) given up" in html
+
+
+def _victim_download(new_blob):
+    def download(url, cfg):
+        return new_blob if url.endswith("/1.1") else NEW
+    return download
+
+
+def _victim_json(monkeypatch):
+    monkeypatch.setattr(fetcher, "_package_json",
+                        lambda pkg, cfg: _VICTIM if pkg == "victim" else _meta(pkg, [("1.0", "2026-01-01T00:00:00Z")]))
+
+
+def test_a_truncated_sdist_is_retried_then_given_up_with_the_error(tmp_cfg, monkeypatch, capsys):
+    big = make_sdist({f"victim/f{i}.py": (f"x{i} = {i}\n" * 4000).encode() for i in range(20)})
+    _feed(monkeypatch, [NewRelease("victim", "1.1", 10), NewRelease("after", "1.0", 11)])
+    _victim_json(monkeypatch)
+    monkeypatch.setattr(fetcher, "_download", _victim_download(big[: len(big) * 6 // 10]))
+    orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
+    conn = store.connect(tmp_cfg)
+    assert store.get_last_serial(conn) == 11                                  # never pins the cursor
+    assert store.get_stage(conn, "victim", "1.1") == "metadata_retry"
+    capsys.readouterr()
+    for _ in range(3):
+        orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
+    assert store.get_stage(conn, "victim", "1.1") == "gave_up"
+    out = capsys.readouterr().out
+    assert out.count("victim 1.1") == 1 and "3 times" in out and "EOFError:" in out
+
+
+def test_a_bz2_sdist_is_retried_not_refused(tmp_cfg, monkeypatch, capsys):
+    _feed(monkeypatch, [NewRelease("victim", "1.1", 10)])
+    _victim_json(monkeypatch)
+    monkeypatch.setattr(fetcher, "_download", _victim_download(b"BZh91AY&SY" + b"\x00" * 64))
+    for _ in range(3):
+        orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
+    conn = store.connect(tmp_cfg)
+    assert store.get_stage(conn, "victim", "1.1") == "gave_up"
+    assert "BadGzipFile" in capsys.readouterr().out
+
+
+def test_a_zip_sdist_is_refused_once_without_retry(tmp_cfg, monkeypatch, capsys):
+    _feed(monkeypatch, [NewRelease("victim", "1.1", 10)])
+    _victim_json(monkeypatch)
+    calls = []
+
+    def download(url, cfg):
+        calls.append(url)
+        return b"PK\x03\x04" + b"\x00" * 64
+    monkeypatch.setattr(fetcher, "_download", download)
+    for _ in range(2):
+        orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
+    conn = store.connect(tmp_cfg)
+    assert store.get_stage(conn, "victim", "1.1") == "refused_to_extract"
+    assert len([u for u in calls if u.endswith("/1.1")]) == 1
+    out = capsys.readouterr().out
+    assert out.count("victim 1.1") == 1
+    assert "zip-sdist: it is a zip archive, which pydiffwatch does not unpack" in out
+
+
+@pytest.mark.parametrize("prior", [b"PK\x03\x04" + b"\x00" * 64, NEW[: len(NEW) // 2]])
+def test_a_zip_or_corrupt_prior_never_fails_the_new_release(tmp_cfg, monkeypatch, prior):
+    _feed(monkeypatch, [NewRelease("victim", "1.1", 10)])
+    _victim_json(monkeypatch)
+    monkeypatch.setattr(fetcher, "_download", lambda url, cfg: NEW if url.endswith("/1.1") else prior)
+    orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
+    conn = store.connect(tmp_cfg)
+    row = conn.execute("SELECT stage, fetch_attempts, fetch_note FROM releases WHERE package='victim'").fetchone()
+    assert row["stage"] not in ("metadata_retry", "gave_up", "refused_to_extract")
+    assert row["fetch_attempts"] == 0 and "prior 1.0 sdist unavailable" in row["fetch_note"]

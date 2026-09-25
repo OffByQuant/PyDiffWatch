@@ -47,7 +47,8 @@ def _signals(a: ArtifactSet, maintainer_context) -> str:
         deps.append(f"dependency {_esc(f.get('name'))}: {why}")
     out += _capped("dependency", deps)
     bins = []
-    for b in facts._normalize_binaries(a.added_binaries):
+    # unscored oversized files last: the shared cap must never cut a scored line for one
+    for b in sorted(facts._normalize_binaries(a.added_binaries), key=lambda b: b["reason"] == "file-too-large"):
         reason = _esc(b.get("reason") or "unknown") + (f" ({_esc(b['ext'])})" if b.get("ext") else "")
         bins.append(f"added file {_esc(b.get('path'))}: {_esc(b.get('size'))} bytes, {reason}")
     out += _capped("added file", bins)

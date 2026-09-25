@@ -53,7 +53,7 @@ def test_gave_up_warns_once_with_the_last_error_and_waits_in_pending(tmp_cfg, ca
     out = capsys.readouterr().out
     assert store.get_stage(conn, "flaky", "1.0") == "gave_up"
     assert "flaky 1.0" in out and _unreviewed(out)
-    assert "4 times" in out and "MetadataUnavailable: HTTP 503" in out
+    assert "3 times" in out and "MetadataUnavailable: HTTP 503" in out
     orchestrator._process_fetched(tmp_cfg, conn, None, None, rel, TimeoutError("again"))   # a re-tick
     assert capsys.readouterr().out == "" and len(_alerts(conn, "flaky")) == 1
     [item] = orchestrator.list_pending(tmp_cfg)
