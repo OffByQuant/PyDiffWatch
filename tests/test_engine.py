@@ -49,3 +49,33 @@ def test_dep_rule_fires_on_finding():
     d = Diff("p", "1.1", False, [], [], added_dep_findings=[{"name": "reqursts", "reason": "typosquat"}])
     r = triage(d, Config(), RULES)
     assert any(fr.rule == "dep-typo" for fr in r.fired_rules) and r.escalate
+
+
+def _many(n, line):
+    return Diff("p", "1.1", False, [FileDiff(f"m/f{i}.py", "modified",
+        [Hunk((0, 0), (0, 2), ["import os", line], [])], "import os\n" + line) for i in range(n)], [])
+
+
+_PRIM = {"id": "prim", "applies_to": "code", "weight": 5, "location_scaled": True,
+         "match": {"bound_call": {"category": "process"}}}
+
+
+def test_max_total_caps_release_score_but_keeps_per_file_weights():
+    capped = [validate_rule(dict(_PRIM, max_total=35))]
+    r = triage(_many(20, "os.system(x)"), Config(), capped)
+    fired = [fr for fr in r.fired_rules if fr.rule == "prim"]
+    assert len(fired) == 20 and all(fr.weight == 5.0 for fr in fired)   # per-file entries intact
+    assert r.score == 35.0 and not r.escalate
+
+
+def test_absent_max_total_keeps_uncapped_sum():
+    r = triage(_many(20, "os.system(x)"), Config(), [validate_rule(_PRIM)])
+    assert r.score == 100.0 and r.escalate
+
+
+def test_cap_is_per_rule_other_rules_still_add():
+    rules = [validate_rule(dict(_PRIM, max_total=35)), RULES[3]]   # + foreign binary rule (25)
+    d = _many(20, "os.system(x)")
+    d.added_binaries.append({"path": "a.php", "reason": "foreign-language-source"})
+    r = triage(d, Config(), rules)
+    assert r.score == 60.0 and r.escalate

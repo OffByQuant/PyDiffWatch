@@ -6,6 +6,7 @@ that fails validation (unknown predicate, wrong-scope predicate, bad enum, malfo
 load time with a logged warning and never evaluated. This is what makes a community-contributed YAML file
 safe to load without sandboxing — it can describe matches but can never execute code."""
 import logging
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +38,22 @@ class Rule:
     attack_type: str = ""
     location_scaled: bool = False
     description: str = ""
+    max_total: float | None = None   # caps this rule's summed contribution to one release's score
+
+
+def _finite_number(v) -> bool:
+    """A real int/float (never a bool or a numeric string) that fits a finite float. Never raises:
+    math.isfinite(10**400) raises OverflowError, which must reject the rule, not crash the load."""
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return False
+    try:
+        return math.isfinite(v)
+    except (OverflowError, TypeError):
+        return False
+
+
+def _valid_max_total(v) -> bool:
+    return _finite_number(v) and v > 0
 
 
 def _valid_pred_args(name, args, scope) -> bool:
@@ -105,11 +122,15 @@ def validate_rule(raw):
     try:
         rid = raw["id"]
         scope = raw["applies_to"]
-        weight = float(raw["weight"])
+        weight = raw["weight"]
         match = raw["match"]
     except (KeyError, TypeError, ValueError):
         logger.warning("rule rejected (missing/invalid required field): %r", raw)
         return None
+    if not (_finite_number(weight) and weight >= 0):
+        logger.warning("rule %r rejected: weight must be a finite number >= 0", raw.get("id"))
+        return None
+    weight = float(weight)
     # Wrap _valid_match defensively: validation must NEVER raise into the loader (fail-closed). A
     # malformed predicate arg (e.g. an unhashable list where a string enum is expected) returns None
     # and is dropped with a warning, never crashing the load of the whole ruleset.
@@ -121,10 +142,13 @@ def validate_rule(raw):
     if not ok:
         logger.warning("rule %r rejected: bad scope or match tree", raw.get("id"))
         return None
+    if "max_total" in raw and not _valid_max_total(raw["max_total"]):
+        logger.warning("rule %r rejected: max_total must be a positive finite number", raw.get("id"))
+        return None
     return Rule(id=str(rid), applies_to=scope, weight=weight, match=match,
                 attack_type=str(raw.get("attack_type", "")),
                 location_scaled=bool(raw.get("location_scaled", False)),
-                description=str(raw.get("description", "")))
+                description=str(raw.get("description", "")), max_total=raw.get("max_total"))
 
 
 def load_rules(rules_dir) -> list:

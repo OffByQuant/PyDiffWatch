@@ -351,6 +351,8 @@ pydiffwatch -c pydiffwatch.toml run
 
 `run` pulls every release since the last cursor (capped by `max_releases_per_run`), diffs each against
 its prior version, scores it with the ruleset, and escalates anything ≥ `threshold_t` to the reviewer.
+The broad `primitives` rule is capped (`max_total: 35`), so it can't escalate a release on its own. Rules
+only ever clear or escalate: only the model or a person can call a release malicious.
 Clear-malicious verdicts alert immediately; borderline "suspicious" ones queue for your judgement.
 
 **Downloads have deadlines.** Each sdist download is capped at `fetch_deadline_s` (120s total) and PyPI's

@@ -11,8 +11,10 @@
   description: >
     Any import-bound dangerous primitive (process/exec/network/decode/credential) OR an encoded blob is
     present on added lines. Corroboration only — fixed low weight; the combos and auto-exec rules escalate.
+    max_total 35 (under the default threshold_t of 40) means it can never escalate a release alone.
   applies_to: code
   weight: 5
+  max_total: 35
   location_scaled: true
   attack_type: primitive-use
   match:
