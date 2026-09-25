@@ -828,3 +828,115 @@ def test_the_other_line_keeps_its_claim_when_the_package_list_is_known(files):
 ])
 def test_the_other_line_makes_no_claim_when_the_package_list_is_not_known(files):
     assert _line(execctx.build(files), "other") == _OTHER_UNKNOWN
+
+
+# ---- residual R2: at most three egg-info top_level.txt are read, each into a bounded collection ----
+
+class _Reads(dict):
+    """new_files that records which top_level.txt sources build() reads."""
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.read = []
+
+    def __getitem__(self, k):
+        if k.endswith("top_level.txt"):
+            self.read.append(k)
+        return super().__getitem__(k)
+
+
+def test_at_most_three_egg_info_top_level_txt_are_read_and_the_rest_are_named(monkeypatch):
+    files = _Reads({f"a{j:02d}.egg-info/top_level.txt": "".join(f"t{j:02d}_{i}\n" for i in range(50)).encode()
+                    for j in range(8)})
+    sizes = []
+    real = execctx._collect
+
+    def spy(slot, entries):
+        real(slot, entries)
+        sizes.append(len(slot[0]))
+    monkeypatch.setattr(execctx, "_collect", spy)
+    ctx = execctx.build(files)
+    assert sorted(set(files.read)) == [f"a{j:02d}.egg-info/top_level.txt" for j in range(3)]
+    assert sizes and max(sizes) <= execctx._MAX_ITEMS + 1
+    u = "unknown (5 more egg-info top_level.txt not read)"
+    assert _field(ctx, "top_level.txt") == ", ".join([u] + [f"t00_{i}" for i in range(19)]) + ", … (+131 more)"
+
+
+def test_unread_top_level_txt_sources_are_named_even_when_the_read_ones_are_empty():
+    files = {f"a{j:02d}.egg-info/top_level.txt": b"\n" if j < 3 else b"x\n" for j in range(5)}
+    ctx = execctx.build(files)
+    assert _field(ctx, "top_level.txt") == "unknown (2 more egg-info top_level.txt not read)"
+
+
+# ---- residual R3: only identifier names are listed as auto-discovered (no field-separator look-alikes) ----
+
+def test_a_non_identifier_module_name_is_not_listed_and_never_leaves_a_bare_none():
+    ctx = execctx.build({"pyproject.toml": _ST, "x; top_level.txt=none.py": b""})
+    assert _field(ctx, "py-modules") == f"auto-discovered: {_AUTO_NONE}"
+    assert _line(ctx, "import").count("top_level.txt=") == 1
+
+
+def test_identifier_modules_are_still_listed_beside_a_non_identifier_one():
+    ctx = execctx.build({"pyproject.toml": _ST, "good.py": b"", "bad-name.py": b"", "src/x y.py": b""})
+    assert _field(ctx, "py-modules") == "auto-discovered: good"
+
+
+@pytest.mark.parametrize("bad", ["x; py-modules=none", "a=b", "a,b", "a b", "a.b"])
+def test_a_package_directory_with_a_separator_is_not_listed(bad):
+    ctx = execctx.build({"pyproject.toml": _ST, f"{bad}/__init__.py": b"", "pkg/__init__.py": b""})
+    assert _field(ctx, "packages") == "auto-discovered: pkg"
+    ctx = execctx.build({"pyproject.toml": _ST, f"{bad}/__init__.py": b""})
+    assert _field(ctx, "packages") == f"auto-discovered: {_AUTO_NONE}"
+
+
+# ---- residuals round 1: package directories setuptools installs under another name are listed ----
+
+def test_hyphenated_src_layout_package_directories_are_listed():
+    ctx = execctx.build({"pyproject.toml": _ST, "src/pkg/__init__.py": b"", "src/evil-x/__init__.py": b""})
+    assert _field(ctx, "packages") == "auto-discovered: evil-x, pkg"
+
+
+def test_a_flat_layout_stubs_package_is_listed():
+    ctx = execctx.build({"pyproject.toml": _ST, "foo-stubs/__init__.py": b""})
+    assert _field(ctx, "packages") == "auto-discovered: foo-stubs"
+
+
+# ---- residuals round 1: an oversized egg-info top_level.txt is unknown, never "not found" ----
+
+def test_an_oversized_top_level_txt_is_unknown_never_not_found():
+    ctx = execctx.build({"pyproject.toml": _ST, "a/__init__.py": b""}, too_large=("a.egg-info/top_level.txt",))
+    assert _field(ctx, "top_level.txt") == "unknown (a.egg-info/top_level.txt too large to scan)"
+
+
+def test_an_oversized_top_level_txt_comes_first_and_is_not_counted_as_unread():
+    files = {f"a{j:02d}.egg-info/top_level.txt": b"t%d\n" % j for j in range(4)}
+    ctx = execctx.build(files, too_large=("big.egg-info/top_level.txt",))
+    assert _field(ctx, "top_level.txt") == ("unknown (big.egg-info/top_level.txt too large to scan), "
+                                            "unknown (1 more egg-info top_level.txt not read), t0, t1, t2")
+
+
+# ---- residual R4: computed and unknown entry-point markers come first, never folded into "+N more" ----
+
+def test_a_computed_setup_py_entry_points_shows_past_thirty_scripts():
+    pp = b"[project]\nname = 'a'\n[project.scripts]\n" + b"".join(b"c%02d = 'm:f'\n" % i for i in range(30))
+    ctx = execctx.build({"pyproject.toml": pp,
+                         "setup.py": b"from setuptools import setup\nsetup(name='a', entry_points=EPS)\n"})
+    cmds, plugins = _line(ctx, "commands"), _line(ctx, "plugins")
+    assert f"entry points={execctx.COMPUTED}" in cmds and f"entry points={execctx.COMPUTED}" in plugins
+    assert cmds.endswith(", … (+11 more)")
+
+
+def test_an_unknown_entry_after_a_group_s_cap_still_shows():
+    eps = {}
+    execctx._add_groups(eps, {"console_scripts": [f"c{i} = m:f" for i in range(30)] + [5],
+                              "pytest11": [f"p{i} = m" for i in range(30)] + ["no equals sign"]})
+    cmds, plugins = execctx._entry_points_lines(eps, [], "none")
+    assert cmds.startswith(f"{execctx.COMPUTED}, c0 -> m:f, ") and cmds.endswith(", … (+11 more)")
+    assert plugins.startswith(f"pytest11: {execctx.COMPUTED}, pytest11: p0 -> m, ")
+    assert plugins.endswith(", … (+11 more)")
+
+
+# ---- residuals round 2: a non-ASCII identifier package directory is listed ----
+
+def test_a_non_ascii_package_directory_is_listed():
+    ctx = execctx.build({"pyproject.toml": _ST, "pkgé/__init__.py": b""})
+    assert _field(ctx, "packages") == "auto-discovered: pkgé"
