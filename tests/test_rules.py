@@ -149,7 +149,7 @@ def test_max_total_accepts_positive_int_and_float():
 def test_max_total_bool_rejected(caplog):
     with caplog.at_level(logging.WARNING):
         assert validate_rule(_capped(True)) is None
-    assert "cap" in caplog.text
+    assert "'cap'" in caplog.text
 
 
 def test_max_total_string_rejected():
@@ -184,3 +184,70 @@ def test_load_rules_drops_bad_max_total(tmp_path, caplog):
     with caplog.at_level(logging.WARNING):
         rules = load_rules(tmp_path)
     assert {r.id for r in rules} == {"ok"} and "bad" in caplog.text
+
+
+def test_max_total_huge_int_rejected_not_crash():
+    # math.isfinite(10**400) raises OverflowError; validation must reject, never raise into the loader
+    assert validate_rule(_capped(10 ** 400)) is None
+
+
+def test_load_rules_drops_huge_max_total_keeps_others(tmp_path, caplog):
+    (tmp_path / "r.yaml").write_text(
+        "- id: ok\n  applies_to: code\n  weight: 5\n  match: {syntax_error: true}\n"
+        f"- id: huge\n  applies_to: code\n  weight: 5\n  max_total: 1{'0' * 400}\n"
+        "  match: {syntax_error: true}\n")
+    with caplog.at_level(logging.WARNING):
+        rules = load_rules(tmp_path)   # must NOT raise
+    assert {r.id for r in rules} == {"ok"} and "huge" in caplog.text
+
+
+def _weighted(weight):
+    return {"id": "w", "applies_to": "code", "weight": weight, "match": {"syntax_error": True}}
+
+
+def test_weight_zero_and_float_allowed():
+    assert validate_rule(_weighted(0)).weight == 0.0
+    assert validate_rule(_weighted(12.5)).weight == 12.5
+
+
+def test_weight_bool_rejected(caplog):
+    with caplog.at_level(logging.WARNING):
+        assert validate_rule(_weighted(True)) is None
+    assert "'w'" in caplog.text
+
+
+def test_weight_string_rejected():
+    assert validate_rule(_weighted("heavy")) is None
+
+
+def test_weight_numeric_string_rejected():
+    assert validate_rule(_weighted("45")) is None
+
+
+def test_weight_nan_rejected():
+    assert validate_rule(_weighted(float("nan"))) is None
+
+
+def test_weight_inf_rejected():
+    assert validate_rule(_weighted(float("inf"))) is None
+
+
+def test_weight_negative_inf_rejected():
+    assert validate_rule(_weighted(float("-inf"))) is None
+
+
+def test_weight_negative_rejected():
+    assert validate_rule(_weighted(-5)) is None
+
+
+def test_weight_huge_int_rejected_not_crash():
+    assert validate_rule(_weighted(10 ** 400)) is None
+
+
+def test_load_rules_drops_huge_weight_keeps_others(tmp_path, caplog):
+    (tmp_path / "r.yaml").write_text(
+        "- id: ok\n  applies_to: code\n  weight: 5\n  match: {syntax_error: true}\n"
+        f"- id: huge\n  applies_to: code\n  weight: 1{'0' * 400}\n  match: {{syntax_error: true}}\n")
+    with caplog.at_level(logging.WARNING):
+        rules = load_rules(tmp_path)   # must NOT raise
+    assert {r.id for r in rules} == {"ok"} and "huge" in caplog.text

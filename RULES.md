@@ -23,7 +23,7 @@ A rule with `max_total` adds at most that much to one release's total, however o
 |---|---|---|
 | `id` | yes | unique identifier (kebab-case) |
 | `applies_to` | yes | evaluation scope: `code` \| `binary` \| `dep` \| `maintainer` |
-| `weight` | yes | points added when the rule fires (number) |
+| `weight` | yes | points added when the rule fires (finite number ≥ 0) |
 | `match` | yes | a boolean tree of predicates (below) |
 | `attack_type` | no | informational label (e.g. `credential-exfil`) |
 | `location_scaled` | no | if `true`, the fired weight is multiplied by the file's location weight (code scope only); default `false` |
@@ -39,13 +39,17 @@ A rule with `max_total` adds at most that much to one release's total, however o
 Rules in `binary`/`dep` scope fire **once per matching item**, and the weights sum — so two foreign-language
 files at weight 25 contribute 50 automatically.
 
-**`max_total`** caps that sum. The release score adds `min(sum of the rule's fired weights, max_total)` for
-the rule; each fired entry keeps its full per-file weight, so the reviewer still ranks files by it. Use it
-for a broad corroborating rule that fires once per file, so a large ordinary codebase can't reach
+**`max_total`** caps that sum. The release score adds `min(sum of the rule's fired weights, max_total)`
+for the rule; each fired entry keeps its full per-file weight, so the reviewer still ranks files by it.
+Use it for a broad corroborating rule that fires once per file, so a large ordinary codebase can't reach
 `threshold_t` on it alone. It must be a positive finite number (int or float): a bool, string, null, 0, a
-negative number, NaN or infinity rejects the whole rule at load, with a logged warning. The shipped
-`primitives` rule (weight 5, location-scaled) has `max_total: 35`, just under the default `threshold_t`, so
-it can never escalate a release by itself.
+negative number, NaN, infinity or an int too large for a float rejects the whole rule at load, with a
+logged warning. `weight` is checked the same way, except that 0 is allowed: a bool, a string (even
+`"45"`), a negative number, NaN, ±infinity or an oversized int rejects the rule. The shipped `primitives`
+rule (weight 5, location-scaled) has `max_total: 35`, just under the default `threshold_t`, so it can
+never escalate a release by itself. Alert lines and the reviewer's `triage_score` header show the capped
+release score; the per-file weights stored with each fired rule (`triage_rules`, an alert's `fired_rules`)
+stay uncapped.
 
 ## The `match` tree
 

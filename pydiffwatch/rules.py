@@ -41,8 +41,19 @@ class Rule:
     max_total: float | None = None   # caps this rule's summed contribution to one release's score
 
 
+def _finite_number(v) -> bool:
+    """A real int/float (never a bool or a numeric string) that fits a finite float. Never raises:
+    math.isfinite(10**400) raises OverflowError, which must reject the rule, not crash the load."""
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return False
+    try:
+        return math.isfinite(v)
+    except (OverflowError, TypeError):
+        return False
+
+
 def _valid_max_total(v) -> bool:
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0
+    return _finite_number(v) and v > 0
 
 
 def _valid_pred_args(name, args, scope) -> bool:
@@ -111,11 +122,15 @@ def validate_rule(raw):
     try:
         rid = raw["id"]
         scope = raw["applies_to"]
-        weight = float(raw["weight"])
+        weight = raw["weight"]
         match = raw["match"]
     except (KeyError, TypeError, ValueError):
         logger.warning("rule rejected (missing/invalid required field): %r", raw)
         return None
+    if not (_finite_number(weight) and weight >= 0):
+        logger.warning("rule %r rejected: weight must be a finite number >= 0", raw.get("id"))
+        return None
+    weight = float(weight)
     # Wrap _valid_match defensively: validation must NEVER raise into the loader (fail-closed). A
     # malformed predicate arg (e.g. an unhashable list where a string enum is expected) returns None
     # and is dropped with a warning, never crashing the load of the whole ruleset.

