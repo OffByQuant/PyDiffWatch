@@ -312,7 +312,7 @@ def _modules(files) -> list[str]:
     """Top-level (or src/) *.py files with an identifier stem, which setuptools auto-discovery installs as
     modules. A non-identifier stem is not installed, and could pose as a field (`x; top_level.txt=none.py`)."""
     return [p.rsplit("/", 1)[-1][:-3] for p in sorted(files)
-            if p.endswith(".py") and (p.count("/") == 0 or (p.count("/") == 1 and p.startswith("src/")))
+            if p.lower().endswith(".py") and (p.count("/") == 0 or (p.count("/") == 1 and p.startswith("src/")))
             and p.rsplit("/", 1)[-1] not in _NOT_MODULES and p.rsplit("/", 1)[-1][:-3].isidentifier()]
 
 

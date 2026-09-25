@@ -246,7 +246,7 @@ def _names_a_dep(fd, pattern) -> bool:
     """Whether a changed CODE file's added lines name a flagged dependency: .py/.pyx/.pyi lines, or a .pth file's
     `import` lines. Metadata (PKG-INFO, *.egg-info/*, configs) never counts: a Requires-Dist line alone is not
     code, and showing only it would turn an unscanned alert into a silent benign verdict (I-1)."""
-    if fd.path.endswith(_CODE_EXT):
+    if fd.path.lower().endswith(_CODE_EXT):
         lines = (ln for h in fd.hunks for ln in h.added)
     elif fd.path.endswith(".pth"):
         lines = (ln for h in fd.hunks for ln in h.added if ln.startswith(("import ", "import\t")))

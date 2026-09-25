@@ -255,7 +255,7 @@ def _file_facts(fd) -> FileFacts:
     loc = classify_location(fd.path)
     if fd.new_text is not None and fd.path.endswith(".pth"):
         return _pth_facts(fd, lines, loc, added_lines, added_strs)
-    if fd.new_text is None or not fd.path.endswith((".py", ".pyx", ".pyi")):
+    if fd.new_text is None or not fd.path.lower().endswith((".py", ".pyx", ".pyi")):
         return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, False, added_strs)
     try:
         tree = ast.parse(fd.new_text)

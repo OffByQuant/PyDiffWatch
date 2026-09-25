@@ -351,6 +351,13 @@ def test_a_dependency_only_fire_also_shows_code_files_naming_the_flagged_depende
                      "--- file: reqs.py (modified) ---"]                         # a/core.py and PKG-INFO never
 
 
+def test_an_uppercase_py_extension_still_ranks_as_code_naming_the_dependency():
+    changed = [_fd("setup.py", "modified", "d"), _fd("b/LOAD.PY", "modified", "import reqeusts.sub")]
+    d = Diff("p", "1.1", False, changed, [], added_dep_findings=_REQ_FINDING)
+    ranked, _ = reviewer._rank_files(d, _TYPO)
+    assert "b/LOAD.PY" in ranked
+
+
 def test_a_dependency_name_matches_only_as_a_whole_name():
     changed = [_fd("a/core.py", "modified", "import reqeustsx; my_reqeusts = 1")]
     d = Diff("p", "1.1", False, changed, [], added_dep_findings=_REQ_FINDING)

