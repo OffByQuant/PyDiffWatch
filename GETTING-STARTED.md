@@ -477,11 +477,36 @@ to manual review.
 Two extras make PyDiffWatch easier to run and easier to *act on*: a built-in daemon loop and a local HTML
 dashboard of verdicts with one-click "report to PyPI" links.
 
-**The dashboard** renders every reviewed release as a card — malicious and suspicious sorted first and
-highlighted, benign muted — each with a direct PyPI link, and flagged cards carry a **"Report malware on
-PyPI"** action so going from "the tool flagged this" to "reported for takedown" is one click. It's a single
-self-contained HTML file with no JavaScript; every untrusted string (package name, the model's reasoning,
-cited code) is HTML-escaped, so a package literally named `<script>…</script>` can't attack the page.
+**The dashboard** renders every reviewed release as one of three kinds of card, sorted malicious first,
+then suspicious, then not-scanned/partial-review, then benign:
+- **A model verdict** — malicious and suspicious highlighted, benign muted — with a **"Report malware on
+  PyPI"** action so going from "the tool flagged this" to "reported for takedown" is one click.
+- **Not scanned** — the release was never scanned at all (a download/extract refusal, a quarantined
+  project, an oversized input, ...; verdict `model == 'none'`). Neutral styling, badge text `not scanned`
+  (rendered as **NOT SCANNED** — the badge's CSS uppercases it, same as every other badge), the recorded
+  reason, a plain PyPI link, and **no** report button — nobody has looked at the code, so there's nothing
+  to report.
+- **Partial review** — the model reviewed the release but not all of it: a benign verdict parked for
+  adjudication because some flagged content was dropped from its input (spec U2). Badge text
+  `partial review` (**PARTIAL REVIEW**). The card still shows the model's own classification
+  (`model: benign`) and only carries a report button if the model called that partial review malicious or
+  suspicious.
+
+A human adjudication (below) still overrides all three for that card: a human `malicious` label keeps the
+report button even on an otherwise not-scanned or partial-review release, and a human `benign` clears a
+not-scanned or partial-review release the same as it would a model verdict.
+
+The status strip and the sub-header both count model-reviewed and not-scanned releases separately, with
+identical wording, e.g. `42 releases · 35 model-reviewed (6 flagged by the model, 4 partial review — need
+manual review) · 7 not scanned — need manual review` — a not-scanned release was never a model finding, so
+it's never folded into "flagged by the model", and partial reviews carry their own "need manual review"
+cue since they need a person's eyes just as much as a not-scanned release does. A row with a human label
+counts by that label instead: `malicious`/`suspicious` counts as flagged, `benign` counts as neither
+flagged, not-scanned, nor partial — it's settled.
+
+It's a single self-contained HTML file with no JavaScript; every untrusted string (package name, the
+model's reasoning, cited code) is HTML-escaped, so a package literally named `<script>…</script>` can't
+attack the page.
 
 **Your own `adjudicate` call is the final word.** Once you've adjudicated a release with
 `pydiffwatch pending` / `pydiffwatch adjudicate <id> ...` (§6), the dashboard shows *your* label, not the
@@ -489,7 +514,8 @@ model's, for that card: a human `benign` clears the flag for good — no highlig
 button, and it drops out of the flagged count in the status strip — even if the model called it
 malicious or suspicious. Conversely, a human `malicious` or `suspicious` label keeps the card flagged
 (highlighted, with the report button) even if the model called it benign. The badge text and the sort
-order (malicious first, then flagged, then benign) both follow your label once one is set. The card also
+order (malicious, then suspicious, then not-scanned/partial-review, then benign) both follow your label
+once one is set. The card also
 reads `your verdict: <label> — <your note> · model said <classification>` (the note and the model's call
 only when there is one, and only when it differs from yours).
 
