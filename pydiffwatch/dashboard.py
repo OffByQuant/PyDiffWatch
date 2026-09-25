@@ -52,9 +52,17 @@ def _is_not_scanned(row: dict) -> bool:
 
 
 def _is_partial(row: dict) -> bool:
-    """reasoning starting 'reviewed partially:' (orchestrator._clip_files) marks a release the model DID
-    review, but not in full — some flagged content was dropped from its input."""
-    return (row.get("reasoning") or "").startswith("reviewed partially:")
+    """A release the model DID review, but not in full — some flagged content was dropped from its input
+    (spec U2). Detected by reasoning starting 'reviewed partially:' (orchestrator._clip_files) OR,
+    independently of that wording (round 1, N2 — a reworded note must not silently stop being detected),
+    by the same shape orchestrator._record routes there: a benign verdict parked in needs_adjudication by
+    an actual model (model != 'none'; a not-scanned release reaching needs_adjudication is a different
+    case, handled by _is_not_scanned)."""
+    if (row.get("reasoning") or "").startswith("reviewed partially:"):
+        return True
+    return (row.get("stage") == "needs_adjudication"
+            and (row.get("classification") or "").lower() == "benign"
+            and row.get("model") not in (None, "none"))
 
 
 def is_flagged(row: dict) -> bool:
@@ -196,17 +204,30 @@ def counts(rows) -> dict:
     """Split verdict rows into model-reviewed vs not-scanned, and how many of the model-reviewed rows are
     flagged (model said malicious/suspicious, or a human overrode it so) or partial reviews. Shared by
     render_dashboard's sub-header and orchestrator.export_dashboard's status strip so the two can't drift
-    apart. Not-scanned rows are excluded from "flagged by the model" even when a human later labelled one
-    malicious (is_flagged is True for it) -- that count is about what the model found, not what a human
-    did after the fact; the row still shows up in not_scanned, and its report button still renders."""
-    not_scanned = sum(1 for r in rows if _is_not_scanned(r))
-    reviewed = [r for r in rows if not _is_not_scanned(r)]
+    apart.
+
+    A human_label takes the row over entirely (round 1, item 2), same as the badge and is_flagged: a
+    human 'malicious'/'suspicious' counts as flagged full stop, even on an otherwise not-scanned or
+    partial-review release (it's no longer a tool gap -- a person looked at it); a human 'benign' counts
+    as neither flagged, not-scanned, nor partial -- it's settled. Only rows with no human_label are ever
+    counted into not_scanned or partial. model_reviewed is everything not counted as not_scanned, so a
+    human-labelled row (whatever its underlying model field) always lands there."""
+    not_scanned = sum(1 for r in rows if r.get("human_label") is None and _is_not_scanned(r))
+    partial = sum(1 for r in rows if r.get("human_label") is None and not _is_not_scanned(r) and _is_partial(r))
     return {
-        "model_reviewed": len(reviewed),
-        "model_flagged": sum(1 for r in reviewed if is_flagged(r)),
-        "partial": sum(1 for r in reviewed if _is_partial(r)),
+        "model_reviewed": len(rows) - not_scanned,
+        "model_flagged": sum(1 for r in rows if is_flagged(r)),
+        "partial": partial,
         "not_scanned": not_scanned,
     }
+
+
+def _counts_text(model_reviewed, model_flagged, partial, not_scanned) -> str:
+    """The model-reviewed/flagged/partial/not-scanned phrase shared verbatim by the status strip and the
+    sub-header (round 1, item 5: they must read identically). Partial reviews wait on a person just like
+    not-scanned releases do, so both carry the "need manual review" cue."""
+    return (f"{model_reviewed} model-reviewed ({model_flagged} flagged by the model, "
+            f"{partial} partial review — need manual review) · {not_scanned} not scanned — need manual review")
 
 
 def _status_strip(status: dict) -> str:
@@ -247,7 +268,7 @@ def _status_strip(status: dict) -> str:
   <span class="stat"><span class="dot {dot}"></span>{e(model_txt)} <code>{e(status.get('reviewer') or '?')}</code></span>
   <span class="stat">last poll: {e(age)}</span>
   <span class="stat">cursor: {e(serial_txt)}</span>
-  <span class="stat">{releases} releases · {model_reviewed} model-reviewed ({model_flagged} flagged by the model, {partial} partial review) · {not_scanned} not scanned — need manual review</span>
+  <span class="stat">{releases} releases · {_counts_text(model_reviewed, model_flagged, partial, not_scanned)}</span>
 {f'  <span class="stat">{e(pending_txt)}</span>' + chr(10) if pending_txt else ''}{f'  <span class="stat">{e(retry_txt)}</span>' + chr(10) if retry_txt else ''}{f'  <span class="stat">{e(guard_txt)}</span>' + chr(10) if guard_txt else ''}</div>"""
 
 
@@ -259,8 +280,7 @@ def render_dashboard(rows, status: dict = None, generated_at: str = "") -> str:
         '<div class="empty">No verdicts yet. Run <code>pydiffwatch run</code> first.</div>'
     gen = f" · generated {html.escape(generated_at)}" if generated_at else ""
     strip = _status_strip(status) if status else ""
-    sub = (f"{c['model_reviewed']} model-reviewed ({c['model_flagged']} flagged by the model, "
-           f"{c['partial']} partial review) · {c['not_scanned']} not scanned — need manual review")
+    sub = _counts_text(c["model_reviewed"], c["model_flagged"], c["partial"], c["not_scanned"])
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PyDiffWatch — verdicts</title><style>{_STYLE}</style></head><body>

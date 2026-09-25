@@ -1,6 +1,17 @@
+import re
+
 from pydiffwatch import dashboard, store, orchestrator
 from pydiffwatch.config import Config
 from pydiffwatch.models import Verdict
+
+
+def _strip_stat_text(html_out):
+    """The status strip's counts live in the <span class="stat"> that starts with "N releases ·" — the
+    sub-header renders the same wording but never that prefix, so this is how round-1 item 3 isolates an
+    assertion to the strip alone."""
+    m = re.search(r'<span class="stat">(\d+ releases[^<]*)</span>', html_out)
+    assert m, "status strip's 'N releases · ...' stat span not found"
+    return m.group(1)
 
 
 # ---- pure-function tests (no DB) ----
@@ -53,6 +64,33 @@ def test_render_partial_review_with_model_malicious_keeps_report_link():
                                        "classification": "malicious", "stage": "needs_adjudication",
                                        "model": "gemma", "reasoning": "reviewed partially: setup.py not shown"}])
     assert "Report malware on PyPI" in out
+
+
+def test_render_partial_review_detected_by_stage_without_the_reasoning_prefix():
+    # round 1, N2: detection must not depend on the reasoning string. A benign verdict parked in
+    # needs_adjudication by a real model (model != 'none') is a partial review even if orchestrator's note
+    # is reworded and no longer starts with "reviewed partially:".
+    out = dashboard.render_dashboard([{"package": "partpkg", "version": "1.0.0",
+                                       "classification": "benign", "stage": "needs_adjudication",
+                                       "model": "gemma", "reasoning": "a file wasn't shown to the model"}])
+    assert "Report malware on PyPI" not in out
+    assert 'class="badge partial">partial review<' in out
+    assert "model: benign" in out
+
+
+def test_record_partial_review_renders_as_partial_review_end_to_end(tmp_path):
+    # round 1, N2 integration test: drive orchestrator._record's real "reviewed partially:" path, then
+    # build rows the way export_dashboard does, and confirm the stored row renders PARTIAL REVIEW.
+    cfg = Config(db_path=tmp_path / "diffwatch.sqlite", reviewer_enabled=False)
+    conn = store.connect(cfg); store.init_schema(conn)
+    rid = store.record_release(conn, "partpkg", "1.0.0", 1, False, "0.9.0", "diff")
+    verdict = Verdict("partpkg", "1.0.0", "benign", 60.0, [], False, model="gemma", reasoning="looks fine")
+    orchestrator._record(cfg, conn, rid, verdict, score=10.0, dropped=["setup.py"])
+    rows = [dict(r) for r in store.all_verdicts(conn)]
+    conn.close()
+    out = dashboard.render_dashboard(rows)
+    assert 'class="badge partial">partial review<' in out
+    assert "Report malware on PyPI" not in out
 
 
 def test_render_not_scanned_shows_badge_reason_and_no_report_link():
@@ -229,6 +267,37 @@ def test_render_counts_split_model_reviewed_flagged_partial_and_not_scanned():
     assert "1 partial review" in out
     assert "2 not scanned" in out
     assert "need manual review" in out
+    # round 1, item 5: partial reviews need a person too, so the cue sits with them in the parenthetical.
+    assert "1 flagged by the model, 1 partial review — need manual review)" in out
+
+
+def test_render_counts_a_not_scanned_row_labelled_benign_counts_as_neither_flagged_nor_not_scanned():
+    rows = [{"package": "gappkg", "version": "1", "classification": "suspicious", "model": "none",
+             "human_label": "benign"}]
+    out = dashboard.render_dashboard(rows)
+    assert "0 flagged by the model" in out
+    assert "0 partial review" in out
+    assert "0 not scanned" in out
+    assert "1 model-reviewed" in out
+
+
+def test_render_counts_a_not_scanned_row_labelled_malicious_counts_as_flagged_not_not_scanned():
+    rows = [{"package": "gappkg", "version": "1", "classification": "suspicious", "model": "none",
+             "human_label": "malicious"}]
+    out = dashboard.render_dashboard(rows)
+    assert "1 flagged by the model" in out
+    assert "0 not scanned" in out
+    assert "0 partial review" in out
+
+
+def test_render_counts_a_partial_row_labelled_benign_counts_as_neither_flagged_nor_partial():
+    rows = [{"package": "partpkg", "version": "1", "classification": "benign", "model": "m",
+             "reasoning": "reviewed partially: x", "human_label": "benign"}]
+    out = dashboard.render_dashboard(rows)
+    assert "0 flagged by the model" in out
+    assert "0 partial review" in out
+    assert "0 not scanned" in out
+    assert "1 model-reviewed" in out
 
 
 def test_export_dashboard_status_counts_split_model_reviewed_and_not_scanned(tmp_path):
@@ -241,9 +310,10 @@ def test_export_dashboard_status_counts_split_model_reviewed_and_not_scanned(tmp
                                              reasoning="UNREVIEWED: refused.", model="none"))
     conn.close()
     out = orchestrator.export_dashboard(cfg).read_text()
-    assert "1 model-reviewed" in out
-    assert "1 flagged by the model" in out
-    assert "1 not scanned" in out
+    strip = _strip_stat_text(out)
+    assert "2 releases · 1 model-reviewed" in strip
+    assert "1 flagged by the model" in strip
+    assert "1 not scanned" in strip
 
 
 def test_a_labelled_card_shows_your_verdict_your_note_and_what_the_model_said(tmp_path):
