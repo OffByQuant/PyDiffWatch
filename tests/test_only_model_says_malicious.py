@@ -35,7 +35,7 @@ class _Backend:
 
 def _cfg(tmp_path, **kw):
     c = Config(db_path=tmp_path / "db.sqlite", lock_path=tmp_path / "l", cache_dir=tmp_path / "c",
-               rules_dir=Path("rules/community"), **kw)
+               rules_dir=Path(__file__).resolve().parents[1] / "rules/community", **kw)
     return dataclasses.replace(c, reviewer=dataclasses.replace(c.reviewer, host_memory_guard=False))
 
 
@@ -162,15 +162,14 @@ ALLOWED_NON_LITERAL = {("reviewer.py", "_call"), ("orchestrator.py", "adjudicate
 
 
 def _classification_arg(call):
-    """The classification expression of a Verdict(...) or dataclasses.replace(...) call, else None."""
+    """(callee name, classification expression) for a Verdict / dataclasses.replace / store.record_alert
+    call; the expression is None when it isn't passed explicitly."""
     fn = call.func
     name = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else None
     kw = next((k.value for k in call.keywords if k.arg == "classification"), None)
-    if name == "Verdict":
-        return kw if kw is not None else (call.args[2] if len(call.args) > 2 else None)
-    if name == "replace":
-        return kw
-    return None
+    if name in ("Verdict", "record_alert"):   # classification is the 3rd positional arg of both
+        return name, kw if kw is not None else (call.args[2] if len(call.args) > 2 else None)
+    return name, kw if name == "replace" else None
 
 
 def violations(source, filename):
@@ -179,11 +178,18 @@ def violations(source, filename):
     def walk(node, func):
         for child in ast.iter_child_nodes(node):
             f = child.name if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else func
-            if isinstance(child, ast.Call) and (arg := _classification_arg(child)) is not None:
+            if isinstance(child, ast.Call):
+                name, arg = _classification_arg(child)
+                sanctioned = (filename, func) in ALLOWED_NON_LITERAL
+                unpacked = any(isinstance(a, ast.Starred) for a in child.args) or \
+                    any(k.arg is None for k in child.keywords)
+                if name == "Verdict" and unpacked and not sanctioned:
+                    out.append(f"{filename}:{child.lineno} Verdict(*args/**kw) in {func}()")
                 if isinstance(arg, ast.Constant):
                     if arg.value == "malicious":
                         out.append(f"{filename}:{child.lineno} literal 'malicious' classification")
-                elif (filename, func) not in ALLOWED_NON_LITERAL:
+                # record_alert's classification is the emitted verdict's (notifier.emit): only literals checked
+                elif arg is not None and name != "record_alert" and not sanctioned:
                     out.append(f"{filename}:{child.lineno} non-literal classification in {func}()")
             walk(child, f)
 
@@ -196,6 +202,12 @@ def test_static_check_catches_a_planted_violation():
     assert violations(bad, "orchestrator.py")
     assert violations("def g(v):\n    return dataclasses.replace(v, classification='malicious')\n", "x.py")
     assert violations("def h(c):\n    return Verdict('p', '1', c, 0, [], True)\n", "notifier.py")
+    assert violations("def i(c):\n    store.record_alert(c, 1, 'malicious', 0, '[]', 'k')\n", "notifier.py")
+    assert violations("def j(c):\n    record_alert(c, 1, classification='malicious')\n", "notifier.py")
+    assert violations("def k(a):\n    return Verdict(*a)\n", "orchestrator.py")
+    assert violations("def m(kw):\n    return Verdict(**kw)\n", "orchestrator.py")
+    # the sanctioned places may pass a non-literal classification
+    assert not violations("def _call(d):\n    return Verdict(classification=d['c'])\n", "reviewer.py")
 
 
 def test_no_code_outside_the_model_parser_or_adjudicate_mints_malicious():
