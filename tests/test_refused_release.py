@@ -1,6 +1,6 @@
 """A release the fetcher refused (an sdist it would not unpack, or a download over the size cap) was never
-looked at. Oversized or malformed archives can hide a payload from scanners, so the release is not
-dropped: the alert says why it was refused, and it waits in `pending` for a manual review."""
+looked at. Oversized archives can hide a payload from scanners, so the release is not dropped: the alert
+says why it was refused, and it waits in `pending` for a manual review."""
 from pydiffwatch import fetcher, notifier, orchestrator, store
 from pydiffwatch.models import NewRelease
 
@@ -47,3 +47,10 @@ def test_refused_release_can_be_adjudicated(tmp_cfg, capsys, monkeypatch):
     assert len(orchestrator.list_pending(tmp_cfg)) == 1
     assert orchestrator.adjudicate(tmp_cfg, rid, "benign")["label"] == "benign"
     assert orchestrator.list_pending(tmp_cfg) == []
+
+
+def test_zip_refusal_names_the_format_and_drops_malformed(tmp_cfg, capsys):
+    conn, out = _refuse(tmp_cfg, fetcher.RefusedToExtract("zip-sdist"), capsys)
+    assert store.get_stage(conn, "big-native-pkg", "0.1.0") == "refused_to_extract"
+    assert "(zip-sdist: it is a zip archive, which pydiffwatch does not unpack)" in out
+    assert "Oversized archives can hide a payload from scanners." in out and "malformed" not in out

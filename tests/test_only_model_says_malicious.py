@@ -213,3 +213,20 @@ def test_static_check_catches_a_planted_violation():
 def test_no_code_outside_the_model_parser_or_adjudicate_mints_malicious():
     found = [v for p in sorted(PKG.glob("*.py")) for v in violations(p.read_text(), p.name)]
     assert found == []
+
+
+def test_one_oversized_source_alone_goes_to_no_content_not_malicious(tmp_path):
+    # A PKG-INFO bump (not a build file) plus one oversized .py: triage escalates (weight 40), the model has
+    # nothing readable to see, so the release is a model-`none` UNREVIEWED item, never malicious.
+    cfg = _cfg(tmp_path)
+    conn = _conn(cfg)
+    art = ArtifactSet("p", "1.1", "1.0", "sdist", {"PKG-INFO": b"Version: 1.1\n"}, {"PKG-INFO": b"Version: 1.0\n"},
+                      {}, added_binaries=[{"path": "p/big.py", "size": 5_000_000, "reason": "source-too-large",
+                                           "sha256": "ab"}],
+                      is_new_package=False, maintainer_metadata=None, added_dep_findings=[], too_large=("p/big.py",))
+    rvw = reviewer.Reviewer(cfg, backend=_Backend())
+    orchestrator._process_fetched(cfg, conn, rvw, orchestrator._load_ruleset(cfg), NewRelease("p", "1.1", 5), art)
+    assert store.get_stage(conn, "p", "1.1") == "needs_adjudication"
+    row = conn.execute("SELECT classification, model FROM verdicts").fetchone()
+    assert (row["classification"], row["model"]) == ("suspicious", "none")
+    _assert_never_malicious(conn, "no_content")
