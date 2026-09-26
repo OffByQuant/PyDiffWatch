@@ -292,7 +292,7 @@ def _one_line(s: str) -> str:
 _EXEC_MAX_CHARS = 4_000
 _SIG_MAX_CHARS = 3_000
 # Each block is also held to max_chars // 8 so a small-context model still sees hunks, but never below this floor:
-# the signals block has at most 45 lines (differ._signals) and each needs 23 chars ("  " + _EXEC_TRUNCATED) plus its
+# the signals block has at most 45 lines (differ.render_signals) and each needs 23 chars ("  " + _EXEC_TRUNCATED) plus its
 # newline to say it was cut, so 1_200 (heading included) keeps every line meaningful and the block within its cap.
 _BLOCK_MIN_CHARS = 1_200
 _EXEC_TRUNCATED = "… (context truncated)"

@@ -152,7 +152,8 @@ def test_differ_lists_every_signal():
                added_binaries=[{"path": "p/x.so", "size": 1234, "sha256": "ab"},
                                {"path": "p/big.py", "size": 9_000_000, "reason": "source-too-large"},
                                {"path": "p/l.php", "size": 10, "ext": ".php", "reason": "foreign-language-source"}])
-    sig = differ.build_diff(art, {"current": {"roles": ["mallory"]}, "prior": {"roles": ["alice"]}}).signals
+    sig = differ.render_signals(art.requires_dist_change, art.added_dep_findings, art.added_binaries,
+                               {"current": {"roles": ["mallory"]}, "prior": {"roles": ["alice"]}})
     assert sig.split("\n") == [
         "requires-dist added: reqeusts==0.1",
         "requires-dist removed: six",
@@ -168,23 +169,24 @@ def test_differ_lists_every_signal():
 
 
 def test_no_signals_no_block():
-    assert differ.build_diff(_art()).signals == ""
+    assert differ.render_signals(None, [], [], None) == ""
     text = reviewer.build_review_input(Diff("p", "1.1", False, [_fd()], []), _FIRED, max_chars=10_000)
     assert "signals" not in text
 
 
 def test_each_kind_of_signal_is_capped_at_twenty_items():
     art = _art(added_binaries=[{"path": f"b{i}.so", "size": 1, "sha256": "x"} for i in range(50)])
-    lines = differ.build_diff(art).signals.split("\n")
+    lines = differ.render_signals(art.requires_dist_change, art.added_dep_findings, art.added_binaries, None).split("\n")
     assert len(lines) == 21 and lines[-1] == "added file: … (+30 more)"
 
 
 def test_a_dependency_typosquat_is_shown_inside_the_markers_after_the_execution_context():
     fd = _fd("setup.py", "modified", "install_requires=['reqeusts']")
-    art_d = differ.build_diff(_art(new_files={"setup.py": b"x\n"}, prior_files={"setup.py": b"y\n"},
-                                   added_dep_findings=[{"name": "reqeusts", "reason": "typosquat",
-                                                        "target": "requests"}]))
-    d = dataclasses.replace(art_d, changed=[fd])
+    art = _art(new_files={"setup.py": b"x\n"}, prior_files={"setup.py": b"y\n"},
+               added_dep_findings=[{"name": "reqeusts", "reason": "typosquat", "target": "requests"}])
+    art_d = differ.build_diff(art)
+    d = dataclasses.replace(art_d, changed=[fd], signals=differ.render_signals(
+        art.requires_dist_change, art.added_dep_findings, art.added_binaries, None))
     text = reviewer.build_review_input(d, _TYPO, max_chars=10_000)
     assert "typosquat of requests" not in _header(text)
     body = _untrusted(text)
@@ -252,7 +254,9 @@ def test_hostile_signal_strings_cannot_forge_a_heading(bad):
                added_dep_findings=[{"name": bad, "reason": "typosquat", "target": bad}, {"name": bad, "reason": bad}],
                added_binaries=[{"path": bad, "size": bad, "reason": bad, "ext": bad}],
                description=bad)
-    d = differ.build_diff(art, {"current": {"roles": [bad]}, "prior": {"roles": ["alice"]}})
+    d = dataclasses.replace(differ.build_diff(art), signals=differ.render_signals(
+        art.requires_dist_change, art.added_dep_findings, art.added_binaries,
+        {"current": {"roles": [bad]}, "prior": {"roles": ["alice"]}}))
     tr = TriageResult(60.0, [FiredRule("dep-typosquat", 40.0, bad, (0, 0)),
                              FiredRule("py-exec", 20.0, "setup.py", (1, 1))], True)
     text = reviewer.build_review_input(d, tr, max_chars=100_000)
@@ -329,7 +333,7 @@ def test_a_non_latest_release_screens_its_own_requires_dist_not_the_latest_s(mon
     assert "1.1" in asked
     assert [f["name"] for f in art.added_dep_findings] == ["reqursts"]          # its own addition only
     assert art.requires_dist_change == {"added": ["requests>=2", "reqursts"], "removed": []}
-    assert "reqeusts" not in differ.build_diff(art).signals
+    assert "reqeusts" not in differ.render_signals(art.requires_dist_change, art.added_dep_findings, art.added_binaries, None)
 
 
 def test_a_non_latest_release_whose_own_list_is_unavailable_gets_no_findings(monkeypatch):
@@ -432,7 +436,7 @@ def test_the_description_stays_within_500_chars_after_escaping():
 
 
 def test_a_typosquat_finding_without_a_target_says_typosquat():
-    sig = differ.build_diff(_art(added_dep_findings=[{"name": "x", "reason": "typosquat"}])).signals
+    sig = differ.render_signals(None, [{"name": "x", "reason": "typosquat"}], [], None)
     assert sig == "dependency x: typosquat"
 
 

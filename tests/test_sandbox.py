@@ -57,3 +57,13 @@ def test_a_refused_new_sdist_raises_out_of_analyze():
     dl = _dl({f"p/m{i}.py": b"" for i in range(5)}, {"p/a.py": b""})
     with pytest.raises(fetcher.RefusedToExtract, match="members"):
         sandbox.analyze(Config(max_members=3), dl, None, [])
+
+
+def test_build_diff_renders_no_signals_analyze_does():
+    from pydiffwatch import differ
+    dl = _dl({"p/a.py": b"x=1\n"}, {"p/a.py": b"x=0\n"},
+             added_dep_findings=[{"name": "x", "reason": "brand-new"}])
+    art = fetcher.extract_download(Config(), dl)
+    assert differ.build_diff(art).signals == ""
+    d, _, _ = sandbox.analyze(Config(), dl, None, [])
+    assert d.signals == "dependency x: brand-new on PyPI"

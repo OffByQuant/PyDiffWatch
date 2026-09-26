@@ -58,7 +58,7 @@ def render_signals(requires_dist_change, added_dep_findings, added_binaries, mai
     return "\n".join(out)
 
 
-def build_diff(a: ArtifactSet, maintainer_context=None) -> Diff:
+def build_diff(a: ArtifactSet) -> Diff:
     changed: list[FileDiff] = []
     for path in sorted(set(a.new_files) | set(a.prior_files)):
         new, prior = a.new_files.get(path), a.prior_files.get(path)
@@ -78,4 +78,4 @@ def build_diff(a: ArtifactSet, maintainer_context=None) -> Diff:
                 list(a.added_binaries), list(a.added_dep_findings), _description(a.description),
                 execctx.build(a.new_files, a.too_large),
                 a.prior_version if a.prior_error and a.prior_version else "", a.surface_omitted,
-                render_signals(a.requires_dist_change, a.added_dep_findings, a.added_binaries, maintainer_context))
+                "")

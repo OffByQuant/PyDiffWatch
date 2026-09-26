@@ -298,7 +298,9 @@ def test_the_rebuild_scores_the_release_with_the_current_rules(tmp_path, monkeyp
     conn.commit()
     _fetch(scan_stub, _art())
     orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=_Backend()), auto=True)
-    tr = engine.triage(differ.build_diff(_art(), {"current": None, "prior": None}), cfg,
+    art = _art()
+    tr = engine.triage(dataclasses.replace(differ.build_diff(art), signals=differ.render_signals(
+        art.requires_dist_change, art.added_dep_findings, art.added_binaries, {"current": None, "prior": None})), cfg,
                        orchestrator._load_ruleset(cfg), {"current": None, "prior": None})
     row = conn.execute("SELECT triage_score, triage_rules FROM releases WHERE id=?", (rid,)).fetchone()
     assert row["triage_score"] == tr.score
