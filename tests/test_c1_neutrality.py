@@ -108,10 +108,9 @@ def _stub_scan_release(monkeypatch):
 
 
 def _scan(cfg, ruleset):
-    """The scan under test: before C1, fetch_artifacts + build_diff(art, owners) + triage(..., owners)."""
-    art = fetcher.fetch_artifacts(cfg, _SCAN_REL)
-    d = differ.build_diff(art, _OWNERS)
-    return d, engine.triage(d, cfg, ruleset, _OWNERS), art.prior_error
+    """The scan under test: since C1, download + sandbox.analyze(backend="off")."""
+    from pydiffwatch import sandbox
+    return sandbox.analyze(cfg, fetcher.download(cfg, _SCAN_REL), _OWNERS, ruleset, backend="off")
 
 
 def test_scan_is_unchanged(monkeypatch):
