@@ -192,8 +192,8 @@ key is missing, that run logs a notice and falls back to heuristic-only — it d
 | `none` | prompt-only; nothing enforces the shape | very small models / last resort |
 
 Regardless of mode, the parsed verdict is **validated client-side** against the review schema. A verdict
-missing a required field or carrying an out-of-range enum is rejected, and the release degrades to a
-heuristic alert — never a silent pass. Start at `json_schema`; step down only if the logs show
+missing a required field or carrying an out-of-range enum is rejected, and the release is parked as
+`review_failed` and retried — never a silent pass. Start at `json_schema`; step down only if the logs show
 `ReviewUnavailable: non-JSON content`.
 
 ---
@@ -316,7 +316,7 @@ malicious_min_confidence = 0.8   # a weaker malicious verdict alerts as suspicio
 ```
 
 (default `0.8`, range 0–1). A weak verdict is recorded and alerted as `suspicious` instead, with `urgent`
-cleared — kind `suspicious`, one alert, deduped separately from any first alert on the release — with `model
+cleared — kind `suspicious`, one alert, deduped separately from any UNREVIEWED alert on the release — with `model
 said malicious (downgraded: <reason>); needs manual review` prepended to the reasoning, where `<reason>` is
 `runs_when=user-command`, `runs_when=not-shipped`, `no confidence`, or `confidence <value> < <floor>`. It
 waits in `pending` for a human like any other suspicious verdict; the model's own classification stays visible
@@ -352,7 +352,8 @@ pydiffwatch -c pydiffwatch.toml run
 `run` pulls every release since the last cursor (capped by `max_releases_per_run`), diffs each against
 its prior version, scores it with the ruleset, and escalates anything ≥ `threshold_t` to the reviewer.
 The broad `primitives` rule is capped (`max_total: 35`), so it can't escalate a release on its own. Rules
-only ever clear or escalate: only the model or a person can call a release malicious.
+only ever clear or escalate: only the model or a person can call a release malicious. A flagged release
+no model has reviewed yet waits in the review queue without an alert.
 Clear-malicious verdicts alert immediately; borderline "suspicious" ones queue for your judgement.
 
 **Downloads have deadlines.** Each sdist download is capped at `fetch_deadline_s` (120s total) and PyPI's
@@ -427,10 +428,11 @@ later review doesn't depend on PyPI still hosting the sdist.
 | reason | when | drained by |
 |---|---|---|
 | `model_busy` | the reviewer guard deferred it: breaker open after a timeout, the model degrading, or this machine short on memory | every tick, first, once the guard allows reviews |
-| `in_review` | the process stopped (killed, crashed, rebooted) while the model was reviewing it | every tick; if that review can't finish either, it gets the heuristic alert it missed |
+| `in_review` | the process stopped (killed, crashed, rebooted) while the model was reviewing it | every tick |
 | `endpoint_unreachable` | the model server is down (each tick prints a warning) | every tick, once it's back |
 | `review_failed` | a review timed out or failed; retried at `timeout` × attempt (300s, 600s, 900s) | every tick, up to `max_review_attempts` (3) |
-| `too_large` | the highest-risk file alone exceeds `max_input_chars` (200k chars) | `review-pending` with a larger-context model |
+| `too_large` | the highest-risk file alone exceeds `max_input_chars` (200k chars) | `review-pending` with a larger-context model; the auto-drain also takes it once it fits the endpoint's cap. No alert |
+| `reviewer_disabled` | no reviewer this run (`reviewer_enabled = false`, or the anthropic backend has no key); no review input or evidence is stored | every tick once a reviewer is enabled: downloaded and scanned again, then reviewed; a PyPI outage spends no attempt |
 
 Each tick retries at most `max_pending_per_tick` (20) queued releases before scanning, and starts no new one once `timeout` (300s) has passed since the first, so a slow model can't hold up the scan for hours. The rest wait for
 you — typically with a bigger model pointed at the same database:
@@ -438,11 +440,12 @@ you — typically with a bigger model pointed at the same database:
 ```bash
 pydiffwatch -c frontier.toml review-pending                     # too_large + exhausted retries
 pydiffwatch -c frontier.toml review-pending --reason too_large --limit 10
+pydiffwatch -c frontier.toml review-pending --reason reviewer_disabled   # queued while the reviewer was off
 ```
 
 `frontier.toml` is any reviewer config (e.g. `examples/anthropic.toml`) with the same `db_path` and a
-larger `max_input_chars`. `pending` shows the queue counts; the dashboard shows them in its status
-strip. A release with **no** reviewable text at all
+larger `max_input_chars`. `pending` shows the queue counts and lists each queued release (id, score, reason;
+the oldest 50); the dashboard shows them in its status strip. A release with **no** reviewable text at all
 (only binary / oversized-member / maintainer signals) is not queued: no model can review it, so it goes
 straight to `pending` for a human.
 
@@ -484,7 +487,7 @@ then suspicious, then not-scanned/partial-review, then benign:
 - **A model verdict** — malicious and suspicious highlighted, benign muted — with a **"Report malware on
   PyPI"** action so going from "the tool flagged this" to "reported for takedown" is one click.
 - **Not scanned** — the release was never scanned at all (a download/extract refusal, a quarantined
-  project, an oversized input, ...; verdict `model == 'none'`). Neutral styling, badge text `not scanned`
+  project, ...; verdict `model == 'none'`). Neutral styling, badge text `not scanned`
   (rendered as **NOT SCANNED** — the badge's CSS uppercases it, same as every other badge), the recorded
   reason, a plain PyPI link, and **no** report button — nobody has looked at the code, so there's nothing
   to report.
@@ -493,6 +496,9 @@ then suspicious, then not-scanned/partial-review, then benign:
   `partial review` (**PARTIAL REVIEW**). The card still shows the model's own classification
   (`model: benign`) and only carries a report button if the model called that partial review malicious or
   suspicious.
+
+A release still waiting for a model review has no card; the status strip counts it by reason. A label you give
+such a release shows `no model review` instead of what the model said.
 
 A human adjudication (below) still overrides all three for that card: a human `malicious` label keeps the
 report button even on an otherwise not-scanned or partial-review release, and a human `benign` clears a
@@ -562,7 +568,7 @@ scans back-to-back and sleeps only once it has caught up. `--model` / `--endpoin
 (network blip, endpoint down) is logged and the daemon keeps going; Ctrl-C stops cleanly. The dashboard's
 status strip shows whether your model endpoint is reachable, how long ago the last scan ran, and the
 review and retry backlogs — start your
-model server (§2) before `watch --serve`, or reviews fall back to heuristics until it's up.
+model server (§2) before `watch --serve`; until it's up, flagged releases wait in the review queue.
 
 It is a **foreground** process — keep the terminal open, or run it under your agent harness, which will run
 it as a background task and hand you back the dashboard URL. For unattended, machine-level scheduling,
@@ -699,7 +705,7 @@ installed, built, imported, or executed — see the [README invariant](README.md
 
 | Oversized member | Recorded as | Effect |
 |---|---|---|
-| Python source or build file (`.py`, `setup.py`, `pyproject.toml`, `.pth`, …) | `source-too-large` | `binary-source-too-large` (40) — alone it escalates; with nothing readable to show the model it lands in `pending` as `(not scanned: no_content)` |
+| Python source or build file (`.py`, `setup.py`, `pyproject.toml`, `.pth`, …) | `source-too-large` | `binary-source-too-large` (40) — alone it escalates; with the reviewer on and nothing readable to show the model it lands in `pending` as `(not scanned: no_content)`; with the reviewer off it waits in the review queue as `reviewer_disabled`, with no alert |
 | Compiled binary (`.so`, `.pyd`, …) | `new-binary` | `binary-new-binary` (10) |
 | Foreign-language source (`.php`, `.exe`, …) | `foreign-language-source` | `foreign-language-source` (25) |
 | Anything else | `file-too-large` | no score; listed to the reviewer after the scored signals |
@@ -727,7 +733,10 @@ webhook_url = "https://hooks.slack.com/services/XXX/YYY/ZZZ"
 
 Alerts are also printed to stdout and recorded (deduped) in the DB, so a webhook failure never loses one.
 
-**Every unscanned outcome alerts once, then waits for you.** A release pydiffwatch could not get a model
+**Only a model verdict or your label alerts.** A release the rules flag waits in the review queue (§6) with no
+alert until a model reviews it.
+
+**Every outcome that leaves a release unscannable alerts once, then waits for you.** A release pydiffwatch could not get a model
 verdict on is never silently dropped: each such outcome fires exactly one `suspicious-heuristic` alert
 (deduped per release + outcome, so a re-tick never repeats it) whose `reasoning` starts `UNREVIEWED:` and
 ends `Not scanned. Needs manual review.` (refusals, `metadata_gone` and `no_content` end differently — see below), and —
@@ -741,8 +750,7 @@ except `metadata_gone`, which alerts only — the release then waits in `pending
 | Refused to unpack the sdist (over-size archive) | `(not scanned: refused_to_extract)` | `UNREVIEWED: pydiffwatch refused to unpack its sdist (<reason>: <why>), so nothing in it was scanned. Oversized archives can hide a payload from scanners. Needs manual review.` |
 | Metadata 404s before the release could be scanned | *(alert only — not queued; the files are gone)* | `UNREVIEWED: removed from PyPI before it could be scanned (its metadata returns 404); the files are gone, so there is nothing to review.` |
 | Download/scan failed `METADATA_ATTEMPTS` (3) times running (including a corrupt, truncated or non-gzip sdist) | `(not scanned: gave_up)` | `UNREVIEWED: pydiffwatch failed to download or scan it 3 times and gave up (last error: <last error>). Not scanned. Needs manual review.` |
-| Review input exceeds the endpoint's cap | `(not scanned: too_large)` | `` UNREVIEWED: its review input is too large for the model (<detail>); run `review-pending` with a larger-context model. Not scanned. Needs manual review. `` |
-| Review failed `max_review_attempts` (3) times running | `(not scanned: review_failed)` | `` UNREVIEWED: the model failed to review it <n> times (last error: <last error>); retries are used up. Run `review-pending` to try again, e.g. with another model. Not scanned. Needs manual review. `` |
+| Review failed `max_review_attempts` (3) times running | `(not scanned: review_failed)` | `` UNREVIEWED: the model failed to review it <n> times (last error: <last error>); retries are used up. Run `review-pending` to try again, e.g. with another model. Not scanned. Needs manual review. `` or, when the release could not be downloaded again for review: `` UNREVIEWED: pydiffwatch could not download and scan it again for review <n> times (last error: <last error>), so no model has seen it; retries are used up. Not scanned. Needs manual review. `` |
 | With the reviewer on, triage fired only on signals with no text to show the model (a dependency, binary or maintainer change) | `(not scanned: no_content)` | `UNREVIEWED: triage fired (<rules>) but none of the flagged content could be shown to the reviewer. Needs a human.` |
 | A release switches to wheel-only (see §14) after `wheel_only_grace_minutes` | `(not scanned: no_sdist)` | `UNREVIEWED: switched to wheel-only: the previous release <prev> shipped an sdist and this one ships only wheels, which pydiffwatch does not scan. Not scanned. Needs manual review.` |
 
@@ -753,12 +761,12 @@ too long **or** containing a control character), `total-size`, `download-size`, 
 carried fired-rule weight — including a first release with more than 40 weighted (score > 0) files, since
 only the top 40 by weight are ever shown to the model — a `benign` classification is routed to
 adjudication instead of saved silently, with `reviewed partially: <files> not shown` prepended to the
-`reasoning` (and one `suspicious-heuristic` alert). It shows up in `pending` like any other model verdict
+`reasoning` (no alert). It shows up in `pending` like any other model verdict
 (`model: benign conf=... attack=...`), not as `(not scanned: ...)` — it *was* reviewed, just not on every
 file.
 
 **A weak malicious verdict alerts as suspicious, not malicious.** See §5 for what makes a `malicious`
-verdict weak. It alerts with kind `suspicious` (one alert, deduped separately from any first alert on the
+verdict weak. It alerts with kind `suspicious` (one alert, deduped separately from any UNREVIEWED alert on the
 release) and `reasoning` starting `model said malicious (downgraded: <reason>); needs manual review`; it
 waits in `pending` like any other suspicious verdict, and the model's own classification and reasoning stay
 visible after it.
@@ -773,8 +781,15 @@ To run with no model at all — rules and weights only, no endpoint required —
 reviewer_enabled = false
 ```
 
-Every release crossing `threshold_t` becomes a heuristic alert. Useful for a first pass on a box with no
-GPU and no API budget, or to keep monitoring when your endpoint is down.
+Every release crossing `threshold_t` is queued for review instead of alerted (`reviewer_disabled`): `pending`
+lists each one with its id and score, and `capture-evidence --release-id <id> --all` downloads it and stores its
+flagged code if you want to read it. No review input or evidence is stored, so a queued release is about 1 KB: at
+the current rules about 230 releases a day are queued, about 85 MB a year (at most about 680 a day, 250 MB a
+year). If you enable a reviewer later, queued releases are downloaded, scanned again and reviewed, up to
+`max_pending_per_tick` per tick, or all at once with `review-pending --reason reviewer_disabled`. While PyPI is
+unreachable they wait without using up a retry. A release that can no longer be downloaded stays queued as
+`review_failed` and alerts `UNREVIEWED` once its `max_review_attempts` are used up. Useful for a first pass on a
+box with no GPU and no API budget.
 
 ---
 
@@ -782,7 +797,7 @@ GPU and no API budget, or to keep monitoring when your endpoint is down.
 
 | Symptom | Cause / fix |
 |---|---|
-| `ReviewUnavailable: non-JSON content` in logs | the model isn't honoring the JSON contract. Lower `structured_output` (`json_schema` → `json_object` → `none`) or use a more capable model. The release still alerted heuristically — nothing was dropped. |
+| `ReviewUnavailable: non-JSON content` in logs | the model isn't honoring the JSON contract. Lower `structured_output` (`json_schema` → `json_object` → `none`) or use a more capable model. The release stays in the review queue — nothing was dropped. |
 | Every Anthropic run logs `heuristic-only this run` | `ANTHROPIC_API_KEY` isn't in the environment the *scheduler* uses. Put it in the systemd `EnvironmentFile` / cron wrapper / Actions secret, not just your interactive shell. |
 | `401`/`403` from a hosted endpoint | `api_key_env` names a variable that's unset, empty, or wrong. Check it from the harness's environment: `echo $OPENAI_API_KEY`. |
 | `400`/`ReviewUnavailable: HTTP Error 400` from DeepSeek (or another reasoning model) | the endpoint rejects strict `json_schema` (an OpenAI-only extension). Set `structured_output = "json_object"`. See `examples/deepseek.toml`. |

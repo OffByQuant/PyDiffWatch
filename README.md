@@ -85,11 +85,12 @@ For everything else (a frontier API with a key, reasoning-model settings, webhoo
 
 ```bash
 pydiffwatch -c pydiffwatch.toml run             # one scan tick (for cron, systemd, CI)
-pydiffwatch -c pydiffwatch.toml pending         # suspicious releases awaiting your verdict
+pydiffwatch -c pydiffwatch.toml pending         # the review queue, and suspicious releases awaiting your verdict
 pydiffwatch -c pydiffwatch.toml review-pending  # review what the LLM couldn't (e.g. with a bigger model)
 ```
 
-You can also run with **no model at all** (rules-only heuristic alerts) when you have no GPU or budget.
+You can also run with **no model at all** when you have no GPU or budget: releases the rules flag are listed by
+`pending` for you to look at, and reviewed if you add a model later.
 
 **→ Full setup — endpoints, API keys, scheduling, heuristic-only mode, troubleshooting:
 [GETTING-STARTED.md](GETTING-STARTED.md)**

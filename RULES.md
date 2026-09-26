@@ -13,7 +13,8 @@ emit YAML that conforms exactly to the schema below; do not invent predicates or
 
 For each changed release the engine builds **facts**, runs every rule whose `match` is satisfied, and
 **sums the weights** of the fired rules. If the total reaches the configured threshold (`threshold_t`,
-default 40), the release is escalated to the LLM reviewer. Weights are additive and tunable — there is no
+default 40), the release is escalated to the LLM reviewer. A rule never alerts on its own: with no
+reviewer, an escalated release waits in the review queue. Weights are additive and tunable — there is no
 magic; a rule worth 45 on its own crosses the default threshold, a rule worth 20 needs a second signal.
 A rule with `max_total` adds at most that much to one release's total, however often it fires.
 
