@@ -435,12 +435,21 @@ def pending_adjudication(conn):
            ORDER BY r.id""", UNSCANNED_STAGES).fetchall()
 
 def adjudicate(conn, release_id, label, note):
-    """Record the agent's adjudication on a verdict; returns the release row (for alerting) or None."""
-    conn.execute("UPDATE verdicts SET human_label=?, human_note=?, adjudicated_at=? WHERE release_id=?",
-                 (label, note, _now(), release_id))
+    """Record the agent's adjudication on a verdict; returns the release row (for alerting) or None. A release
+    with no verdict row (queued as reviewer_disabled or too_large, no model has seen it) gets a stand-in "not
+    reviewed" verdict carrying the label (spec R1), so a label is never a silent no-op."""
+    now = _now()
+    cur = conn.execute("UPDATE verdicts SET human_label=?, human_note=?, adjudicated_at=? WHERE release_id=?",
+                       (label, note, now, release_id))
+    rel = conn.execute("SELECT package, version, serial, triage_score, triage_rules "
+                       "FROM releases WHERE id=?", (release_id,)).fetchone()
+    if cur.rowcount == 0 and rel is not None:
+        conn.execute("INSERT INTO verdicts(release_id, classification, confidence, attack_type, reasoning, "
+                     "cited_hunk, model, urgent, created_at, human_label, human_note, adjudicated_at) "
+                     "VALUES(?, 'suspicious', 0.0, 'none', 'UNREVIEWED: no model reviewed it; labelled by a "
+                     "person.', '', 'none', 0, ?, ?, ?, ?)", (release_id, now, label, note, now))
     conn.commit()
-    return conn.execute("SELECT package, version, serial, triage_score, triage_rules "
-                        "FROM releases WHERE id=?", (release_id,)).fetchone()
+    return rel
 
 # Phase 1 LIMITATION (two issues, both fixed by PEP 440 ordering in Phase 3, spec §3.1):
 #  1. Lexicographic compare: "1.9" < "1.10" is False, so multi-digit jumps pick a wrong baseline.
