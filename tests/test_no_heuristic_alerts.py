@@ -233,7 +233,7 @@ def _queued_off(tmp_path, scan_stub, **rv):
 
 
 def _fetch(scan_stub, result):
-    """fetcher.fetch_artifacts returns `result`, or raises it; returns the list of releases it was asked for."""
+    """The pipeline's download (scan_stub.fetch) returns `result`, or raises it; returns the list of releases it was asked for."""
     asked = []
 
     def fetch(cfg, rel, **kw):
@@ -246,7 +246,7 @@ def _fetch(scan_stub, result):
 
 
 def _unavailable(cause):
-    """A MetadataUnavailable chained to its cause, as fetcher.fetch_artifacts raises it."""
+    """A MetadataUnavailable chained to its cause, as fetcher.download raises it."""
     try:
         raise fetcher.MetadataUnavailable(f"pkg: {type(cause).__name__}: {cause}") from cause
     except fetcher.MetadataUnavailable as e:

@@ -1,5 +1,5 @@
 """Confirmed-malicious packages — DiffWatch must NEVER download, process, or (under any circumstances)
-install these. This is a static denylist of supply-chain malware confirmed by review. fetch_artifacts()
+install these. This is a static denylist of supply-chain malware confirmed by review. download()
 hard-refuses any entry before a single byte is pulled, so DiffWatch won't re-ingest them on later ticks.
 
 IMPORTANT: DiffWatch has no install path of ANY kind — no pip/subprocess/extractall/import/exec/eval;

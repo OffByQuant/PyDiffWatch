@@ -124,7 +124,7 @@ def test_refused_extract_emits_suspicious_alert(tmp_cfg, monkeypatch, scan_stub)
     # A package whose sdist cannot be safely extracted must produce a suspicious alert (spec §8).
     monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: [
         NewRelease("bomb", "1.0", 7)])
-    # make extraction refuse by patching fetch_artifacts directly
+    # make extraction refuse by registering a RefusedToExtract through scan_stub
     scan_stub.fetch(lambda cfg, rel, **k: (_ for _ in ()).throw(fetcher.RefusedToExtract("bomb")))
     orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
     conn = store.connect(tmp_cfg)

@@ -10,7 +10,7 @@ from .rules import evaluate
 
 def _fire(rule, file_path, lines, loc_weight):
     w = rule.weight * (loc_weight if rule.location_scaled else 1.0)
-    return FiredRule(rule.id, w, file_path, lines), w
+    return FiredRule(rule.id, w, file_path, lines)
 
 
 def score(fired, ruleset) -> float:
@@ -30,21 +30,17 @@ def triage(diff, cfg, ruleset, maintainer_context=None) -> TriageResult:
         if rule.applies_to == "code":
             for f in facts.files:
                 if evaluate(rule.match, f):
-                    fr, _ = _fire(rule, f.path, f.lines, f.location_weight)
-                    fired.append(fr)
+                    fired.append(_fire(rule, f.path, f.lines, f.location_weight))
         elif rule.applies_to == "binary":
             for b in facts.binaries:
                 if evaluate(rule.match, b):
-                    fr, _ = _fire(rule, b.get("path", "?"), (0, 0), 1.0)
-                    fired.append(fr)
+                    fired.append(_fire(rule, b.get("path", "?"), (0, 0), 1.0))
         elif rule.applies_to == "dep":
             for dep in facts.deps:
                 if evaluate(rule.match, dep):
-                    fr, _ = _fire(rule, dep.get("name", "?"), (0, 0), 1.0)
-                    fired.append(fr)
+                    fired.append(_fire(rule, dep.get("name", "?"), (0, 0), 1.0))
         elif rule.applies_to == "maintainer":
             if evaluate(rule.match, facts.maintainer_changed):
-                fr, _ = _fire(rule, "<ownership>", (0, 0), 1.0)
-                fired.append(fr)
+                fired.append(_fire(rule, "<ownership>", (0, 0), 1.0))
     total = score(fired, ruleset)
     return TriageResult(total, fired, total >= cfg.threshold_t)

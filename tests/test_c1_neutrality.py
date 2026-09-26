@@ -3,7 +3,7 @@ what fetch_artifacts + build_diff(art, owners) + triage(d, cfg, ruleset, owners)
 (spec §4, §6). The golden files were written once from the pre-split code; never regenerate them."""
 import dataclasses, hashlib, json, os, pathlib
 
-from pydiffwatch import differ, engine, fetcher, rules
+from pydiffwatch import fetcher, rules
 from pydiffwatch.config import Config
 from pydiffwatch.models import NewRelease
 from tests.fixtures.build_fixtures import make_sdist

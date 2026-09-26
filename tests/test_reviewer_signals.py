@@ -168,7 +168,7 @@ def test_differ_lists_every_signal():
     ]
 
 
-def test_no_signals_no_block():
+def test_no_signal_data_renders_no_signal_line_and_no_block():
     assert differ.render_signals(None, [], [], None) == ""
     text = reviewer.build_review_input(Diff("p", "1.1", False, [_fd()], []), _FIRED, max_chars=10_000)
     assert "signals" not in text

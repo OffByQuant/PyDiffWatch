@@ -62,7 +62,8 @@ def scan_stub(monkeypatch):
                                 got.maintainer_metadata, list(got.added_dep_findings), got.requires_dist_change,
                                 got.description)
             arts[(package, version)] = got
-            return Download(package, version, "0", False, b"", None, None, None, [], None, None)
+            # Registered exceptions are raised by extraction; refusals are mapped before anything is recorded.
+            return Download(package, version, None, False, b"", None, None, None, [], None, None)
 
         def fetch(self, fn):
             takes_attempt = any(p.name == "attempt" or p.kind is p.VAR_KEYWORD
