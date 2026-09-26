@@ -1,0 +1,175 @@
+{
+ "first_skip": {
+  "added_binaries": [],
+  "added_dep_findings": [],
+  "artifact_hashes": {},
+  "basis": "sdist",
+  "description": "skp summary",
+  "is_new_package": true,
+  "maintainer_metadata": {
+   "author": null,
+   "maintainer": null,
+   "roles": [],
+   "upload_time": "2026-01-01T00:00:00Z"
+  },
+  "new_files": {},
+  "package": "skp",
+  "prior_error": null,
+  "prior_files": {},
+  "prior_version": null,
+  "requires_dist_change": null,
+  "surface_omitted": null,
+  "too_large": [],
+  "version": "1.0"
+ },
+ "first_surface": {
+  "added_binaries": [],
+  "added_dep_findings": [],
+  "artifact_hashes": {},
+  "basis": "sdist",
+  "description": "new summary",
+  "is_new_package": true,
+  "maintainer_metadata": {
+   "author": null,
+   "maintainer": null,
+   "roles": [],
+   "upload_time": "2026-01-01T00:00:00Z"
+  },
+  "new_files": {
+   "new/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "setup.py": "1049bed46a50254cf591a004d4c7c0f1ca44cc74617f8f01c6e666be3d4246f6"
+  },
+  "package": "new",
+  "prior_error": null,
+  "prior_files": {},
+  "prior_version": null,
+  "requires_dist_change": null,
+  "surface_omitted": 1,
+  "too_large": [],
+  "version": "1.0"
+ },
+ "no_sdist": {
+  "no_sdist": "1.0"
+ },
+ "oversized_member": {
+  "added_binaries": [
+   {
+    "path": "big/gen.py",
+    "reason": "source-too-large",
+    "sha256": "37a5b7be7a2690ce13edd2f641c8e00df560f611bf7c3277518dac9d76593623",
+    "size": 1200000
+   }
+  ],
+  "added_dep_findings": [],
+  "artifact_hashes": {},
+  "basis": "sdist",
+  "description": "big summary",
+  "is_new_package": false,
+  "maintainer_metadata": {
+   "author": null,
+   "maintainer": null,
+   "roles": [],
+   "upload_time": "2026-01-02T00:00:00Z"
+  },
+  "new_files": {
+   "big/__init__.py": "4205c4809ab1b080fd32b6bf9640e5feaa6d1b69bf9fa684954ab710157ec141"
+  },
+  "package": "big",
+  "prior_error": null,
+  "prior_files": {
+   "big/__init__.py": "9e26bf369911c45c243c684147b23fc9e1dcfcf257d299a1c632016a6fcd33f4"
+  },
+  "prior_version": "1.0",
+  "requires_dist_change": null,
+  "surface_omitted": null,
+  "too_large": [
+   "big/gen.py"
+  ],
+  "version": "1.1"
+ },
+ "prior_download_fails": {
+  "added_binaries": [],
+  "added_dep_findings": [],
+  "artifact_hashes": {},
+  "basis": "sdist",
+  "description": "pdl summary",
+  "is_new_package": false,
+  "maintainer_metadata": {
+   "author": null,
+   "maintainer": null,
+   "roles": [],
+   "upload_time": "2026-01-02T00:00:00Z"
+  },
+  "new_files": {
+   "pdl/__init__.py": "4205c4809ab1b080fd32b6bf9640e5feaa6d1b69bf9fa684954ab710157ec141"
+  },
+  "package": "pdl",
+  "prior_error": "prior 1.0 sdist unavailable (TimeoutError: prior download hung); diffed against nothing",
+  "prior_files": {},
+  "prior_version": "1.0",
+  "requires_dist_change": null,
+  "surface_omitted": null,
+  "too_large": [],
+  "version": "1.1"
+ },
+ "prior_extract_fails": {
+  "added_binaries": [],
+  "added_dep_findings": [],
+  "artifact_hashes": {},
+  "basis": "sdist",
+  "description": "pbad summary",
+  "is_new_package": false,
+  "maintainer_metadata": {
+   "author": null,
+   "maintainer": null,
+   "roles": [],
+   "upload_time": "2026-01-02T00:00:00Z"
+  },
+  "new_files": {
+   "pbad/__init__.py": "4205c4809ab1b080fd32b6bf9640e5feaa6d1b69bf9fa684954ab710157ec141"
+  },
+  "package": "pbad",
+  "prior_error": "prior 1.0 sdist unavailable (BadGzipFile: Not a gzipped file (b'no')); diffed against nothing",
+  "prior_files": {},
+  "prior_version": "1.0",
+  "requires_dist_change": null,
+  "surface_omitted": null,
+  "too_large": [],
+  "version": "1.1"
+ },
+ "update": {
+  "added_binaries": [
+   {
+    "path": "upd/_c.so",
+    "sha256": "3bdbb4fe8397cd2b842430b39ccff01a8663c751945ef5e9a09e267fb8b1d359",
+    "size": 4
+   }
+  ],
+  "added_dep_findings": [],
+  "artifact_hashes": {},
+  "basis": "sdist",
+  "description": "upd summary",
+  "is_new_package": false,
+  "maintainer_metadata": {
+   "author": null,
+   "maintainer": null,
+   "roles": [],
+   "upload_time": "2026-01-02T00:00:00Z"
+  },
+  "new_files": {
+   "setup.py": "1049bed46a50254cf591a004d4c7c0f1ca44cc74617f8f01c6e666be3d4246f6",
+   "upd/__init__.py": "4205c4809ab1b080fd32b6bf9640e5feaa6d1b69bf9fa684954ab710157ec141"
+  },
+  "package": "upd",
+  "prior_error": null,
+  "prior_files": {
+   "setup.py": "1049bed46a50254cf591a004d4c7c0f1ca44cc74617f8f01c6e666be3d4246f6",
+   "upd/__init__.py": "9e26bf369911c45c243c684147b23fc9e1dcfcf257d299a1c632016a6fcd33f4"
+  },
+  "prior_version": "1.0",
+  "requires_dist_change": null,
+  "surface_omitted": null,
+  "too_large": [],
+  "version": "1.1"
+ }
+}

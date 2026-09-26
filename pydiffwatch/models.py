@@ -24,6 +24,20 @@ class ArtifactSet:
     requires_dist_change: dict | None = None   # {"added": [...], "removed": [...]} Requires-Dist lines, when known
 
 @dataclass(frozen=True)
+class Download:
+    """One release as downloaded, before any archive is opened (fetcher.download). Parsing it is
+    fetcher.extract_download's job, which C2 moves into a sandboxed worker."""
+    package: str; version: str; prior_version: str | None
+    is_new_package: bool
+    new_blob: bytes | None          # None only for a new package under new_package_policy="skip" (not downloaded)
+    prior_blob: bytes | None        # None: no predecessor, or its download failed (prior_error says which)
+    prior_error: str | None         # the prior sdist could not be downloaded
+    maintainer_metadata: dict | None
+    added_dep_findings: list[dict]  # signal 5, screened here: the lookups need the network
+    requires_dist_change: dict | None
+    description: str | None         # the JSON info.summary; PKG-INFO's Summary replaces it once extracted
+
+@dataclass(frozen=True)
 class Hunk:
     old_range: tuple[int, int]; new_range: tuple[int, int]
     added: list[str]; removed: list[str]

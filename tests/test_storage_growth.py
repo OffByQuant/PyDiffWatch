@@ -162,15 +162,17 @@ def test_config_defaults_and_toml(tmp_path):
     assert (cfg.retention_days, cfg.prune_every_hours) == (0, 6.0)
 
 
-def test_a_release_below_the_review_threshold_stores_no_evidence(tmp_path, monkeypatch):
-    from pydiffwatch import engine, reviewer
+def test_a_release_below_the_review_threshold_stores_no_evidence(tmp_path, monkeypatch, scan_stub):
+    from pydiffwatch import differ, reviewer, sandbox
     cfg, conn = _db(tmp_path)
-    monkeypatch.setattr(engine, "triage",
-                        lambda *a, **k: TriageResult(10.0, [FiredRule("exec", 10.0, "setup.py", (1, 1))], False))
-    monkeypatch.setattr(reviewer, "build_evidence", lambda *a, **k: _EV)
     art = ArtifactSet("quiet", "1.1", "1.0", "sdist", {"setup.py": b"exec(x)\n"}, {"setup.py": b"x\n"}, {},
                       added_binaries=[], is_new_package=False, maintainer_metadata=None, added_dep_findings=[])
-    orchestrator._process_fetched(cfg, conn, None, orchestrator._load_ruleset(cfg), NewRelease("quiet", "1.1", 5), art)
+    monkeypatch.setattr(sandbox, "analyze",
+                        lambda cfg, dl, owners, ruleset, backend=None: (differ.build_diff(art),
+                        TriageResult(10.0, [FiredRule("exec", 10.0, "setup.py", (1, 1))], False), None))
+    monkeypatch.setattr(reviewer, "build_evidence", lambda *a, **k: _EV)
+    orchestrator._process_fetched(cfg, conn, None, orchestrator._load_ruleset(cfg), NewRelease("quiet", "1.1", 5),
+                                  scan_stub.dl(art))
     assert conn.execute("SELECT evidence FROM releases WHERE package='quiet'").fetchone()[0] is None
 
 

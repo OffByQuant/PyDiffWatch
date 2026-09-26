@@ -120,13 +120,12 @@ def test_e2e_maintainer_metadata_persisted_and_change_detected(tmp_cfg, monkeypa
     assert set(store.get_release_metadata(conn, "acme", "1.1")["roles"]) == {"alice", "mallory"}
     conn.close()
 
-def test_refused_extract_emits_suspicious_alert(tmp_cfg, monkeypatch):
+def test_refused_extract_emits_suspicious_alert(tmp_cfg, monkeypatch, scan_stub):
     # A package whose sdist cannot be safely extracted must produce a suspicious alert (spec §8).
     monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: [
         NewRelease("bomb", "1.0", 7)])
-    # make extraction refuse by patching fetch_artifacts directly
-    monkeypatch.setattr(fetcher, "fetch_artifacts",
-                        lambda cfg, rel, **k: (_ for _ in ()).throw(fetcher.RefusedToExtract("bomb")))
+    # make extraction refuse by registering a RefusedToExtract through scan_stub
+    scan_stub.fetch(lambda cfg, rel, **k: (_ for _ in ()).throw(fetcher.RefusedToExtract("bomb")))
     orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
     conn = store.connect(tmp_cfg)
     stage = conn.execute("SELECT stage FROM releases WHERE package='bomb'").fetchone()[0]
@@ -136,7 +135,7 @@ def test_refused_extract_emits_suspicious_alert(tmp_cfg, monkeypatch):
     assert alert is not None and alert[0] == "suspicious-heuristic"
     conn.close()
 
-def test_transient_fetch_error_is_retryable_not_poison(tmp_cfg, monkeypatch):
+def test_transient_fetch_error_is_retryable_not_poison(tmp_cfg, monkeypatch, scan_stub):
     # A transient (non-RefusedTo*) error mid-batch must NOT abort the tick, must NOT pin the cursor at the
     # failed release, and must be reprocessed+alerted on a later tick from the retry queue (no silent drop).
     import urllib.error
@@ -155,7 +154,7 @@ def test_transient_fetch_error_is_retryable_not_poison(tmp_cfg, monkeypatch):
         from pydiffwatch.models import ArtifactSet
         files, bins = fetcher.extract_sdist(blob, cfg)
         return ArtifactSet(rel.package, rel.version, None, "sdist", files, {}, {}, bins)
-    monkeypatch.setattr(fetcher, "fetch_artifacts", flaky_fetch)
+    scan_stub.fetch(flaky_fetch)
 
     n1 = orchestrator.run_once(tmp_cfg, seed_if_fresh=False)   # tick 1: good ok, victimx fails transiently
     assert n1 == 3

