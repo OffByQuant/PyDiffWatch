@@ -185,13 +185,13 @@ def test_a_model_busy_park_is_silent(tmp_path, monkeypatch):
     assert be.calls == []
 
 
-def test_a_review_that_raises_in_process_fetched_parks_silently(tmp_path, monkeypatch):
+def test_a_review_that_raises_in_process_fetched_parks_silently(tmp_path, monkeypatch, scan_stub):
     emitted = _emitted(monkeypatch)
     cfg, conn, rid, rvw = _setup(tmp_path, _Backend())
     monkeypatch.setattr(orchestrator.sandbox, "analyze", lambda cfg, dl, owners, ruleset, backend=None: (_diff(), _T, None))
     monkeypatch.setattr(rvw, "prepare", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("prepare broke")))
     orchestrator._process_fetched(cfg, conn, rvw, None, NewRelease("pkg", "1.0.0", 1),
-                                  ArtifactSet("pkg", "1.0.0", "0.9", "sdist", {}, {}, {}))
+                                  scan_stub.dl(ArtifactSet("pkg", "1.0.0", "0.9", "sdist", {}, {}, {})))
     _assert_quiet(conn, emitted, "review_failed")
 
 

@@ -283,18 +283,18 @@ def test_lowering_max_review_attempts_still_warns_once(tmp_path, capsys):
     assert [i["not_scanned"] for i in orchestrator.list_pending(cfg)] == ["review_failed"]
 
 
-def _escalating(monkeypatch):
+def _escalating(monkeypatch, scan_stub):
     monkeypatch.setattr(orchestrator.sandbox, "analyze",
                         lambda cfg, dl, owners, ruleset, backend=None: (_diff(), _T, None))
-    return ArtifactSet("pkg", "1.0.0", "0.9", "sdist", {}, {}, {})
+    return scan_stub.dl(ArtifactSet("pkg", "1.0.0", "0.9", "sdist", {}, {}, {}))
 
 
-def test_a_late_review_exception_parks_the_release_and_later_exhausts(tmp_path, capsys, monkeypatch):
+def test_a_late_review_exception_parks_the_release_and_later_exhausts(tmp_path, capsys, monkeypatch, scan_stub):
     # D20: the download and scan succeeded, so an exception in the review must not refetch the release. It is
     # parked as a failed review attempt; the auto-drain retries it and the exhaustion alert still fires.
     be = _Backend(fail=_TIMEOUT)
     cfg, conn, rid, rvw = _setup(tmp_path, be)
-    art = _escalating(monkeypatch)
+    art = _escalating(monkeypatch, scan_stub)
     real = rvw.review_text
     monkeypatch.setattr(rvw, "review_text", lambda *a, **k: (_ for _ in ()).throw(KeyError("confidence")))
     assert orchestrator._process_fetched(cfg, conn, rvw, None, NewRelease("pkg", "1.0.0", 1), art)
@@ -309,10 +309,10 @@ def test_a_late_review_exception_parks_the_release_and_later_exhausts(tmp_path, 
     assert store.get_stage(conn, "pkg", "1.0.0") == "pending_review" and len(be.calls) == 1
 
 
-def test_an_exception_while_preparing_the_review_parks_instead_of_refetching(tmp_path, capsys, monkeypatch):
+def test_an_exception_while_preparing_the_review_parks_instead_of_refetching(tmp_path, capsys, monkeypatch, scan_stub):
     # D20, outside the model call: the parked row carries a review input the auto-drain can re-drive.
     cfg, conn, rid, rvw = _setup(tmp_path, _Backend())
-    art = _escalating(monkeypatch)
+    art = _escalating(monkeypatch, scan_stub)
     monkeypatch.setattr(rvw, "prepare", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("prepare broke")))
     assert orchestrator._process_fetched(cfg, conn, rvw, None, NewRelease("pkg", "1.0.0", 1), art)
     [row] = store.pending_reviews(conn)
@@ -330,11 +330,11 @@ def _boom(*a, **k):
 
 
 @pytest.mark.parametrize("target", ["build_review_input", "build_evidence"])
-def test_a_failure_after_triage_still_gives_up_with_its_alert(tmp_path, capsys, monkeypatch, target):
+def test_a_failure_after_triage_still_gives_up_with_its_alert(tmp_path, capsys, monkeypatch, target, scan_stub):
     # Review finding 1: the failure count was reset right after triage, before the evidence and review steps
     # (both parse attacker-controlled diff content), so a deterministic crash there retried forever, silently.
     cfg, conn, rid, rvw = _setup(tmp_path, _Backend())
-    art = _escalating(monkeypatch)
+    art = _escalating(monkeypatch, scan_stub)
     monkeypatch.setattr(reviewer, target, _boom)
     rel = NewRelease("pkg", "1.0.0", 1)
     seen = []

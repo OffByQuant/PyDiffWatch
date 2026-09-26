@@ -143,3 +143,16 @@ def test_backfill_of_a_first_release_keeps_the_whole_tree_under_surface(tmp_path
     scan_stub.fetch(lambda cfg, rel: art)
     orchestrator.backfill_evidence(cfg, rid, all_flagged=True)
     assert seen["dl"].prior_version is None and seen["dl"].is_new_package is False
+
+
+def test_a_corrupt_new_sdist_records_the_baseline_and_owners(tmp_path):
+    # R2 (Task 6 review): before the split this failed in the fetch thread and recorded neither; now analyze fails
+    # and the crash branch records what the download established
+    from pydiffwatch.models import Download
+    cfg = _cfg(tmp_path)
+    conn = store.connect(cfg); store.init_schema(conn)
+    dl = Download("p", "1.1", "1.0", False, b"not a gzip", None, None, {"roles": ["alice"]}, [], None, None)
+    orchestrator._process_fetched(cfg, conn, None, orchestrator._load_ruleset(cfg), NewRelease("p", "1.1", 5), dl)
+    row = conn.execute("SELECT stage, prior_version, maintainer_metadata, fetch_note FROM releases").fetchone()
+    assert tuple(row)[:3] == ("metadata_retry", "1.0", '{"roles": ["alice"]}')
+    assert "BadGzipFile" in row[3]
