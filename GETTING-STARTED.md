@@ -789,7 +789,8 @@ the current rules about 230 releases a day are queued, about 85 MB a year (at mo
 year). If you enable a reviewer later, queued releases are downloaded, scanned again and reviewed, up to
 `max_pending_per_tick` per tick, or all at once with `review-pending --reason reviewer_disabled`. Stop `watch`
 first, or leave it to `watch`'s own drain: running both downloads the same releases twice. While PyPI is
-unreachable they wait without using up a retry. A release that can no longer be downloaded stays queued as
+unreachable they wait without using up a retry; a download that stalls past its deadline uses one retry, and
+the rest wait for the next tick. A release that can no longer be downloaded stays queued as
 `review_failed` and alerts `UNREVIEWED` once its `max_review_attempts` are used up. Useful for a first pass on a
 box with no GPU and no API budget.
 
