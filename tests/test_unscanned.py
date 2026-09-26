@@ -481,7 +481,7 @@ def test_a_first_park_over_the_cold_start_cap_is_silent(tmp_path, capsys):
     be = _Backend()
     cfg, conn, rid, rvw = _setup(tmp_path, be)
     gd = guard_mod.ReviewerGuard(cfg, be, conn, memory=None, out=lambda m: None)
-    assert gd.cap_is_provisional()
+    assert gd.input_cap_chars() == guard_mod.COLD_START_CAP
     orchestrator._review_escalated(cfg, conn, rvw, _diff("x" * 60_000), _T, rid, guard=gd)
     assert store.pending_reviews(conn)[0]["pending_reason"] == "too_large" and be.calls == []
     assert _alerts(conn, "pkg") == []

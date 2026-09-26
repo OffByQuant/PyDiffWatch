@@ -245,6 +245,9 @@ def test_one_oversized_source_alone_goes_to_no_content_not_malicious(tmp_path):
 
 # The only functions in orchestrator.py that may call notifier.emit (spec B §4): _record (the model's malicious and
 # the weak-malicious suspicious), _alert_unscanned (could-not-scan outcomes, never malicious) and adjudicate.
+# This guard parses orchestrator.py only and catches direct `emit(...)` calls only: an alias, a `getattr`, or a new
+# path through an allowed function (e.g. a new caller of _alert_unscanned) is caught only by the behavioural tests
+# in test_no_heuristic_alerts.py.
 EMITTERS = {"_record", "_alert_unscanned", "adjudicate"}
 
 

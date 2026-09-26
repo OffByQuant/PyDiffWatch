@@ -139,7 +139,6 @@ class _Deferring:
     """A reviewer guard that admits nothing: the release parks as model_busy."""
     def input_cap_chars(self): return 200_000
     def cap_explain(self): return "cap 200000"
-    def cap_is_provisional(self): return False
     def admit(self): return "breaker open after a timeout"
 
 
@@ -170,7 +169,7 @@ def test_a_provisional_too_large_park_is_silent(tmp_path, monkeypatch):
     be = _Backend()
     cfg, conn, rid, rvw = _setup(tmp_path, be)
     gd = guard_mod.ReviewerGuard(cfg, be, conn, memory=None, out=lambda m: None)
-    assert gd.cap_is_provisional()
+    assert gd.input_cap_chars() == guard_mod.COLD_START_CAP
     orchestrator._review_escalated(cfg, conn, rvw, _diff("x" * 60_000), _T, rid, guard=gd)
     _assert_quiet(conn, emitted, "too_large")
 

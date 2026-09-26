@@ -340,7 +340,7 @@ def _alert_unscanned(cfg, conn, rid, package, version, note, *, stage, score=0.0
 
     - `note` is the alert's reasoning. By convention it starts `UNREVIEWED:` and ends `Not scanned. Needs
       manual review.` (refusals and `metadata_gone` keep their own endings).
-    - `stage` names the outcome (`refused_to_fetch`, `too_large`, `gave_up`, ...). The alert is
+    - `stage` names the outcome (`refused_to_fetch`, `no_sdist`, `gave_up`, ...). The alert is
       `suspicious-heuristic`, deduped on package|version|suspicious-heuristic|unscanned:<stage>, so it fires
       once per outcome, and never again on a re-tick.
     - `queue=True` records the UNREVIEWED verdict (`suspicious`, model `none`), so the release waits in

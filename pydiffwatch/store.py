@@ -242,10 +242,10 @@ def clear_pending(conn, release_id):
 
 def pending_reviews(conn, reasons=None, max_chars=None, max_attempts=None, with_input=True):
     """Rows parked for review and not labelled by a person, optionally only those with `reasons` or input at most
-    `max_chars`. With
-    `max_attempts`, a review_failed row with that many attempts that has already warned (has a verdict) is left
-    out: the auto-drain never retries it. `with_input=False` leaves the stored input out (review_input(row, conn)
-    loads it). `has_verdict` says whether a row has a verdict; `review_input_chars` is the input's length."""
+    `max_chars`. With `max_attempts`, a review_failed row with that many attempts that has already warned (has a
+    verdict) is left out: the auto-drain never retries it. `with_input=False` leaves the stored input out
+    (review_input(row, conn) loads it). `has_verdict` says whether a row has a verdict; `review_input_chars` is the
+    input's length."""
     sql = ("SELECT id AS release_id, package, version, triage_score, triage_rules, pending_reason, "
            "pending_detail, COALESCE(review_attempts,0) AS review_attempts, review_input_chars, "
            + ("review_input, " if with_input else "") +
