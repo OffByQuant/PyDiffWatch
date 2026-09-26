@@ -210,10 +210,9 @@ def _alert_review_exhausted(cfg, conn, rid, package, version, n, err, score, fir
 
 
 def _review_escalated(cfg, conn, rvw, d, tr, rid, *, offline=False, guard=None):
-    if rvw is None:
-        notifier.emit(cfg, conn, Verdict(d.package, d.version, "suspicious-heuristic",
-                                         tr.score, tr.fired_rules, False), rid)
-        store.update_stage(conn, rid, "alerted", tr.score, None)
+    if rvw is None:     # queued with no input and no evidence (spec decision 3): the drain rebuilds both
+        store.park_for_review(conn, rid, "reviewer_disabled", "no reviewer this run (reviewer_enabled = false, or "
+                              "the anthropic backend has no ANTHROPIC_API_KEY)", "")
         return
     try:
         text = rvw.prepare(d, tr, cap=guard.input_cap_chars() if guard is not None else None)
@@ -472,7 +471,8 @@ def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=
                            json.dumps([r.__dict__ for r in tr.fired_rules]))
         # Persist the flagged payload code itself (not just file:line metadata) so the DB is a
         # self-contained takedown-report source that survives the package being pulled from PyPI.
-        ev = reviewer.build_evidence(d, tr, max_chars=cfg.evidence_max_chars) if tr.escalate else None
+        ev = (reviewer.build_evidence(d, tr, max_chars=cfg.evidence_max_chars)
+              if tr.escalate and rvw is not None else None)   # reviewer off: the drain's rebuild stores it
         if ev:      # below the review threshold nobody acts on the release, so its code isn't kept
             store.update_evidence(conn, rid, ev)
         if tr.escalate:

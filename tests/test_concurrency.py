@@ -101,5 +101,5 @@ def test_concurrency_outcome_matches_serial(tmp_path, monkeypatch):
     parallel = run_at(8, tmp_path / "parallel")
     assert serial == parallel
     assert serial[2] == 13                                   # cursor advanced to the last serial
-    assert ("victim", "1.1", "suspicious-heuristic") in serial[1]   # malicious update alerted
+    assert serial[1] == [] and serial[0]["victim@1.1"] == "pending_review"   # queued for a model, no alert
     assert ("safe", "1.0") not in [(p, v) for (p, v, _) in serial[1]]   # benign silent
