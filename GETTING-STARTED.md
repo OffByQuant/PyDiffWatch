@@ -445,9 +445,10 @@ pydiffwatch -c frontier.toml review-pending --reason reviewer_disabled   # queue
 
 `frontier.toml` is any reviewer config (e.g. `examples/anthropic.toml`) with the same `db_path` and a
 larger `max_input_chars`. `pending` shows the queue counts and lists each queued release (id, score, reason;
-the oldest 50); the dashboard shows them in its status strip. A release with **no** reviewable text at all
-(only binary / oversized-member / maintainer signals) is not queued: no model can review it, so it goes
-straight to `pending` for a human.
+the oldest 50); the dashboard shows them in its status strip. With the reviewer on, a release with **no**
+reviewable text at all (only binary / oversized-member / maintainer signals) is not queued: no model can review
+it, so it goes straight to `pending` for a human. With the reviewer off it waits in the queue as
+`reviewer_disabled` like any other (see §11, heuristic-only mode).
 
 **Model protection.** The reviewer measures your endpoint and adapts to it, so a slow or struggling
 model server isn't overloaded — the guard's own state (measured speed, breaker, degradation) is stored
@@ -786,7 +787,8 @@ lists each one with its id and score, and `capture-evidence --release-id <id> --
 flagged code if you want to read it. No review input or evidence is stored, so a queued release is about 1 KB: at
 the current rules about 230 releases a day are queued, about 85 MB a year (at most about 680 a day, 250 MB a
 year). If you enable a reviewer later, queued releases are downloaded, scanned again and reviewed, up to
-`max_pending_per_tick` per tick, or all at once with `review-pending --reason reviewer_disabled`. While PyPI is
+`max_pending_per_tick` per tick, or all at once with `review-pending --reason reviewer_disabled`. Stop `watch`
+first, or leave it to `watch`'s own drain: running both downloads the same releases twice. While PyPI is
 unreachable they wait without using up a retry. A release that can no longer be downloaded stays queued as
 `review_failed` and alerts `UNREVIEWED` once its `max_review_attempts` are used up. Useful for a first pass on a
 box with no GPU and no API budget.

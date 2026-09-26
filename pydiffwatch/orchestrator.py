@@ -328,15 +328,20 @@ def _drain_one(cfg, conn, rvw, row, *, auto, cap, guard, drain):
         return False, True
     if chars == 0:     # a reviewer_disabled park stored no input (a real input is never empty): rebuild it
         if drain["pypi_down"]:
-            return False, True      # one download per drain while PyPI is unreachable
+            return False, True      # one download per drain while PyPI is unreachable or stalling
+        if guard is not None and (why := guard.admit()):
+            _park(conn, rid, "model_busy", why, None)       # no download for a review the guard would not send
+            return False, False
         if drain["ruleset"] is None:
             drain["ruleset"] = _load_ruleset(cfg)
         got = _rebuild_review_input(cfg, conn, rvw, row, drain["ruleset"], cap)
-        if got == "unreachable":
+        if got in ("unreachable", "timeout"):
             drain["pypi_down"] = True
         if isinstance(got, str):
             return True, True       # the download counts as a try for `limit`
         tr, text = got
+        # Stored before the model call, as _review_escalated does: a kill mid-review does not download it again.
+        _park_auto(conn, rid, "in_review", "the review was interrupted before it finished", text)
         return True, _attempt_review(cfg, conn, rvw, rid, row["package"], row["version"], tr.score,
                                      tr.fired_rules, text, guard, dropped=rvw.dropped_files)
     text = store.review_input(row, conn)
@@ -363,8 +368,11 @@ def _rebuild_review_input(cfg, conn, rvw, row, ruleset, cap):
     """Download and scan a queued release again, for the review input its reviewer_disabled park did not store
     (spec §3.3), with the current rules. Returns (triage, text); "cleared" (the current rules do not escalate it:
     stage `triaged`, no attempt spent, no alert); "failed" (a definitive failure, counted as a failed review
-    attempt, or an input over `cap`, re-parked as too_large); or "unreachable" (PyPI is down: re-parked under its
-    reason, no attempt spent)."""
+    attempt, or an input over `cap`, re-parked as too_large); "timeout" (a definitive failure caused by a
+    TimeoutError: counted like "failed", and the drain rebuilds nothing more, as for a stalling PyPI); or
+    "unreachable" (PyPI is down: re-parked under its reason, no attempt spent). Attempt k downloads with k times
+    the deadlines (fetcher.fetch_artifacts), as the scan's retry sweep does, so a later attempt can hold a tick
+    longer."""
     rid, pkg, ver = row["release_id"], row["package"], row["version"]
 
     def failed(why):
@@ -372,7 +380,8 @@ def _rebuild_review_input(cfg, conn, rvw, row, ruleset, cap):
                        f"{_REBUILD_FAILED} to review ({why})")
         return "failed"
     try:
-        art = fetcher.fetch_artifacts(cfg, NewRelease(pkg, ver, row["serial"]))
+        art = fetcher.fetch_artifacts(cfg, NewRelease(pkg, ver, row["serial"]),
+                                      attempt=row["review_attempts"] + 1)
         if art is None or isinstance(art, fetcher.NoSdist):
             return failed("no sdist on PyPI")
         prior_meta = store.get_release_metadata(conn, pkg, art.prior_version) if art.prior_version else None
@@ -384,7 +393,8 @@ def _rebuild_review_input(cfg, conn, rvw, row, ruleset, cap):
             store.set_pending_reason(conn, rid, row["pending_reason"], f"could not reach PyPI to download it "
                                      f"again; retried next tick ({type(e).__name__}: {e})")
             return "unreachable"
-        return failed(f"{type(e).__name__}: {e}")
+        failed(f"{type(e).__name__}: {e}")
+        return "timeout" if isinstance(e.__cause__ if e.__cause__ is not None else e, TimeoutError) else "failed"
     rules = json.dumps([r.__dict__ for r in tr.fired_rules])
     if not tr.escalate:     # the current rules clear it: nothing for a model to confirm, nothing to alert
         store.clear_pending(conn, rid)

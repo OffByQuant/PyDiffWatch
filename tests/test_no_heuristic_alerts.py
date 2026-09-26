@@ -377,10 +377,89 @@ def test_a_pypi_outage_costs_one_download_per_drain_and_stored_inputs_are_still_
     assert sorted(store.pending_review_counts(conn).items()) == [("reviewer_disabled", 3)]
 
 
-def test_a_rebuilt_input_the_guard_defers_is_stored_and_never_downloaded_twice(tmp_path, monkeypatch):
+def test_a_pypi_read_stall_spends_one_attempt_per_drain_not_one_per_row(tmp_path, monkeypatch):
+    """Final review I2: a definitive TimeoutError still spends its attempt, but stops the drain's other rebuilds."""
+    cfg, conn, first = _queued_off(tmp_path)
+    for i, pkg in enumerate(("q2", "q3")):
+        _queue_disabled(conn, store.record_release(conn, pkg, "1.0", 10 + i, False, None, "sdist"))
+    asked = _fetch(monkeypatch, TimeoutError("sdist read stalled"))
+    rvw = reviewer.Reviewer(cfg, backend=_Backend())
+
+    def attempts():
+        return dict(conn.execute("SELECT id, COALESCE(review_attempts,0) FROM releases").fetchall())
+    orchestrator.drain_pending(cfg, conn, rvw, auto=True)
+    got = attempts()
+    assert got[first] == 1 and sorted(got.values()) == [0, 0, 1] and len(asked) == 1
+    assert conn.execute("SELECT count(*) FROM alerts").fetchone()[0] == 0
+    for n in (2, 3):
+        orchestrator.drain_pending(cfg, conn, rvw, auto=True)
+        assert len(asked) == n       # one download per drain
+    got = attempts()
+    assert got[first] == cfg.reviewer.max_review_attempts and sorted(got.values()) == [0, 0, 3]
+    assert [k for (k,) in conn.execute("SELECT dedupe_key FROM alerts")] == \
+        ["pkg|1.1|suspicious-heuristic|unscanned:review_failed"]
+
+
+def test_a_rebuild_downloads_with_the_attempt_it_is_on(tmp_path, monkeypatch):
+    """Final review I1: attempt k of a rebuild gets the scaled deadlines the scan's retry sweep uses."""
+    cfg, conn, rid = _queued_off(tmp_path)
+    seen = []
+
+    def fetch(cfg, rel, attempt=1):
+        seen.append(attempt)
+        if len(seen) == 1:
+            raise fetcher.MetadataGone("pkg: PyPI metadata returned 404")
+        return _art()
+    monkeypatch.setattr(fetcher, "fetch_artifacts", fetch)
+    rvw = reviewer.Reviewer(cfg, backend=_Backend())
+    orchestrator.drain_pending(cfg, conn, rvw, auto=True)
+    assert store.pending_reviews(conn)[0]["review_attempts"] == 1
+    orchestrator.drain_pending(cfg, conn, rvw, auto=True)
+    assert seen == [1, 2] and store.get_stage(conn, "pkg", "1.1") == "reviewed"
+
+
+def test_a_rebuilt_input_is_stored_before_the_review_so_a_crash_does_not_download_it_again(tmp_path, monkeypatch):
+    """Final review M1: a kill mid-review leaves the rebuilt input queued as in_review."""
+    cfg, conn, rid = _queued_off(tmp_path)
+    asked = _fetch(monkeypatch, _art())
+    crash = _Backend()
+    crash.complete = lambda **kw: (_ for _ in ()).throw(KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=crash), auto=True)
+    [row] = store.pending_reviews(conn)
+    assert row["pending_reason"] == "in_review" and "os.system" in store.review_input(row)
+    be = _Backend()
+    orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=be), auto=True)
+    assert len(asked) == 1 and len(be.calls) == 1 and store.get_stage(conn, "pkg", "1.1") == "reviewed"
+
+
+def test_a_busy_guard_defers_a_rebuild_before_it_downloads(tmp_path, monkeypatch):
+    """Final review M2: no download for a review the guard would not send."""
     cfg, conn, rid = _queued_off(tmp_path)
     asked = _fetch(monkeypatch, _art())
     orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=_Backend()), auto=True, guard=_Deferring())
+    [row] = store.pending_reviews(conn)
+    assert asked == [] and (row["pending_reason"], row["review_input_chars"]) == ("model_busy", 0)
+    assert row["pending_detail"] == "breaker open after a timeout"
+    be = _Backend()
+    orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=be), auto=True)
+    assert len(asked) == 1 and len(be.calls) == 1 and store.get_stage(conn, "pkg", "1.1") == "reviewed"
+
+
+class _DeferAfterFirst(_Deferring):
+    """Admits once (the rebuild's check), then defers (the review's check)."""
+    def __init__(self): self.n = 0
+
+    def admit(self):
+        self.n += 1
+        return None if self.n == 1 else super().admit()
+
+
+def test_a_rebuilt_input_the_guard_defers_is_stored_and_never_downloaded_twice(tmp_path, monkeypatch):
+    cfg, conn, rid = _queued_off(tmp_path)
+    asked = _fetch(monkeypatch, _art())
+    orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=_Backend()), auto=True,
+                               guard=_DeferAfterFirst())
     [row] = store.pending_reviews(conn)
     assert row["pending_reason"] == "model_busy" and "os.system" in store.review_input(row)
     be = _Backend()
@@ -475,7 +554,7 @@ def _http(code):
 
 
 @pytest.mark.parametrize("cause, transient", [
-    (TimeoutError("package JSON took longer than 30s"), False),
+    (TimeoutError("package JSON took longer than 30s"), "stall"),
     (json.JSONDecodeError("Expecting value", "<html>", 0), False),
     (_http(403), False),
     (_http(410), False),
@@ -490,10 +569,15 @@ def test_a_metadata_failure_is_classified_by_its_cause(tmp_path, monkeypatch, ca
     monkeypatch.setattr(fetcher, "_package_json", lambda pkg, c: asked.append(pkg) or (_ for _ in ()).throw(cause))
     orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=_Backend()), auto=True)
     rows = store.pending_reviews(conn)
-    if transient:      # no attempt, and the drain downloads nothing more (pypi_down)
+    if transient is True:      # no attempt, and the drain downloads nothing more (pypi_down)
         assert asked == ["pkg"]
         assert [(r["pending_reason"], r["review_attempts"]) for r in rows] == [("reviewer_disabled", 0)] * 2
         assert rows[0]["pending_detail"].startswith("could not reach PyPI to download it again")
+    elif transient == "stall":     # one attempt, and the drain downloads nothing more (final review I2)
+        assert asked == ["pkg"]
+        assert [(r["pending_reason"], r["review_attempts"]) for r in rows] == \
+            [("review_failed", 1), ("reviewer_disabled", 0)]
+        assert "could not download and scan it again to review (MetadataUnavailable: " in rows[0]["pending_detail"]
     else:              # one attempt, and the next row is still rebuilt
         assert asked == ["pkg", "q2"]
         assert [(r["pending_reason"], r["review_attempts"]) for r in rows] == [("review_failed", 1)] * 2

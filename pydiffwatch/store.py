@@ -379,7 +379,9 @@ _QUEUED = ("stage='pending_review' AND "
 
 def queued_releases(conn, limit):
     """(rows, total): the oldest `limit` releases queued for LLM review with no verdict, and how many there are.
-    Two bounded reads on the releases_stage index, however long the queue."""
+    Both reads use the releases_stage index. The rows returned are bounded by `limit`, but the ORDER BY sorts the
+    whole matching set before its LIMIT, and the count walks it too (about 22 ms at 84k queued rows, per the
+    orchestrator._queued_rows note)."""
     rows = conn.execute("SELECT id AS release_id, package, version, triage_score, pending_reason FROM releases "
                         f"WHERE {_QUEUED} ORDER BY id LIMIT ?", (limit,)).fetchall()
     return rows, conn.execute(f"SELECT count(*) FROM releases WHERE {_QUEUED}").fetchone()[0]
