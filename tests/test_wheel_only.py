@@ -225,13 +225,14 @@ def test_a_stale_json_on_the_merged_sdist_event_is_rescanned_when_due(tmp_cfg, m
     assert store.get_stage(conn, "r", "1.1") == "triaged" and _alerts(conn, "r") == []
 
 
-def test_an_sdist_upload_for_a_release_that_was_never_no_sdist_fetches_nothing(tmp_cfg, monkeypatch):
+def test_an_sdist_upload_for_a_release_that_was_never_no_sdist_fetches_nothing(tmp_cfg, monkeypatch, request):
     _pypi(monkeypatch, {"n": _meta("n", BOTH)})
     _feed(monkeypatch, [NewRelease("n", "1.1", 10)])
-    orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
+    orchestrator.run_once(tmp_cfg, seed_if_fresh=False)   # a real fetch + extract, before scan_stub patches extract_download
     conn = store.connect(tmp_cfg)
     assert store.get_stage(conn, "n", "1.1") == "triaged"
-    monkeypatch.setattr(fetcher, "fetch_artifacts", lambda *a, **k: (_ for _ in ()).throw(AssertionError("refetched")))
+    scan_stub = request.getfixturevalue("scan_stub")   # only now: guard the next fetch without touching the real one above
+    scan_stub.fetch(lambda *a, **k: (_ for _ in ()).throw(AssertionError("refetched")))
     _feed(monkeypatch, [NewRelease("n", "1.1", 11, new_release=False, sdist_upload=True),     # its own sdist upload
                         NewRelease("unseen", "2.0", 12, new_release=False, sdist_upload=True)])  # never recorded
     orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
@@ -285,7 +286,7 @@ def test_parking_in_the_wait_logs_once_with_the_due_time(tmp_cfg, caplog):
     assert "sw==1.1" in rec.getMessage() and due in rec.getMessage()
 
 
-def test_a_due_wait_row_is_not_starved_by_a_backlog_of_failing_retries(tmp_cfg, monkeypatch):
+def test_a_due_wait_row_is_not_starved_by_a_backlog_of_failing_retries(tmp_cfg, monkeypatch, scan_stub):
     # (f): 45 older releases keep failing; they used to fill LIMIT 20 (ordered by serial) every tick.
     conn = store.connect(tmp_cfg); store.init_schema(conn)
     for i in range(45):
@@ -298,12 +299,12 @@ def test_a_due_wait_row_is_not_starved_by_a_backlog_of_failing_retries(tmp_cfg, 
         if rel.package == "sw":
             return fetcher.NoSdist(switched_from="1.0")
         raise TimeoutError("still down")
-    monkeypatch.setattr(fetcher, "fetch_artifacts", fetch)
+    scan_stub.fetch(fetch)
     orchestrator._retry_metadata(tmp_cfg, conn, None, None, False, None)
     assert store.get_stage(conn, "sw", "1.1") == "no_sdist"       # decided on the first tick
 
 
-def test_the_retry_sweep_stops_at_its_time_budget_and_leaves_the_rest_for_next_tick(tmp_cfg, monkeypatch):
+def test_the_retry_sweep_stops_at_its_time_budget_and_leaves_the_rest_for_next_tick(tmp_cfg, monkeypatch, scan_stub):
     # Review finding 2: with deadlines x attempt, 40 trickling rows could hold the scan lock for hours before
     # ingest. The sweep stops starting windows once packument_deadline_s has passed; the rest waits a tick.
     # Rows tried most come first (fix round 2), so a row once started reaches gave_up within 4 ticks.
@@ -318,7 +319,7 @@ def test_the_retry_sweep_stops_at_its_time_budget_and_leaves_the_rest_for_next_t
         with lock:
             clock[0] += 200.0                      # each fetch trickles for 200 s
         raise TimeoutError("trickling")
-    monkeypatch.setattr(fetcher, "fetch_artifacts", fetch)
+    scan_stub.fetch(fetch)
 
     def attempts():
         return sorted(r[0] for r in conn.execute("SELECT fetch_attempts FROM releases"))
@@ -330,7 +331,7 @@ def test_the_retry_sweep_stops_at_its_time_budget_and_leaves_the_rest_for_next_t
     assert attempts() == [0] * (10 - W) + [2] * W          # next tick: the most-tried rows go first
 
 
-def test_a_steady_inflow_of_new_failures_does_not_starve_older_retries(tmp_cfg, monkeypatch):
+def test_a_steady_inflow_of_new_failures_does_not_starve_older_retries(tmp_cfg, monkeypatch, scan_stub):
     # Fix round 2 (the reviewer's scratch test): least-tried-first kept every new failure (attempt 1) ahead of
     # older rows, so under a steady inflow the older rows were never retried, never gave up and never alerted.
     import threading
@@ -348,7 +349,7 @@ def test_a_steady_inflow_of_new_failures_does_not_starve_older_retries(tmp_cfg, 
         with lock:
             clock[0] += 200.0
         raise TimeoutError("trickling")
-    monkeypatch.setattr(fetcher, "fetch_artifacts", fetch)
+    scan_stub.fetch(fetch)
     serial = 100
     for tick in range(30):
         for j in range(W):            # this tick's ingest: W new releases fail -> metadata_retry at attempt 1

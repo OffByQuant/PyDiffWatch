@@ -26,8 +26,9 @@ def _queue_disabled(conn, rid, score=_T.score):
 
 # --- R1: adjudicating a queued release with no verdict row ------------------------------------------------
 
-def test_adjudicating_a_verdictless_queued_release_writes_a_stand_in_and_alerts_once(tmp_path, capsys, monkeypatch):
-    monkeypatch.setattr(fetcher, "fetch_artifacts", lambda *a, **k: (_ for _ in ()).throw(AssertionError("refetched")))
+def test_adjudicating_a_verdictless_queued_release_writes_a_stand_in_and_alerts_once(tmp_path, capsys, monkeypatch,
+                                                                                     scan_stub):
+    scan_stub.fetch(lambda *a, **k: (_ for _ in ()).throw(AssertionError("refetched")))
     be = _Backend()
     cfg, conn, rid, rvw = _setup(tmp_path, be)
     _queue_disabled(conn, rid)
@@ -232,7 +233,7 @@ def _queued_off(tmp_path, **rv):
     return cfg, conn, rid
 
 
-def _fetch(monkeypatch, result):
+def _fetch(scan_stub, result):
     """fetcher.fetch_artifacts returns `result`, or raises it; returns the list of releases it was asked for."""
     asked = []
 
@@ -241,7 +242,7 @@ def _fetch(monkeypatch, result):
         if isinstance(result, BaseException):
             raise result
         return result
-    monkeypatch.setattr(fetcher, "fetch_artifacts", fetch)
+    scan_stub.fetch(fetch)
     return asked
 
 
@@ -253,9 +254,9 @@ def _unavailable(cause):
         return e
 
 
-def test_once_a_reviewer_is_enabled_the_drain_rebuilds_and_reviews_it(tmp_path, monkeypatch):
+def test_once_a_reviewer_is_enabled_the_drain_rebuilds_and_reviews_it(tmp_path, monkeypatch, scan_stub):
     cfg, conn, rid = _queued_off(tmp_path)
-    asked = _fetch(monkeypatch, _art())
+    asked = _fetch(scan_stub, _art())
     stored = []
     real = store.update_evidence
     monkeypatch.setattr(store, "update_evidence", lambda c, r, ev: stored.append(ev) or real(c, r, ev))
@@ -268,9 +269,9 @@ def test_once_a_reviewer_is_enabled_the_drain_rebuilds_and_reviews_it(tmp_path, 
     assert len(stored) == 1 and "os.system" in stored[0]       # stored, then cleared by the benign verdict
 
 
-def test_a_rebuilt_release_the_model_calls_suspicious_keeps_its_evidence(tmp_path, monkeypatch):
+def test_a_rebuilt_release_the_model_calls_suspicious_keeps_its_evidence(tmp_path, monkeypatch, scan_stub):
     cfg, conn, rid = _queued_off(tmp_path)
-    _fetch(monkeypatch, _art())
+    _fetch(scan_stub, _art())
     be = _Backend()
     be.complete = lambda **kw: be.calls.append(kw) or _OK.replace('"benign"', '"suspicious"')
     orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=be), auto=True)
@@ -279,9 +280,9 @@ def test_a_rebuilt_release_the_model_calls_suspicious_keeps_its_evidence(tmp_pat
 
 
 def test_a_release_the_current_rules_no_longer_escalate_is_cleared_without_a_review_or_an_alert(tmp_path,
-                                                                                                monkeypatch):
+                                                                                                monkeypatch, scan_stub):
     cfg, conn, rid = _queued_off(tmp_path)
-    _fetch(monkeypatch, _art({"setup.py": _PLAIN_SETUP, "pkg/mod.py": b"X = 1\n"}))   # nothing fires today
+    _fetch(scan_stub, _art({"setup.py": _PLAIN_SETUP, "pkg/mod.py": b"X = 1\n"}))   # nothing fires today
     be = _Backend()
     assert orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=be), auto=True) == 1
     row = conn.execute("SELECT stage, pending_reason, triage_score, review_attempts FROM releases WHERE id=?",
@@ -291,12 +292,12 @@ def test_a_release_the_current_rules_no_longer_escalate_is_cleared_without_a_rev
     assert conn.execute("SELECT count(*) FROM alerts").fetchone()[0] == 0
 
 
-def test_the_rebuild_scores_the_release_with_the_current_rules(tmp_path, monkeypatch):
+def test_the_rebuild_scores_the_release_with_the_current_rules(tmp_path, monkeypatch, scan_stub):
     cfg, conn, rid = _queued_off(tmp_path)
     conn.execute("UPDATE releases SET triage_score=99, triage_rules=? WHERE id=?",
                  (json.dumps([{"rule": "retired-rule", "weight": 99.0, "file": "setup.py", "lines": [1, 1]}]), rid))
     conn.commit()
-    _fetch(monkeypatch, _art())
+    _fetch(scan_stub, _art())
     orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=_Backend()), auto=True)
     tr = engine.triage(differ.build_diff(_art(), {"current": None, "prior": None}), cfg,
                        orchestrator._load_ruleset(cfg), {"current": None, "prior": None})
@@ -313,9 +314,9 @@ def test_the_rebuild_scores_the_release_with_the_current_rules(tmp_path, monkeyp
     urllib.error.HTTPError("https://files.pythonhosted.org/x.tar.gz", 404, "Not Found", {}, None),
 ])
 def test_a_release_that_cannot_be_downloaded_again_uses_up_its_attempts_then_alerts_once(tmp_path, monkeypatch,
-                                                                                        result):
+                                                                                        result, scan_stub):
     cfg, conn, rid = _queued_off(tmp_path)
-    asked = _fetch(monkeypatch, result)
+    asked = _fetch(scan_stub, result)
     be = _Backend()
     rvw = reviewer.Reviewer(cfg, backend=be)
     orchestrator.drain_pending(cfg, conn, rvw, auto=True)
@@ -333,9 +334,9 @@ def test_a_release_that_cannot_be_downloaded_again_uses_up_its_attempts_then_ale
     assert len(asked) == cfg.reviewer.max_review_attempts and be.calls == []
 
 
-def test_an_exception_while_rescanning_counts_as_a_failed_attempt(tmp_path, monkeypatch):
+def test_an_exception_while_rescanning_counts_as_a_failed_attempt(tmp_path, monkeypatch, scan_stub):
     cfg, conn, rid = _queued_off(tmp_path)
-    _fetch(monkeypatch, _art())
+    _fetch(scan_stub, _art())
     monkeypatch.setattr(differ, "build_diff", lambda *a, **k: (_ for _ in ()).throw(ValueError("bad diff")))
     orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=_Backend()), auto=True)
     [row] = store.pending_reviews(conn)
@@ -351,9 +352,9 @@ def test_an_exception_while_rescanning_counts_as_a_failed_attempt(tmp_path, monk
     http.client.IncompleteRead(b""),
     http.client.RemoteDisconnected("Remote end closed connection without response"),
 ])
-def test_pypi_unreachable_spends_no_attempt_and_sends_no_alert(tmp_path, monkeypatch, error):
+def test_pypi_unreachable_spends_no_attempt_and_sends_no_alert(tmp_path, monkeypatch, error, scan_stub):
     cfg, conn, rid = _queued_off(tmp_path)
-    _fetch(monkeypatch, error)
+    _fetch(scan_stub, error)
     for _ in range(5):
         orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=_Backend()), auto=True)
     [row] = store.pending_reviews(conn)
@@ -362,7 +363,7 @@ def test_pypi_unreachable_spends_no_attempt_and_sends_no_alert(tmp_path, monkeyp
     assert conn.execute("SELECT count(*) FROM alerts").fetchone()[0] == 0
 
 
-def test_a_pypi_outage_costs_one_download_per_drain_and_stored_inputs_are_still_reviewed(tmp_path, monkeypatch):
+def test_a_pypi_outage_costs_one_download_per_drain_and_stored_inputs_are_still_reviewed(tmp_path, monkeypatch, scan_stub):
     cfg, conn, _ = _queued_off(tmp_path)
     for i, pkg in enumerate(("q2", "q3")):
         _queue_disabled(conn, store.record_release(conn, pkg, "1.0", 10 + i, False, None, "sdist"))
@@ -370,19 +371,19 @@ def test_a_pypi_outage_costs_one_download_per_drain_and_stored_inputs_are_still_
     for i, (pkg, reason) in enumerate((("down", "endpoint_unreachable"), ("busy", "model_busy"))):
         store.park_for_review(conn, store.record_release(conn, pkg, "1.0", 20 + i, False, None, "sdist"),
                               reason, "x", text)
-    asked = _fetch(monkeypatch, _unavailable(urllib.error.URLError(ConnectionRefusedError())))
+    asked = _fetch(scan_stub, _unavailable(urllib.error.URLError(ConnectionRefusedError())))
     be = _Backend()
     assert orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=be), auto=True) == 2
     assert len(asked) == 1 and len(be.calls) == 2
     assert sorted(store.pending_review_counts(conn).items()) == [("reviewer_disabled", 3)]
 
 
-def test_a_pypi_read_stall_spends_one_attempt_per_drain_not_one_per_row(tmp_path, monkeypatch):
+def test_a_pypi_read_stall_spends_one_attempt_per_drain_not_one_per_row(tmp_path, monkeypatch, scan_stub):
     """Final review I2: a definitive TimeoutError still spends its attempt, but stops the drain's other rebuilds."""
     cfg, conn, first = _queued_off(tmp_path)
     for i, pkg in enumerate(("q2", "q3")):
         _queue_disabled(conn, store.record_release(conn, pkg, "1.0", 10 + i, False, None, "sdist"))
-    asked = _fetch(monkeypatch, TimeoutError("sdist read stalled"))
+    asked = _fetch(scan_stub, TimeoutError("sdist read stalled"))
     rvw = reviewer.Reviewer(cfg, backend=_Backend())
 
     def attempts():
@@ -400,7 +401,7 @@ def test_a_pypi_read_stall_spends_one_attempt_per_drain_not_one_per_row(tmp_path
         ["pkg|1.1|suspicious-heuristic|unscanned:review_failed"]
 
 
-def test_a_rebuild_downloads_with_the_attempt_it_is_on(tmp_path, monkeypatch):
+def test_a_rebuild_downloads_with_the_attempt_it_is_on(tmp_path, monkeypatch, scan_stub):
     """Final review I1: attempt k of a rebuild gets the scaled deadlines the scan's retry sweep uses."""
     cfg, conn, rid = _queued_off(tmp_path)
     seen = []
@@ -410,7 +411,7 @@ def test_a_rebuild_downloads_with_the_attempt_it_is_on(tmp_path, monkeypatch):
         if len(seen) == 1:
             raise fetcher.MetadataGone("pkg: PyPI metadata returned 404")
         return _art()
-    monkeypatch.setattr(fetcher, "fetch_artifacts", fetch)
+    scan_stub.fetch(fetch)
     rvw = reviewer.Reviewer(cfg, backend=_Backend())
     orchestrator.drain_pending(cfg, conn, rvw, auto=True)
     assert store.pending_reviews(conn)[0]["review_attempts"] == 1
@@ -418,10 +419,10 @@ def test_a_rebuild_downloads_with_the_attempt_it_is_on(tmp_path, monkeypatch):
     assert seen == [1, 2] and store.get_stage(conn, "pkg", "1.1") == "reviewed"
 
 
-def test_a_rebuilt_input_is_stored_before_the_review_so_a_crash_does_not_download_it_again(tmp_path, monkeypatch):
+def test_a_rebuilt_input_is_stored_before_the_review_so_a_crash_does_not_download_it_again(tmp_path, monkeypatch, scan_stub):
     """Final review M1: a kill mid-review leaves the rebuilt input queued as in_review."""
     cfg, conn, rid = _queued_off(tmp_path)
-    asked = _fetch(monkeypatch, _art())
+    asked = _fetch(scan_stub, _art())
     crash = _Backend()
     crash.complete = lambda **kw: (_ for _ in ()).throw(KeyboardInterrupt())
     with pytest.raises(KeyboardInterrupt):
@@ -433,10 +434,10 @@ def test_a_rebuilt_input_is_stored_before_the_review_so_a_crash_does_not_downloa
     assert len(asked) == 1 and len(be.calls) == 1 and store.get_stage(conn, "pkg", "1.1") == "reviewed"
 
 
-def test_a_busy_guard_defers_a_rebuild_before_it_downloads(tmp_path, monkeypatch):
+def test_a_busy_guard_defers_a_rebuild_before_it_downloads(tmp_path, monkeypatch, scan_stub):
     """Final review M2: no download for a review the guard would not send."""
     cfg, conn, rid = _queued_off(tmp_path)
-    asked = _fetch(monkeypatch, _art())
+    asked = _fetch(scan_stub, _art())
     orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=_Backend()), auto=True, guard=_Deferring())
     [row] = store.pending_reviews(conn)
     assert asked == [] and (row["pending_reason"], row["review_input_chars"]) == ("model_busy", 0)
@@ -455,9 +456,9 @@ class _DeferAfterFirst(_Deferring):
         return None if self.n == 1 else super().admit()
 
 
-def test_a_rebuilt_input_the_guard_defers_is_stored_and_never_downloaded_twice(tmp_path, monkeypatch):
+def test_a_rebuilt_input_the_guard_defers_is_stored_and_never_downloaded_twice(tmp_path, monkeypatch, scan_stub):
     cfg, conn, rid = _queued_off(tmp_path)
-    asked = _fetch(monkeypatch, _art())
+    asked = _fetch(scan_stub, _art())
     orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=_Backend()), auto=True,
                                guard=_DeferAfterFirst())
     [row] = store.pending_reviews(conn)
@@ -468,9 +469,9 @@ def test_a_rebuilt_input_the_guard_defers_is_stored_and_never_downloaded_twice(t
 
 
 def test_a_lowered_max_review_attempts_after_a_failed_rebuild_alerts_with_the_rebuild_wording(tmp_path,
-                                                                                               monkeypatch):
+                                                                                               monkeypatch, scan_stub):
     cfg, conn, rid = _queued_off(tmp_path)
-    _fetch(monkeypatch, fetcher.MetadataGone("pkg: PyPI metadata returned 404"))
+    _fetch(scan_stub, fetcher.MetadataGone("pkg: PyPI metadata returned 404"))
     orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=_Backend()), auto=True)     # attempt 1 of 3
     low = dataclasses.replace(cfg, reviewer=dataclasses.replace(cfg.reviewer, max_review_attempts=1))
     orchestrator.drain_pending(low, conn, reviewer.Reviewer(low, backend=_Backend()), auto=True)
@@ -479,9 +480,9 @@ def test_a_lowered_max_review_attempts_after_a_failed_rebuild_alerts_with_the_re
     assert conn.execute("SELECT count(*) FROM alerts").fetchone()[0] == 1
 
 
-def test_a_rebuilt_input_over_the_cap_waits_as_too_large_with_its_input(tmp_path, monkeypatch):
+def test_a_rebuilt_input_over_the_cap_waits_as_too_large_with_its_input(tmp_path, monkeypatch, scan_stub):
     cfg, conn, rid = _queued_off(tmp_path, max_input_chars=10_000)
-    _fetch(monkeypatch, _art({"setup.py": _EVIL_SETUP + b"PAD = '" + b"y" * 50_000 + b"'\n"}))
+    _fetch(scan_stub, _art({"setup.py": _EVIL_SETUP + b"PAD = '" + b"y" * 50_000 + b"'\n"}))
     be = _Backend()
     orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=be), auto=True)
     [row] = store.pending_reviews(conn)
@@ -498,14 +499,14 @@ def _trace(conn):
     return seen
 
 
-def test_the_auto_drain_reads_a_bounded_window_with_model_busy_first(tmp_path, monkeypatch):
+def test_the_auto_drain_reads_a_bounded_window_with_model_busy_first(tmp_path, monkeypatch, scan_stub):
     cfg, conn, _ = _queued_off(tmp_path)
     for i in range(99):
         _queue_disabled(conn, store.record_release(conn, f"q{i}", "1.0", 10 + i, False, None, "sdist"))
     busy = store.record_release(conn, "busy", "1.0", 500, False, None, "sdist")
     store.park_for_review(conn, busy, "model_busy", "x",
                           reviewer.build_review_input(_diff("exec(busy)"), _T, max_chars=cfg.reviewer.max_input_chars))
-    _fetch(monkeypatch, _unavailable(urllib.error.URLError(ConnectionRefusedError())))
+    _fetch(scan_stub, _unavailable(urllib.error.URLError(ConnectionRefusedError())))
     got = []
     real = store.pending_reviews
     monkeypatch.setattr(store, "pending_reviews", lambda *a, **k: got.append(real(*a, **k)) or got[-1])
@@ -585,7 +586,8 @@ def test_a_metadata_failure_is_classified_by_its_cause(tmp_path, monkeypatch, ca
     assert conn.execute("SELECT count(*) FROM alerts").fetchone()[0] == 0
 
 
-def test_one_project_whose_metadata_is_gone_for_good_does_not_block_the_other_rebuilds(tmp_path, monkeypatch):
+def test_one_project_whose_metadata_is_gone_for_good_does_not_block_the_other_rebuilds(tmp_path, monkeypatch,
+                                                                                       scan_stub):
     cfg = _cfg(tmp_path)
     conn = store.connect(cfg); store.init_schema(conn)
     a = store.record_release(conn, "a", "1.0", 1, False, None, "sdist")      # queued first: drained first
@@ -596,7 +598,7 @@ def test_one_project_whose_metadata_is_gone_for_good_does_not_block_the_other_re
         if rel.package == "a":
             raise _unavailable(_http(410))
         return _art()
-    monkeypatch.setattr(fetcher, "fetch_artifacts", fetch)
+    scan_stub.fetch(fetch)
     be = _Backend()
     orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=be), auto=True)
     assert len(be.calls) == 1 and store.get_stage(conn, "pkg", "1.1") == "reviewed"
@@ -604,15 +606,15 @@ def test_one_project_whose_metadata_is_gone_for_good_does_not_block_the_other_re
     assert (row["release_id"], row["pending_reason"], row["review_attempts"]) == (a, "review_failed", 1)
 
 
-def test_an_exhausted_rebuild_the_current_rules_clear_drops_its_unreviewed_verdict(tmp_path, monkeypatch):
+def test_an_exhausted_rebuild_the_current_rules_clear_drops_its_unreviewed_verdict(tmp_path, monkeypatch, scan_stub):
     cfg, conn, rid = _queued_off(tmp_path)
-    _fetch(monkeypatch, fetcher.MetadataGone("pkg: PyPI metadata returned 404"))
+    _fetch(scan_stub, fetcher.MetadataGone("pkg: PyPI metadata returned 404"))
     rvw = reviewer.Reviewer(cfg, backend=_Backend())
     for _ in range(cfg.reviewer.max_review_attempts + 1):
         orchestrator.drain_pending(cfg, conn, rvw, auto=True)
     assert conn.execute("SELECT model FROM verdicts WHERE release_id=?", (rid,)).fetchall()[0][0] == "none"
     assert conn.execute("SELECT count(*) FROM alerts").fetchone()[0] == 1
-    _fetch(monkeypatch, _art({"setup.py": _PLAIN_SETUP, "pkg/mod.py": b"X = 1\n"}))    # nothing fires today
+    _fetch(scan_stub, _art({"setup.py": _PLAIN_SETUP, "pkg/mod.py": b"X = 1\n"}))    # nothing fires today
     be = _Backend()
     orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=be), auto=False)
     assert store.get_stage(conn, "pkg", "1.1") == "triaged" and be.calls == []
@@ -622,13 +624,13 @@ def test_an_exhausted_rebuild_the_current_rules_clear_drops_its_unreviewed_verdi
 
 # --- the CLI ------------------------------------------------------------------------------------------------------
 
-def test_pending_lists_each_queued_release_once_and_the_oldest_50(tmp_path, monkeypatch, capsys):
+def test_pending_lists_each_queued_release_once_and_the_oldest_50(tmp_path, monkeypatch, capsys, scan_stub):
     cfg, conn, rid, rvw = _setup(tmp_path, _Backend(fail=TimeoutError("timed out")), max_review_attempts=1)
     _queue_disabled(conn, rid)
     ex = store.record_release(conn, "exhausted", "1.0", 2, False, None, "sdist")
     store.update_stage(conn, ex, "triaged", _T.score, json.dumps([r.__dict__ for r in _T.fired_rules]))
     orchestrator._review_escalated(cfg, conn, rvw, dataclasses.replace(_diff(), package="exhausted"), _T, ex)
-    out = _pending_cli(cfg, monkeypatch, capsys)
+    out = _pending_cli(cfg, monkeypatch, capsys, scan_stub)
     assert f"  release_id={rid}  pkg==1.0.0  score=60  waiting: reviewer_disabled" in out
     assert out.count("exhausted==1.0") == 1 and "exhausted==1.0  (not scanned: review_failed)" in out   # once
     for i in range(54):
@@ -641,20 +643,20 @@ def test_pending_lists_each_queued_release_once_and_the_oldest_50(tmp_path, monk
         conn.set_trace_callback(seen.append)
         return conn
     monkeypatch.setattr(orchestrator.store, "connect", traced)
-    out = _pending_cli(cfg, monkeypatch, capsys)
+    out = _pending_cli(cfg, monkeypatch, capsys, scan_stub)
     assert len([ln for ln in out.splitlines() if ln.startswith("  release_id=")]) == 50
     assert "  … and 5 more (oldest first)" in out
     assert any("NOT EXISTS" in q and q.endswith("LIMIT 50") for q in seen)
 
 
-def test_review_pending_takes_reason_reviewer_disabled_and_drains_only_that_reason(tmp_path, monkeypatch, capsys):
+def test_review_pending_takes_reason_reviewer_disabled_and_drains_only_that_reason(tmp_path, monkeypatch, capsys,
+                                                                                   scan_stub):
     cfg, conn, rid, _ = _setup(tmp_path, _Backend())
     _queue_disabled(conn, rid)
     other = store.record_release(conn, "other", "1.0", 2, False, None, "sdist")
     store.park_for_review(conn, other, "endpoint_unreachable", "down",
                           reviewer.build_review_input(_diff(), _T, max_chars=cfg.reviewer.max_input_chars))
-    monkeypatch.setattr(fetcher, "fetch_artifacts",
-                        lambda c, rel, **k: _art() if rel.package == "pkg" else None)
+    scan_stub.fetch(lambda c, rel, **k: _art() if rel.package == "pkg" else None)
     monkeypatch.setattr(differ, "build_diff", lambda art, *_: _diff())
     monkeypatch.setattr(engine, "triage", lambda *a, **k: _T)
     be = _Backend()

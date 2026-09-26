@@ -72,14 +72,13 @@ def test_seed_now_returns_none_when_pypi_unreachable(tmp_cfg, monkeypatch):
     conn.close()
 
 
-def test_recent_starts_a_fresh_cursor_n_events_back_and_scans_in_the_same_tick(tmp_cfg, monkeypatch):
-    from pydiffwatch import fetcher
+def test_recent_starts_a_fresh_cursor_n_events_back_and_scans_in_the_same_tick(tmp_cfg, monkeypatch, scan_stub):
     from pydiffwatch.models import NewRelease
     monkeypatch.setattr(ingest, "current_serial", lambda cfg: 10_000)
     seen = []
     monkeypatch.setattr(ingest, "changes_since",
                         lambda cfg, since: seen.append(since) or [NewRelease("pkg", "1.0", 9_700)])
-    monkeypatch.setattr(fetcher, "fetch_artifacts", lambda cfg, rel: None)   # no sdist: terminal
+    scan_stub.fetch(lambda cfg, rel: None)   # no sdist: terminal
     assert orchestrator.run_once(tmp_cfg, recent=500) == 1
     assert seen == [9_500]
     conn = store.connect(tmp_cfg)

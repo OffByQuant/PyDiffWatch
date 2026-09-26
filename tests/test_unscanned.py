@@ -21,7 +21,7 @@ def _alerts(conn, package):
                         "WHERE r.package=? ORDER BY a.id", (package,)).fetchall()
 
 
-def _pending_cli(cfg, monkeypatch, capsys):
+def _pending_cli(cfg, monkeypatch, capsys, scan_stub):
     """`pydiffwatch pending` with every entry-point side effect stubbed: no network, no scan, no refetch."""
     cfg = dataclasses.replace(cfg, reviewer_enabled=False)
     monkeypatch.setattr(cli, "_cfg", lambda args: cfg)
@@ -30,7 +30,7 @@ def _pending_cli(cfg, monkeypatch, capsys):
     monkeypatch.setattr(cli, "watch", lambda *a, **k: (_ for _ in ()).throw(AssertionError("watched")))
     monkeypatch.setattr(ingest, "changes_since", lambda *a, **k: (_ for _ in ()).throw(AssertionError("ingest")))
     monkeypatch.setattr(ingest, "current_serial", lambda *a, **k: (_ for _ in ()).throw(AssertionError("ingest")))
-    monkeypatch.setattr(fetcher, "fetch_artifacts", lambda *a, **k: (_ for _ in ()).throw(AssertionError("refetched")))
+    scan_stub.fetch(lambda *a, **k: (_ for _ in ()).throw(AssertionError("refetched")))
     monkeypatch.setattr(sys, "argv", ["pydiffwatch", "pending"])
     capsys.readouterr()
     cli.main()
@@ -43,7 +43,7 @@ def _unreviewed(text):
 
 # --- gave_up -------------------------------------------------------------------------------------------
 
-def test_gave_up_warns_once_with_the_last_error_and_waits_in_pending(tmp_cfg, capsys, monkeypatch):
+def test_gave_up_warns_once_with_the_last_error_and_waits_in_pending(tmp_cfg, capsys, monkeypatch, scan_stub):
     conn = store.connect(tmp_cfg); store.init_schema(conn)
     rel = NewRelease("flaky", "1.0", 10)
     for i in range(store.METADATA_ATTEMPTS - 1):
@@ -58,13 +58,13 @@ def test_gave_up_warns_once_with_the_last_error_and_waits_in_pending(tmp_cfg, ca
     assert capsys.readouterr().out == "" and len(_alerts(conn, "flaky")) == 1
     [item] = orchestrator.list_pending(tmp_cfg)
     assert item["package"] == "flaky" and "HTTP 503" in item["reasoning"] and item["diff_text"] is None
-    out = _pending_cli(tmp_cfg, monkeypatch, capsys)
+    out = _pending_cli(tmp_cfg, monkeypatch, capsys, scan_stub)
     assert "(not scanned: gave_up)" in out and "model: suspicious" not in out
 
 
 # --- quarantined refused_to_fetch ----------------------------------------------------------------------
 
-def test_a_quarantined_package_alerts_without_calling_it_malicious(tmp_cfg, capsys, monkeypatch):
+def test_a_quarantined_package_alerts_without_calling_it_malicious(tmp_cfg, capsys, monkeypatch, scan_stub):
     conn = store.connect(tmp_cfg); store.init_schema(conn)
     rel = NewRelease("cudrequest", "0.2.0", 7)
     orchestrator._process_fetched(tmp_cfg, conn, None, None, rel, fetcher.RefusedToFetch("quarantined: cudrequest"))
@@ -76,13 +76,13 @@ def test_a_quarantined_package_alerts_without_calling_it_malicious(tmp_cfg, caps
     assert capsys.readouterr().out == "" and len(_alerts(conn, "cudrequest")) == 1
     [item] = orchestrator.list_pending(tmp_cfg)
     assert item["classification"] != "malicious" and "quarantine list" in item["reasoning"]
-    out = _pending_cli(tmp_cfg, monkeypatch, capsys)
+    out = _pending_cli(tmp_cfg, monkeypatch, capsys, scan_stub)
     assert "(not scanned: refused_to_fetch)" in out and "model: suspicious" not in out
 
 
 # --- too_large -----------------------------------------------------------------------------------------
 
-def test_too_large_waits_in_the_queue_without_an_alert(tmp_path, capsys, monkeypatch):
+def test_too_large_waits_in_the_queue_without_an_alert(tmp_path, capsys, monkeypatch, scan_stub):
     cfg, conn, rid, rvw = _setup(tmp_path, _Backend(), max_input_chars=10_000)
     orchestrator._review_escalated(cfg, conn, rvw, _diff("x" * 50_000), _T, rid)
     assert capsys.readouterr().out == "" and _alerts(conn, "pkg") == []
@@ -94,7 +94,7 @@ def test_too_large_waits_in_the_queue_without_an_alert(tmp_path, capsys, monkeyp
         orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=_Backend()), auto=True)
     assert capsys.readouterr().out == "" and _alerts(conn, "pkg") == []
     assert orchestrator.list_pending(cfg) == []
-    out = _pending_cli(cfg, monkeypatch, capsys)
+    out = _pending_cli(cfg, monkeypatch, capsys, scan_stub)
     assert "pkg==1.0.0" in out and "waiting: too_large" in out and "(not scanned: too_large)" not in out
 
 
@@ -108,7 +108,7 @@ def test_a_too_large_release_that_is_later_reviewed_leaves_pending(tmp_path, cap
 
 # --- review_failed, retries exhausted ------------------------------------------------------------------
 
-def test_exhausted_review_retries_warn_once(tmp_path, capsys, monkeypatch):
+def test_exhausted_review_retries_warn_once(tmp_path, capsys, monkeypatch, scan_stub):
     be = _Backend(fail=_TIMEOUT)
     cfg, conn, rid, rvw = _setup(tmp_path, be)
     orchestrator._review_escalated(cfg, conn, rvw, _diff(), _T, rid)
@@ -124,13 +124,13 @@ def test_exhausted_review_retries_warn_once(tmp_path, capsys, monkeypatch):
     assert len(_alerts(conn, "pkg")) == 1                                     # the exhaustion alert only
     [item] = orchestrator.list_pending(cfg)
     assert "3 times" in item["reasoning"]
-    out = _pending_cli(cfg, monkeypatch, capsys)
+    out = _pending_cli(cfg, monkeypatch, capsys, scan_stub)
     assert "(not scanned: review_failed)" in out and "model: suspicious" not in out
 
 
 # --- metadata_gone -------------------------------------------------------------------------------------
 
-def test_metadata_gone_alerts_once_and_stays_out_of_pending(tmp_cfg, capsys, monkeypatch):
+def test_metadata_gone_alerts_once_and_stays_out_of_pending(tmp_cfg, capsys, monkeypatch, scan_stub):
     conn = store.connect(tmp_cfg); store.init_schema(conn)
     rel = NewRelease("gone", "1.0", 3)
     orchestrator._process_fetched(tmp_cfg, conn, None, None, rel, fetcher.MetadataGone("404"))
@@ -140,16 +140,16 @@ def test_metadata_gone_alerts_once_and_stays_out_of_pending(tmp_cfg, capsys, mon
     orchestrator._process_fetched(tmp_cfg, conn, None, None, rel, fetcher.MetadataGone("404"))
     assert capsys.readouterr().out == "" and len(_alerts(conn, "gone")) == 1
     assert orchestrator.list_pending(tmp_cfg) == []
-    assert "not scanned" not in _pending_cli(tmp_cfg, monkeypatch, capsys)
+    assert "not scanned" not in _pending_cli(tmp_cfg, monkeypatch, capsys, scan_stub)
 
 
 # --- refused_to_extract keeps its wording, gains the stage label ---------------------------------------
 
-def test_refused_extract_shows_its_stage_in_pending(tmp_cfg, capsys, monkeypatch):
+def test_refused_extract_shows_its_stage_in_pending(tmp_cfg, capsys, monkeypatch, scan_stub):
     conn = store.connect(tmp_cfg); store.init_schema(conn)
     orchestrator._process_fetched(tmp_cfg, conn, None, None, NewRelease("big", "1.0", 1),
                                   fetcher.RefusedToExtract("members"))
-    out = _pending_cli(tmp_cfg, monkeypatch, capsys)
+    out = _pending_cli(tmp_cfg, monkeypatch, capsys, scan_stub)
     assert "(not scanned: refused_to_extract)" in out and "model: suspicious" not in out
 
 
@@ -206,7 +206,7 @@ INSERT INTO verdicts(release_id, classification, reasoning, model, human_label)
 """
 
 
-def test_old_verdictless_refusals_get_the_unreviewed_verdict_once(tmp_cfg, monkeypatch, capsys):
+def test_old_verdictless_refusals_get_the_unreviewed_verdict_once(tmp_cfg, monkeypatch, capsys, scan_stub):
     raw = sqlite3.connect(tmp_cfg.db_path); raw.executescript(_OLD_SCHEMA); raw.commit(); raw.close()
     for _ in range(2):                                            # idempotent across connects
         conn = store.connect(tmp_cfg); store.init_schema(conn)
@@ -218,7 +218,7 @@ def test_old_verdictless_refusals_get_the_unreviewed_verdict_once(tmp_cfg, monke
         assert _unreviewed(rows[0]["reasoning"]) and _unreviewed(rows[1]["reasoning"])
         assert rows[2]["reasoning"] == "kept as is" and rows[2]["human_label"] == "benign"
     assert [i["package"] for i in orchestrator.list_pending(tmp_cfg)] == ["old-extract", "old-fetch"]
-    out = _pending_cli(tmp_cfg, monkeypatch, capsys)
+    out = _pending_cli(tmp_cfg, monkeypatch, capsys, scan_stub)
     assert "(not scanned: refused_to_extract)" in out and "(not scanned: refused_to_fetch)" in out
 
 
@@ -385,7 +385,7 @@ def _binary_only():
     return d, TriageResult(score=60.0, escalate=True, fired_rules=[FiredRule("added-binary", 60.0, "pkg/x.so", (0, 0))])
 
 
-def test_a_flag_with_no_content_for_the_model_alerts_once_with_the_reviewer_on(tmp_path, capsys, monkeypatch):
+def test_a_flag_with_no_content_for_the_model_alerts_once_with_the_reviewer_on(tmp_path, capsys, monkeypatch, scan_stub):
     # A dep/binary/maintainer-only flag leaves the model nothing to read, so the reviewer skips the call and
     # returns the UNREVIEWED verdict (model 'none'). Heuristic-only mode alerts on it; the reviewer path must too.
     be = _Backend()
@@ -399,7 +399,7 @@ def test_a_flag_with_no_content_for_the_model_alerts_once_with_the_reviewer_on(t
     orchestrator._review_escalated(cfg, conn, rvw, d, tr, rid)                 # a re-review: deduped
     assert capsys.readouterr().out == "" and len(_alerts(conn, "pkg")) == 1
     assert [i["not_scanned"] for i in orchestrator.list_pending(cfg)] == ["no_content"]
-    out = _pending_cli(cfg, monkeypatch, capsys)
+    out = _pending_cli(cfg, monkeypatch, capsys, scan_stub)
     assert "(not scanned: no_content)" in out and "model: suspicious" not in out
 
 

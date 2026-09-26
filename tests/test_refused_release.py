@@ -24,18 +24,18 @@ def test_size_refusal_alerts_with_its_reason(tmp_cfg, capsys):
     assert "big-native-pkg 0.1.0" in out and "download-size" in out and "manual review" in out
 
 
-def test_refused_release_waits_in_pending_without_a_refetch(tmp_cfg, capsys, monkeypatch):
+def test_refused_release_waits_in_pending_without_a_refetch(tmp_cfg, capsys, monkeypatch, scan_stub):
     conn, _ = _refuse(tmp_cfg, fetcher.RefusedToExtract("members"), capsys)
     assert store.get_stage(conn, "big-native-pkg", "0.1.0") == "refused_to_extract"
-    monkeypatch.setattr(fetcher, "fetch_artifacts", lambda *a: (_ for _ in ()).throw(AssertionError("refetched")))
+    scan_stub.fetch(lambda *a: (_ for _ in ()).throw(AssertionError("refetched")))
     [item] = orchestrator.list_pending(tmp_cfg)
     assert item["package"] == "big-native-pkg" and "manual review" in item["reasoning"]
     assert "members" in item["reasoning"] and item["diff_text"] is None and "refused" in item["fetch_error"]
 
 
-def test_size_refused_release_waits_in_pending(tmp_cfg, capsys, monkeypatch):
+def test_size_refused_release_waits_in_pending(tmp_cfg, capsys, monkeypatch, scan_stub):
     _refuse(tmp_cfg, fetcher.RefusedToFetch("download-size"), capsys)
-    monkeypatch.setattr(fetcher, "fetch_artifacts", lambda *a: (_ for _ in ()).throw(AssertionError("refetched")))
+    scan_stub.fetch(lambda *a: (_ for _ in ()).throw(AssertionError("refetched")))
     [item] = orchestrator.list_pending(tmp_cfg)
     assert "download-size" in item["reasoning"] and "refused" in item["fetch_error"]
 
