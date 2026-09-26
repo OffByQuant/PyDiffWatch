@@ -94,6 +94,8 @@ def test_too_large_waits_in_the_queue_without_an_alert(tmp_path, capsys, monkeyp
         orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=_Backend()), auto=True)
     assert capsys.readouterr().out == "" and _alerts(conn, "pkg") == []
     assert orchestrator.list_pending(cfg) == []
+    out = _pending_cli(cfg, monkeypatch, capsys)
+    assert "pkg==1.0.0" in out and "waiting: too_large" in out and "(not scanned: too_large)" not in out
 
 
 def test_a_too_large_release_that_is_later_reviewed_leaves_pending(tmp_path, capsys):

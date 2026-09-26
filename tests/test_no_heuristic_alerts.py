@@ -534,3 +534,50 @@ def test_an_exhausted_rebuild_the_current_rules_clear_drops_its_unreviewed_verdi
     assert store.get_stage(conn, "pkg", "1.1") == "triaged" and be.calls == []
     assert conn.execute("SELECT count(*) FROM verdicts WHERE release_id=? AND model='none'", (rid,)).fetchone()[0] == 0
     assert conn.execute("SELECT count(*) FROM alerts").fetchone()[0] == 1
+
+
+# --- the CLI ------------------------------------------------------------------------------------------------------
+
+def test_pending_lists_each_queued_release_once_and_the_oldest_50(tmp_path, monkeypatch, capsys):
+    cfg, conn, rid, rvw = _setup(tmp_path, _Backend(fail=TimeoutError("timed out")), max_review_attempts=1)
+    _queue_disabled(conn, rid)
+    ex = store.record_release(conn, "exhausted", "1.0", 2, False, None, "sdist")
+    store.update_stage(conn, ex, "triaged", _T.score, json.dumps([r.__dict__ for r in _T.fired_rules]))
+    orchestrator._review_escalated(cfg, conn, rvw, dataclasses.replace(_diff(), package="exhausted"), _T, ex)
+    out = _pending_cli(cfg, monkeypatch, capsys)
+    assert f"  release_id={rid}  pkg==1.0.0  score=60  waiting: reviewer_disabled" in out
+    assert out.count("exhausted==1.0") == 1 and "exhausted==1.0  (not scanned: review_failed)" in out   # once
+    for i in range(54):
+        _queue_disabled(conn, store.record_release(conn, f"q{i}", "1.0", 10 + i, False, None, "sdist"))
+    seen = []
+    real = orchestrator.store.connect
+
+    def traced(c):
+        conn = real(c)
+        conn.set_trace_callback(seen.append)
+        return conn
+    monkeypatch.setattr(orchestrator.store, "connect", traced)
+    out = _pending_cli(cfg, monkeypatch, capsys)
+    assert len([ln for ln in out.splitlines() if ln.startswith("  release_id=")]) == 50
+    assert "  … and 5 more (oldest first)" in out
+    assert any("NOT EXISTS" in q and q.endswith("LIMIT 50") for q in seen)
+
+
+def test_review_pending_takes_reason_reviewer_disabled_and_drains_only_that_reason(tmp_path, monkeypatch, capsys):
+    cfg, conn, rid, _ = _setup(tmp_path, _Backend())
+    _queue_disabled(conn, rid)
+    other = store.record_release(conn, "other", "1.0", 2, False, None, "sdist")
+    store.park_for_review(conn, other, "endpoint_unreachable", "down",
+                          reviewer.build_review_input(_diff(), _T, max_chars=cfg.reviewer.max_input_chars))
+    monkeypatch.setattr(fetcher, "fetch_artifacts",
+                        lambda c, rel, **k: _art() if rel.package == "pkg" else None)
+    monkeypatch.setattr(differ, "build_diff", lambda art, *_: _diff())
+    monkeypatch.setattr(engine, "triage", lambda *a, **k: _T)
+    be = _Backend()
+    monkeypatch.setattr(orchestrator, "_build_reviewer", lambda c: reviewer.Reviewer(c, backend=be))
+    monkeypatch.setattr(cli, "_cfg", lambda args: cfg)
+    monkeypatch.setattr(cli.egress, "install_guard", lambda cfg: None)
+    monkeypatch.setattr(sys, "argv", ["pydiffwatch", "review-pending", "--reason", "reviewer_disabled"])
+    cli.main()
+    assert "reviewed 1 queued release(s); still queued: endpoint_unreachable: 1" in capsys.readouterr().out
+    assert len(be.calls) == 1 and store.get_stage(conn, "pkg", "1.0.0") == "reviewed"

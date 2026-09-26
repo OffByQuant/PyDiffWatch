@@ -373,6 +373,17 @@ def pending_review_counts(conn) -> dict:
     return dict(conn.execute("SELECT pending_reason, count(*) FROM releases WHERE stage='pending_review' "
                              f"AND {_UNLABELLED} GROUP BY pending_reason").fetchall())
 
+# Queued for LLM review with no verdict row: never labelled, and not an exhausted retry (which has a verdict).
+_QUEUED = ("stage='pending_review' AND "
+           "NOT EXISTS(SELECT 1 FROM verdicts v WHERE v.release_id = releases.id)")
+
+def queued_releases(conn, limit):
+    """(rows, total): the oldest `limit` releases queued for LLM review with no verdict, and how many there are.
+    Two bounded reads on the releases_stage index, however long the queue."""
+    rows = conn.execute("SELECT id AS release_id, package, version, triage_score, pending_reason FROM releases "
+                        f"WHERE {_QUEUED} ORDER BY id LIMIT ?", (limit,)).fetchall()
+    return rows, conn.execute(f"SELECT count(*) FROM releases WHERE {_QUEUED}").fetchone()[0]
+
 def update_stage(conn, release_id, stage, score=None, rules=None):
     sets = ["stage=?"]; params = [stage]
     if score is not None:

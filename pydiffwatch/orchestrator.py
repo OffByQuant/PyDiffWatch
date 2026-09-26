@@ -774,6 +774,16 @@ def pending_review_counts(cfg: Config) -> dict:
         conn.close()
 
 
+def queued_releases(cfg: Config, limit=50):
+    """(rows, total): the oldest `limit` releases waiting for an LLM review, for `pending`. A queued row with a
+    verdict is an exhausted retry, which list_pending prints already as `(not scanned: ...)`."""
+    conn = store.connect(cfg); store.init_schema(conn)
+    try:
+        return store.queued_releases(conn, limit)
+    finally:
+        conn.close()
+
+
 def list_pending(cfg: Config):
     """Suspicious LLM verdicts awaiting adjudication. Each item carries the model's verdict plus the
     stored payload evidence (or the diff re-fetched from PyPI when evidence is absent on older rows)."""
