@@ -79,3 +79,27 @@ def test_cap_is_per_rule_other_rules_still_add():
     d.added_binaries.append({"path": "a.php", "reason": "foreign-language-source"})
     r = triage(d, Config(), rules)
     assert r.score == 60.0 and r.escalate
+
+
+def test_score_caps_each_rule_at_its_max_total():
+    from pydiffwatch import engine
+    from pydiffwatch.models import FiredRule
+    from pydiffwatch.rules import Rule
+    rs = [Rule("primitives", "code", 20, {}, max_total=35), Rule("other", "code", 5, {})]
+    fired = [FiredRule("primitives", 20.0, "a.py", (1, 1)), FiredRule("primitives", 20.0, "b.py", (1, 1)),
+             FiredRule("other", 5.0, "a.py", (2, 2))]
+    assert engine.score(fired, rs) == 40.0          # min(40, 35) + 5
+    assert engine.score([FiredRule("unknown", 99.0, "a.py", (1, 1))], rs) == 0.0   # not in the ruleset
+
+
+def test_triage_score_is_engine_score_of_its_fired_rules():
+    import pathlib
+    from pydiffwatch import engine, rules
+    from pydiffwatch.config import Config
+    from pydiffwatch.models import Diff, FileDiff, Hunk
+    rs = rules.load_rules(pathlib.Path(__file__).parent.parent / "rules" / "community")
+    src = "import os, base64\nexec(base64.b64decode('eA=='))\nos.system('id')\n"
+    d = Diff("p", "1.1", False, [FileDiff("p/__init__.py", "modified",
+                                          [Hunk((0, 0), (0, 3), src.splitlines(), [])], src)], [])
+    tr = engine.triage(d, Config(), rs)
+    assert tr.fired_rules and tr.score == engine.score(tr.fired_rules, rs)
