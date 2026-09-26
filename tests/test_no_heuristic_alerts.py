@@ -245,6 +245,14 @@ def _fetch(monkeypatch, result):
     return asked
 
 
+def _unavailable(cause):
+    """A MetadataUnavailable chained to its cause, as fetcher.fetch_artifacts raises it."""
+    try:
+        raise fetcher.MetadataUnavailable(f"pkg: {type(cause).__name__}: {cause}") from cause
+    except fetcher.MetadataUnavailable as e:
+        return e
+
+
 def test_once_a_reviewer_is_enabled_the_drain_rebuilds_and_reviews_it(tmp_path, monkeypatch):
     cfg, conn, rid = _queued_off(tmp_path)
     asked = _fetch(monkeypatch, _art())
@@ -336,7 +344,7 @@ def test_an_exception_while_rescanning_counts_as_a_failed_attempt(tmp_path, monk
 
 
 @pytest.mark.parametrize("error", [
-    fetcher.MetadataUnavailable("pkg: PyPI metadata returned HTTP 503"),
+    _unavailable(urllib.error.HTTPError("https://pypi.org/pypi/pkg/json", 503, "Service Unavailable", {}, None)),
     urllib.error.HTTPError("https://files.pythonhosted.org/x.tar.gz", 502, "Bad Gateway", {}, None),
     urllib.error.URLError(ConnectionRefusedError()),
     ConnectionResetError(54, "Connection reset by peer"),
@@ -362,7 +370,7 @@ def test_a_pypi_outage_costs_one_download_per_drain_and_stored_inputs_are_still_
     for i, (pkg, reason) in enumerate((("down", "endpoint_unreachable"), ("busy", "model_busy"))):
         store.park_for_review(conn, store.record_release(conn, pkg, "1.0", 20 + i, False, None, "sdist"),
                               reason, "x", text)
-    asked = _fetch(monkeypatch, fetcher.MetadataUnavailable("HTTP 503"))
+    asked = _fetch(monkeypatch, _unavailable(urllib.error.URLError(ConnectionRefusedError())))
     be = _Backend()
     assert orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=be), auto=True) == 2
     assert len(asked) == 1 and len(be.calls) == 2
@@ -418,7 +426,7 @@ def test_the_auto_drain_reads_a_bounded_window_with_model_busy_first(tmp_path, m
     busy = store.record_release(conn, "busy", "1.0", 500, False, None, "sdist")
     store.park_for_review(conn, busy, "model_busy", "x",
                           reviewer.build_review_input(_diff("exec(busy)"), _T, max_chars=cfg.reviewer.max_input_chars))
-    _fetch(monkeypatch, fetcher.MetadataUnavailable("HTTP 503"))
+    _fetch(monkeypatch, _unavailable(urllib.error.URLError(ConnectionRefusedError())))
     got = []
     real = store.pending_reviews
     monkeypatch.setattr(store, "pending_reviews", lambda *a, **k: got.append(real(*a, **k)) or got[-1])
@@ -458,3 +466,71 @@ def test_the_manual_drain_reads_pages_and_reviews_the_whole_queue(tmp_path, monk
     be = _Backend()
     assert orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=be), auto=False) == 1_200
     assert sizes == [500, 500, 200, 0] and len(be.calls) == 1_200 and store.pending_review_counts(conn) == {}
+
+
+# --- a metadata failure is transient only when PyPI itself is unreachable (Task 4 review I1/I2) ---------------------
+
+def _http(code):
+    return urllib.error.HTTPError("https://pypi.org/pypi/pkg/json", code, "x", {}, None)
+
+
+@pytest.mark.parametrize("cause, transient", [
+    (TimeoutError("package JSON took longer than 30s"), False),
+    (json.JSONDecodeError("Expecting value", "<html>", 0), False),
+    (_http(403), False),
+    (_http(410), False),
+    (_http(503), True),
+    (urllib.error.URLError(ConnectionRefusedError()), True),
+    (ConnectionResetError(54, "Connection reset by peer"), True),
+])
+def test_a_metadata_failure_is_classified_by_its_cause(tmp_path, monkeypatch, cause, transient):
+    cfg, conn, rid = _queued_off(tmp_path)
+    _queue_disabled(conn, store.record_release(conn, "q2", "1.0", 10, False, None, "sdist"))
+    asked = []
+    monkeypatch.setattr(fetcher, "_package_json", lambda pkg, c: asked.append(pkg) or (_ for _ in ()).throw(cause))
+    orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=_Backend()), auto=True)
+    rows = store.pending_reviews(conn)
+    if transient:      # no attempt, and the drain downloads nothing more (pypi_down)
+        assert asked == ["pkg"]
+        assert [(r["pending_reason"], r["review_attempts"]) for r in rows] == [("reviewer_disabled", 0)] * 2
+        assert rows[0]["pending_detail"].startswith("could not reach PyPI to download it again")
+    else:              # one attempt, and the next row is still rebuilt
+        assert asked == ["pkg", "q2"]
+        assert [(r["pending_reason"], r["review_attempts"]) for r in rows] == [("review_failed", 1)] * 2
+        assert "could not download and scan it again to review (MetadataUnavailable: " in rows[0]["pending_detail"]
+    assert conn.execute("SELECT count(*) FROM alerts").fetchone()[0] == 0
+
+
+def test_one_project_whose_metadata_is_gone_for_good_does_not_block_the_other_rebuilds(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    conn = store.connect(cfg); store.init_schema(conn)
+    a = store.record_release(conn, "a", "1.0", 1, False, None, "sdist")      # queued first: drained first
+    _queue_disabled(conn, a)
+    _scan(dataclasses.replace(cfg, reviewer_enabled=False), conn, None, _art())
+
+    def fetch(cfg, rel, **kw):
+        if rel.package == "a":
+            raise _unavailable(_http(410))
+        return _art()
+    monkeypatch.setattr(fetcher, "fetch_artifacts", fetch)
+    be = _Backend()
+    orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=be), auto=True)
+    assert len(be.calls) == 1 and store.get_stage(conn, "pkg", "1.1") == "reviewed"
+    [row] = store.pending_reviews(conn)
+    assert (row["release_id"], row["pending_reason"], row["review_attempts"]) == (a, "review_failed", 1)
+
+
+def test_an_exhausted_rebuild_the_current_rules_clear_drops_its_unreviewed_verdict(tmp_path, monkeypatch):
+    cfg, conn, rid = _queued_off(tmp_path)
+    _fetch(monkeypatch, fetcher.MetadataGone("pkg: PyPI metadata returned 404"))
+    rvw = reviewer.Reviewer(cfg, backend=_Backend())
+    for _ in range(cfg.reviewer.max_review_attempts + 1):
+        orchestrator.drain_pending(cfg, conn, rvw, auto=True)
+    assert conn.execute("SELECT model FROM verdicts WHERE release_id=?", (rid,)).fetchall()[0][0] == "none"
+    assert conn.execute("SELECT count(*) FROM alerts").fetchone()[0] == 1
+    _fetch(monkeypatch, _art({"setup.py": _PLAIN_SETUP, "pkg/mod.py": b"X = 1\n"}))    # nothing fires today
+    be = _Backend()
+    orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=be), auto=False)
+    assert store.get_stage(conn, "pkg", "1.1") == "triaged" and be.calls == []
+    assert conn.execute("SELECT count(*) FROM verdicts WHERE release_id=? AND model='none'", (rid,)).fetchone()[0] == 0
+    assert conn.execute("SELECT count(*) FROM alerts").fetchone()[0] == 1

@@ -348,14 +348,15 @@ def _drain_one(cfg, conn, rvw, row, *, auto, cap, guard, drain):
 
 
 def _pypi_unreachable(e) -> bool:
-    """PyPI could not be reached (spec R3): its JSON failed other than with a 404, the file host answered 5xx, the
-    connection failed, or it dropped mid-download. Transient: the release is retried next tick without spending a
-    review attempt. A deadline overrun (TimeoutError) is not: it repeats for that one release."""
-    if isinstance(e, fetcher.MetadataUnavailable):
-        return True
-    if isinstance(e, urllib.error.HTTPError):
-        return e.code >= 500
-    return isinstance(e, (urllib.error.URLError, ConnectionError, http.client.HTTPException))
+    """PyPI could not be reached (spec R3, amended I1), judged by the cause fetcher chains (`raise ... from`) or,
+    for an error raised directly, by `e`: a 5xx, a failed connection (URLError, ConnectionError), or one dropped
+    mid-download (http.client.HTTPException). Transient: the release is retried next tick without spending a review
+    attempt. Anything else (a TimeoutError deadline overrun, JSON that does not parse, a 4xx) repeats for that one
+    release, so it spends an attempt rather than pausing every other rebuild."""
+    c = e.__cause__ if e.__cause__ is not None else e
+    if isinstance(c, urllib.error.HTTPError):
+        return c.code >= 500
+    return isinstance(c, (urllib.error.URLError, ConnectionError, http.client.HTTPException))
 
 
 def _rebuild_review_input(cfg, conn, rvw, row, ruleset, cap):
@@ -387,6 +388,7 @@ def _rebuild_review_input(cfg, conn, rvw, row, ruleset, cap):
     rules = json.dumps([r.__dict__ for r in tr.fired_rules])
     if not tr.escalate:     # the current rules clear it: nothing for a model to confirm, nothing to alert
         store.clear_pending(conn, rid)
+        store.clear_unscanned_verdict(conn, rid)   # a stale UNREVIEWED from an earlier exhaustion (spec I2)
         store.update_stage(conn, rid, "triaged", tr.score, rules)
         return "cleared"
     store.update_stage(conn, rid, "pending_review", tr.score, rules)
