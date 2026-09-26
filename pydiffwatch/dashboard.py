@@ -46,8 +46,8 @@ def _conf_pct(conf) -> str:
 
 
 def _is_not_scanned(row: dict) -> bool:
-    """model == 'none' marks the UNREVIEWED placeholder verdict (fetch/extract refusal, quarantine,
-    oversized input, ...): pydiffwatch never ran a model over this release at all."""
+    """model == 'none' marks the UNREVIEWED placeholder verdict (fetch/extract refusal, quarantine, ...):
+    pydiffwatch never ran a model over this release at all."""
     return row.get("model") == "none"
 
 
@@ -119,8 +119,11 @@ def _card(row: dict) -> str:
     if human:
         note = row.get("human_note") or ""
         model_cls = (row.get("classification") or "?").lower()
-        human_html = (f'<div class="human">your verdict: {e(human)}{" — " + e(note) if note else ""}'
-                      f'{f" · model said {e(model_cls)}" if model_cls != human.lower() else ""}</div>')
+        if row.get("model") == "none":      # no model reviewed it (spec R1's stand-in, or an UNREVIEWED verdict)
+            said = " · no model review"
+        else:
+            said = f" · model said {e(model_cls)}" if model_cls != human.lower() else ""
+        human_html = f'<div class="human">your verdict: {e(human)}{" — " + e(note) if note else ""}{said}</div>'
     triage = row.get("triage_score")
     triage_html = (f'<span class="k">triage</span><span class="v">{int(triage)}</span>'
                    if triage is not None else "")

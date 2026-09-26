@@ -4,7 +4,7 @@ from . import egress, store
 from .config import Config, load_config
 from .orchestrator import (run_once, seed_now, list_pending, adjudicate, get_evidence,
                            backfill_evidence, export_dashboard, watch, review_pending,
-                           pending_review_counts, metadata_retry_counts, prune)
+                           pending_review_counts, metadata_retry_counts, prune, queued_releases)
 
 
 def _cfg(args):
@@ -66,14 +66,16 @@ def main():
     sub.add_parser("seed-now",
                    help="set the cursor to PyPI's current serial and exit (start monitoring from now)")
     sub.add_parser("pending",
-                   help="list suspicious verdicts awaiting adjudication, each with its diff")
+                   help="list releases queued for LLM review, and suspicious verdicts awaiting "
+                        "adjudication with their diffs")
     sub.add_parser("prune", help="shrink the database now (run/watch also do it daily): compress evidence, drop "
                                  "it for benign releases, apply retention_days, compact; findings and queues stay")
     rpp = sub.add_parser("review-pending",
                          help="review releases queued for LLM review (by default: too_large and exhausted "
                               "retries) — e.g. with -c pointing at a larger-context model")
     rpp.add_argument("--reason", action="append",
-                     choices=["too_large", "review_failed", "endpoint_unreachable", "model_busy"],
+                     choices=["too_large", "review_failed", "endpoint_unreachable", "model_busy",
+                              "reviewer_disabled"],
                      help="only this queue reason (repeatable)")
     rpp.add_argument("--limit", type=int, default=None, help="review at most N releases")
     adjp = sub.add_parser("adjudicate", help="record your verdict on a queued suspicious release")
@@ -151,6 +153,12 @@ def main():
             print(f"[pydiffwatch] {sum(queued.values())} release(s) queued for LLM review ("
                   + ", ".join(f"{k}: {v}" for k, v in sorted(queued.items()))
                   + ") — see `review-pending`")
+            rows, total = queued_releases(cfg)
+            for r in rows:
+                print(f"  release_id={r['release_id']}  {r['package']}=={r['version']}  "
+                      f"score={r['triage_score'] or 0:.0f}  waiting: {r['pending_reason']}")
+            if total > len(rows):
+                print(f"  … and {total - len(rows)} more (oldest first)")
         items = list_pending(cfg)
         if not items:
             print("[pydiffwatch] nothing awaiting adjudication"); return

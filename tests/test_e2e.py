@@ -14,7 +14,7 @@ def _meta(pkg, versions):   # versions: list of (ver, iso_ts) -> synthetic PyPI 
     return {"releases": {v: [{"packagetype": "sdist", "url": f"mock://{pkg}/{v}",
             "upload_time_iso_8601": ts, "yanked": False}] for v, ts in versions}}
 
-def test_e2e_alerts_on_malicious_only(tmp_cfg, monkeypatch):
+def test_e2e_queues_the_flagged_release_and_alerts_on_nothing(tmp_cfg, monkeypatch):
     monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: [
         NewRelease("victim", "1.0", 10), NewRelease("victim", "1.1", 11),
         NewRelease("safe", "1.0", 12)])
@@ -31,17 +31,15 @@ def test_e2e_alerts_on_malicious_only(tmp_cfg, monkeypatch):
     n = orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
     assert n == 3
     conn = store.connect(tmp_cfg)
-    rows = conn.execute("SELECT classification FROM alerts").fetchall()
-    pkgs = conn.execute("""SELECT r.package, r.version FROM alerts a
-                           JOIN releases r ON r.id=a.release_id""").fetchall()
-    assert ("victim", "1.1") in [tuple(p) for p in pkgs]   # malicious alerted
-    assert ("safe", "1.0") not in [tuple(p) for p in pkgs] # benign silent
-    assert len(rows) == 1
+    victim = conn.execute("SELECT stage, pending_reason FROM releases WHERE package='victim' AND version='1.1'")
+    assert tuple(victim.fetchone()) == ("pending_review", "reviewer_disabled")   # flagged: queued for a model
+    assert store.get_stage(conn, "safe", "1.0") == "triaged"                     # benign silent
+    assert conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] == 0        # no model has looked: no alert
     conn.close()
-    # idempotency: second run adds no new alerts
+    # idempotency: second run adds no alerts either
     orchestrator.run_once(tmp_cfg)
     conn = store.connect(tmp_cfg)
-    assert conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] == 0
 
 def test_cursor_resume_across_runs(tmp_cfg, monkeypatch):
     # First run sees one release; second run sees a NEW release at a higher serial.
@@ -171,8 +169,8 @@ def test_transient_fetch_error_is_retryable_not_poison(tmp_cfg, monkeypatch):
 
     n2 = orchestrator.run_once(tmp_cfg)             # tick 2: the retry queue re-fetches victimx; it now succeeds
     conn = store.connect(tmp_cfg)
-    assert store.get_stage(conn, "victimx", "1.1") in ("triaged", "alerted")
+    assert store.get_stage(conn, "victimx", "1.1") == "pending_review"   # retried and queued for review, not dropped
     assert conn.execute("SELECT COUNT(*) FROM alerts a JOIN releases r ON r.id=a.release_id "
-                        "WHERE r.package='victimx'").fetchone()[0] == 1   # malicious now alerted
+                        "WHERE r.package='victimx'").fetchone()[0] == 0
     assert store.get_last_serial(conn) == 12
     conn.close()

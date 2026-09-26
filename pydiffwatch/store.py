@@ -72,6 +72,9 @@ def migrate_schema(conn):
                       "queued for review, so the reason was not kept. Not scanned. Needs manual review.", _now()))
         conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('unreviewed_refusals', ?)", (_now(),))
         conn.commit()
+    # The review queue's reads (every tick: pending_review_counts, the drain, `pending`) use it instead of a scan.
+    conn.execute("CREATE INDEX IF NOT EXISTS releases_stage ON releases(stage, pending_reason)")
+    conn.commit()
 
 def get_last_serial(conn) -> int:
     return conn.execute("SELECT last_serial FROM cursor WHERE id=1").fetchone()[0]
@@ -240,14 +243,15 @@ def clear_pending(conn, release_id):
                  (release_id,))
     conn.commit()
 
-def pending_reviews(conn, reasons=None, max_chars=None, over_chars=None, without_verdict=False,
-                    max_attempts=None, with_input=True):
-    """Rows parked for review and not labelled by a person, optionally only those with `reasons`, input at most
-    `max_chars` or over `over_chars`, or `without_verdict` (never given the UNREVIEWED verdict). With
-    `max_attempts`, a review_failed row with that many attempts that has already warned (has a verdict) is left
-    out: the auto-drain never retries it. `with_input=False` leaves the stored input out (review_input(row, conn)
-    loads it). `has_verdict` says whether a row has a verdict; `review_input_chars` is the input's length."""
-    sql = ("SELECT id AS release_id, package, version, triage_score, triage_rules, pending_reason, "
+def pending_reviews(conn, reasons=None, max_chars=None, max_attempts=None, with_input=True, limit=None,
+                    after_id=None):
+    """Rows parked for review and not labelled by a person, optionally only those with `reasons` or input at most
+    `max_chars`. `limit` bounds the read (spec R2): model_busy rows first, then by id; with `after_id` (one page of
+    the manual drain) only rows past that id, by id. With `max_attempts`, a review_failed row with that many
+    attempts that has already warned (has a verdict) is left out: the auto-drain never retries it.
+    `with_input=False` leaves the stored input out (review_input(row, conn) loads it). `has_verdict` says whether a
+    row has a verdict; `review_input_chars` is the input's length."""
+    sql = ("SELECT id AS release_id, package, version, serial, triage_score, triage_rules, pending_reason, "
            "pending_detail, COALESCE(review_attempts,0) AS review_attempts, review_input_chars, "
            + ("review_input, " if with_input else "") +
            "EXISTS(SELECT 1 FROM verdicts v WHERE v.release_id = releases.id) AS has_verdict "
@@ -262,12 +266,13 @@ def pending_reviews(conn, reasons=None, max_chars=None, over_chars=None, without
     if max_chars is not None:
         sql += " AND review_input_chars <= ?"
         params.append(max_chars)
-    if over_chars is not None:
-        sql += " AND review_input_chars > ?"
-        params.append(over_chars)
-    if without_verdict:
-        sql += " AND NOT EXISTS(SELECT 1 FROM verdicts v WHERE v.release_id = releases.id)"
-    return conn.execute(sql + " ORDER BY id", params).fetchall()
+    if after_id is not None:
+        sql += " AND id > ?"
+        params.append(after_id)
+    if limit is None:
+        return conn.execute(sql + " ORDER BY id", params).fetchall()
+    order = " ORDER BY id" if after_id is not None else " ORDER BY pending_reason != 'model_busy', id"
+    return conn.execute(sql + order + " LIMIT ?", params + [limit]).fetchall()
 
 def review_input(row, conn=None) -> str:
     """A parked row's stored review input; read from `conn` when the row was selected without it."""
@@ -368,6 +373,19 @@ def pending_review_counts(conn) -> dict:
     return dict(conn.execute("SELECT pending_reason, count(*) FROM releases WHERE stage='pending_review' "
                              f"AND {_UNLABELLED} GROUP BY pending_reason").fetchall())
 
+# Queued for LLM review with no verdict row: never labelled, and not an exhausted retry (which has a verdict).
+_QUEUED = ("stage='pending_review' AND "
+           "NOT EXISTS(SELECT 1 FROM verdicts v WHERE v.release_id = releases.id)")
+
+def queued_releases(conn, limit):
+    """(rows, total): the oldest `limit` releases queued for LLM review with no verdict, and how many there are.
+    Both reads use the releases_stage index. The rows returned are bounded by `limit`, but the ORDER BY sorts the
+    whole matching set before its LIMIT, and the count walks it too (about 22 ms at 84k queued rows, per the
+    orchestrator._queued_rows note)."""
+    rows = conn.execute("SELECT id AS release_id, package, version, triage_score, pending_reason FROM releases "
+                        f"WHERE {_QUEUED} ORDER BY id LIMIT ?", (limit,)).fetchall()
+    return rows, conn.execute(f"SELECT count(*) FROM releases WHERE {_QUEUED}").fetchone()[0]
+
 def update_stage(conn, release_id, stage, score=None, rules=None):
     sets = ["stage=?"]; params = [stage]
     if score is not None:
@@ -415,7 +433,7 @@ def get_stage(conn, package, version):
 
 # Stages at which a release can be left unscanned. Carrying the UNREVIEWED verdict (model 'none'), such a
 # release waits in `pending`, which labels it `(not scanned: <stage>)`; for pending_review the label is the
-# pending_reason (too_large, review_failed).
+# pending_reason (review_failed; too_large on rows from before PR B).
 UNSCANNED_STAGES = ("refused_to_extract", "refused_to_fetch", "gave_up", "pending_review", "no_sdist")
 
 def pending_adjudication(conn):
@@ -435,12 +453,21 @@ def pending_adjudication(conn):
            ORDER BY r.id""", UNSCANNED_STAGES).fetchall()
 
 def adjudicate(conn, release_id, label, note):
-    """Record the agent's adjudication on a verdict; returns the release row (for alerting) or None."""
-    conn.execute("UPDATE verdicts SET human_label=?, human_note=?, adjudicated_at=? WHERE release_id=?",
-                 (label, note, _now(), release_id))
+    """Record the agent's adjudication on a verdict; returns the release row (for alerting) or None. A release
+    with no verdict row (queued as reviewer_disabled or too_large, no model has seen it) gets a stand-in "not
+    reviewed" verdict carrying the label (spec R1), so a label is never a silent no-op."""
+    now = _now()
+    cur = conn.execute("UPDATE verdicts SET human_label=?, human_note=?, adjudicated_at=? WHERE release_id=?",
+                       (label, note, now, release_id))
+    rel = conn.execute("SELECT package, version, serial, triage_score, triage_rules "
+                       "FROM releases WHERE id=?", (release_id,)).fetchone()
+    if cur.rowcount == 0 and rel is not None:
+        conn.execute("INSERT INTO verdicts(release_id, classification, confidence, attack_type, reasoning, "
+                     "cited_hunk, model, urgent, created_at, human_label, human_note, adjudicated_at) "
+                     "VALUES(?, 'suspicious', 0.0, 'none', 'UNREVIEWED: no model reviewed it; labelled by a "
+                     "person.', '', 'none', 0, ?, ?, ?, ?)", (release_id, now, label, note, now))
     conn.commit()
-    return conn.execute("SELECT package, version, serial, triage_score, triage_rules "
-                        "FROM releases WHERE id=?", (release_id,)).fetchone()
+    return rel
 
 # Phase 1 LIMITATION (two issues, both fixed by PEP 440 ordering in Phase 3, spec §3.1):
 #  1. Lexicographic compare: "1.9" < "1.10" is False, so multi-digit jumps pick a wrong baseline.
