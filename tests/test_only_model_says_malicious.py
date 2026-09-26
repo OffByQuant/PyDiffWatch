@@ -130,7 +130,9 @@ def _escalate(tmp_path, diff=_DIFF, tr=_TR, fail=False, offline=False, **rv):
 
 def test_too_large_never_malicious(tmp_path):
     big = Diff("p", "1.1", False, [FileDiff("setup.py", "modified", [Hunk((0, 1), (0, 1), ["x" * 50_000], [])])], [])
-    _assert_never_malicious(_escalate(tmp_path, diff=big, max_input_chars=10_000), "too_large")
+    conn = _escalate(tmp_path, diff=big, max_input_chars=10_000)
+    assert store.pending_reviews(conn)[0]["pending_reason"] == "too_large"
+    _assert_never_malicious(conn, alerted=False)
 
 
 def test_review_failed_exhausted_never_malicious(tmp_path):
@@ -150,13 +152,13 @@ def test_reviewer_with_no_content_records_model_none_suspicious(tmp_path):
 def test_endpoint_unreachable_park_never_malicious(tmp_path):
     conn = _escalate(tmp_path, offline=True)
     assert store.pending_reviews(conn)[0]["pending_reason"] == "endpoint_unreachable"
-    _assert_never_malicious(conn)
+    _assert_never_malicious(conn, alerted=False)
 
 
 def test_llm_down_with_retries_left_never_malicious(tmp_path):
     conn = _escalate(tmp_path, fail=True, max_review_attempts=3)
     assert store.pending_reviews(conn)[0]["pending_reason"] == "review_failed"
-    _assert_never_malicious(conn)
+    _assert_never_malicious(conn, alerted=False)
 
 
 # --- static: nothing else mints a malicious Verdict ----------------------------------------------------
@@ -237,3 +239,39 @@ def test_one_oversized_source_alone_goes_to_no_content_not_malicious(tmp_path):
     row = conn.execute("SELECT classification, model FROM verdicts").fetchone()
     assert (row["classification"], row["model"]) == ("suspicious", "none")
     _assert_never_malicious(conn, "no_content")
+
+
+# --- static: only the model, the unscanned path or a person alerts ----------------------------------------------
+
+# The only functions in orchestrator.py that may call notifier.emit (spec B §4): _record (the model's malicious and
+# the weak-malicious suspicious), _alert_unscanned (could-not-scan outcomes, never malicious) and adjudicate.
+EMITTERS = {"_record", "_alert_unscanned", "adjudicate"}
+
+
+def emit_sites(source):
+    """Every `emit(...)` / `notifier.emit(...)` call outside EMITTERS, as 'line in function()'."""
+    out = []
+
+    def walk(node, func):
+        for child in ast.iter_child_nodes(node):
+            f = child.name if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else func
+            if isinstance(child, ast.Call):
+                fn = child.func
+                name = fn.attr if isinstance(fn, ast.Attribute) else fn.id if isinstance(fn, ast.Name) else None
+                if name == "emit" and func not in EMITTERS:
+                    out.append(f"orchestrator.py:{child.lineno} emit in {func}()")
+            walk(child, f)
+
+    walk(ast.parse(source), None)
+    return out
+
+
+def test_static_emit_check_catches_a_planted_violation():
+    assert emit_sites("def _review_escalated(c, v):\n    notifier.emit(c, None, v, 1)\n")
+    assert emit_sites("def _drain_one(c, v):\n    emit(c, None, v, 1)\n")
+    assert emit_sites("notifier.emit(c, None, v, 1)\n")                            # module level
+    assert not emit_sites("def _record(c, v):\n    notifier.emit(c, None, v, 1)\n")
+
+
+def test_only_the_model_the_unscanned_path_or_a_person_alerts():
+    assert emit_sites((PKG / "orchestrator.py").read_text()) == []

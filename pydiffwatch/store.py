@@ -240,10 +240,9 @@ def clear_pending(conn, release_id):
                  (release_id,))
     conn.commit()
 
-def pending_reviews(conn, reasons=None, max_chars=None, over_chars=None, without_verdict=False,
-                    max_attempts=None, with_input=True):
-    """Rows parked for review and not labelled by a person, optionally only those with `reasons`, input at most
-    `max_chars` or over `over_chars`, or `without_verdict` (never given the UNREVIEWED verdict). With
+def pending_reviews(conn, reasons=None, max_chars=None, max_attempts=None, with_input=True):
+    """Rows parked for review and not labelled by a person, optionally only those with `reasons` or input at most
+    `max_chars`. With
     `max_attempts`, a review_failed row with that many attempts that has already warned (has a verdict) is left
     out: the auto-drain never retries it. `with_input=False` leaves the stored input out (review_input(row, conn)
     loads it). `has_verdict` says whether a row has a verdict; `review_input_chars` is the input's length."""
@@ -262,11 +261,6 @@ def pending_reviews(conn, reasons=None, max_chars=None, over_chars=None, without
     if max_chars is not None:
         sql += " AND review_input_chars <= ?"
         params.append(max_chars)
-    if over_chars is not None:
-        sql += " AND review_input_chars > ?"
-        params.append(over_chars)
-    if without_verdict:
-        sql += " AND NOT EXISTS(SELECT 1 FROM verdicts v WHERE v.release_id = releases.id)"
     return conn.execute(sql + " ORDER BY id", params).fetchall()
 
 def review_input(row, conn=None) -> str:
@@ -415,7 +409,7 @@ def get_stage(conn, package, version):
 
 # Stages at which a release can be left unscanned. Carrying the UNREVIEWED verdict (model 'none'), such a
 # release waits in `pending`, which labels it `(not scanned: <stage>)`; for pending_review the label is the
-# pending_reason (too_large, review_failed).
+# pending_reason (review_failed; too_large on rows from before PR B).
 UNSCANNED_STAGES = ("refused_to_extract", "refused_to_fetch", "gave_up", "pending_review", "no_sdist")
 
 def pending_adjudication(conn):

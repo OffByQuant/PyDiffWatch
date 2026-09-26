@@ -92,7 +92,7 @@ def test_build_reviewer_anthropic_builds_with_key(monkeypatch):
     assert rvw.backend.primary_model == "claude-sonnet-4-6"
 
 
-def test_llm_down_falls_back_to_heuristic_and_parks_for_review(tmp_path):
+def test_llm_down_parks_for_review_without_an_alert(tmp_path):
     cfg = Config(db_path=tmp_path / "o.sqlite")
     conn = store.connect(cfg); store.init_schema(conn)
     rid = store.record_release(conn, "p", "1.0", 1, False, "0.9", "sdist")
@@ -104,5 +104,4 @@ def test_llm_down_falls_back_to_heuristic_and_parks_for_review(tmp_path):
 
     assert store.get_stage(conn, "p", "1.0") == "pending_review"       # parked; the queue retries it
     assert store.pending_reviews(conn)[0]["pending_reason"] == "review_failed"
-    alert = conn.execute("SELECT classification FROM alerts WHERE release_id=?", (rid,)).fetchone()
-    assert alert["classification"] == "suspicious-heuristic"           # signal not dropped
+    assert conn.execute("SELECT count(*) FROM alerts").fetchone()[0] == 0   # queued, not dropped; no model said so

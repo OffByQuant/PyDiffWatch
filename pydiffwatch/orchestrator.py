@@ -88,9 +88,7 @@ def _record(cfg, conn, rid, verdict, score, dropped=()):
         reasoning = f"{note}. Model: {verdict.reasoning}" if verdict.reasoning else note
         v = dataclasses.replace(verdict, reasoning=reasoning)
         store.record_verdict(conn, rid, v)
-        store.update_stage(conn, rid, "needs_adjudication", score, None)  # -> `pydiffwatch pending`
-        notifier.emit(cfg, conn, dataclasses.replace(v, classification="suspicious-heuristic"), rid,
-                     dedupe_suffix="partial-review")                      # one alert; a person looks at it
+        store.update_stage(conn, rid, "needs_adjudication", score, None)  # -> `pydiffwatch pending`, no alert
         return
     if verdict.classification == "malicious" and (weak := _weak_malicious(cfg, verdict)):
         # spec decision 2: weak evidence never alerts as malicious. It is recorded and alerted as suspicious and
@@ -210,6 +208,8 @@ def _alert_review_exhausted(cfg, conn, rid, package, version, n, err, score, fir
 
 
 def _review_escalated(cfg, conn, rvw, d, tr, rid, *, offline=False, guard=None):
+    """Only a model or a person confirms a finding: a release that can't be reviewed now waits in the
+    queue with no alert."""
     if rvw is None:     # queued with no input and no evidence (spec decision 3): the drain rebuilds both
         store.park_for_review(conn, rid, "reviewer_disabled", "no reviewer this run (reviewer_enabled = false, or "
                               "the anthropic backend has no ANTHROPIC_API_KEY)", "")
@@ -218,14 +218,8 @@ def _review_escalated(cfg, conn, rvw, d, tr, rid, *, offline=False, guard=None):
         text = rvw.prepare(d, tr, cap=guard.input_cap_chars() if guard is not None else None)
     except reviewer.InputTooLarge as e:
         detail = f"{e}; {guard.cap_explain()}" if guard is not None else str(e)
-        # Over the provisional cold-start cap it may fit once the endpoint is measured: no "too large" claim
-        # yet (the auto-drain makes it then), only the heuristic alert any other park gets.
-        provisional = guard is not None and guard.cap_is_provisional()
-        _park_too_large(cfg, conn, rid, d.package, d.version, tr.score, tr.fired_rules, detail, e.text,
-                        alert=not provisional)
-        if provisional:
-            _alert_heuristic(cfg, conn, rid, d.package, d.version, tr.score, tr.fired_rules)
-        return      # one alert: the unscanned one (with the score and rules), or the heuristic one
+        _park(conn, rid, "too_large", detail, e.text)     # the input is kept for a larger-context model
+        return
     else:
         dropped = getattr(rvw, "dropped_files", ())   # spec U2: weighted files prepare()'s cap dropped
         if offline:
@@ -236,13 +230,6 @@ def _review_escalated(cfg, conn, rvw, d, tr, rid, *, offline=False, guard=None):
             _park_auto(conn, rid, "in_review", "the review was interrupted before it finished", text)
             _attempt_review(cfg, conn, rvw, rid, d.package, d.version, tr.score, tr.fired_rules, text, guard,
                             dropped=dropped)
-    if store.get_stage(conn, d.package, d.version) == "pending_review":
-        _alert_heuristic(cfg, conn, rid, d.package, d.version, tr.score, tr.fired_rules)
-
-
-def _alert_heuristic(cfg, conn, rid, package, version, score, fired_rules):
-    """Not reviewed yet: alert on the heuristic now rather than wait for the queue to drain."""
-    notifier.emit(cfg, conn, Verdict(package, version, "suspicious-heuristic", score, fired_rules, False), rid)
 
 
 def drain_pending(cfg, conn, rvw, *, auto: bool, reasons=None, limit=None, guard=None,
@@ -259,15 +246,11 @@ def drain_pending(cfg, conn, rvw, *, auto: bool, reasons=None, limit=None, guard
     elif not reasons:
         reasons = ("too_large", "review_failed")
     cap = guard.input_cap_chars() if guard is not None else cfg.reviewer.max_input_chars
-    provisional = guard is not None and guard.cap_is_provisional()
     # No stored input here: it is read only for a row that is reviewed. The auto-drain skips exhausted retries.
     rows = store.pending_reviews(conn, reasons, max_attempts=cfg.reviewer.max_review_attempts if auto else None,
                                  with_input=False)
     if auto:      # oversized for an earlier cap (cold start, a smaller max_input_chars) but fits this one
         rows += store.pending_reviews(conn, ("too_large",), max_chars=cap, with_input=False)
-        if not provisional:   # parked silently over the cold-start cap, and over the measured one too: warn now
-            rows += store.pending_reviews(conn, ("too_large",), over_chars=cap, without_verdict=True,
-                                          with_input=False)
     rows = sorted(rows,
                   key=lambda r: (r["pending_reason"] != "model_busy", r["release_id"]))
     done = tried = 0
@@ -280,8 +263,7 @@ def drain_pending(cfg, conn, rvw, *, auto: bool, reasons=None, limit=None, guard
                            cfg.reviewer.timeout, len(rows) - n)
             break
         try:
-            attempted, go_on = _drain_one(cfg, conn, rvw, row, auto=auto, cap=cap, provisional=provisional,
-                                          guard=guard)
+            attempted, go_on = _drain_one(cfg, conn, rvw, row, auto=auto, cap=cap, guard=guard)
         except Exception as e:   # a corrupt row or a bug on this input: its failed attempt, never a stalled tick
             logger.exception("review queue: %s==%s failed", row["package"], row["version"])
             try:
@@ -299,7 +281,7 @@ def drain_pending(cfg, conn, rvw, *, auto: bool, reasons=None, limit=None, guard
     return done
 
 
-def _drain_one(cfg, conn, rvw, row, *, auto, cap, provisional, guard):
+def _drain_one(cfg, conn, rvw, row, *, auto, cap, guard):
     """One drain_pending row. Returns (attempted: a review was tried, go_on: keep draining)."""
     if auto and row["pending_reason"] == "review_failed" and \
             row["review_attempts"] >= cfg.reviewer.max_review_attempts:
@@ -313,20 +295,13 @@ def _drain_one(cfg, conn, rvw, row, *, auto, cap, provisional, guard):
     if chars > cap:
         if auto:
             explain = guard.cap_explain() if guard is not None else f"cap {cap}"
-            # Over the provisional cold-start cap it may fit once the endpoint is measured: park silently.
-            _park_too_large(cfg, conn, rid, row["package"], row["version"], row["triage_score"],
-                            _rules_from_json(row["triage_rules"]), f"needs {chars} chars; {explain}", None,
-                            alert=not provisional)
+            _park(conn, rid, "too_large", f"needs {chars} chars; {explain}", None)
         return False, True
     text = store.review_input(row, conn)
     fired_rules = _rules_from_json(row["triage_rules"])
     dropped = reviewer.dropped_from_text(fired_rules, text)   # spec U2: recovered from stored text
     go_on = _attempt_review(cfg, conn, rvw, rid, row["package"], row["version"], row["triage_score"],
                             fired_rules, reviewer.refresh_marker(text), guard, dropped=dropped)
-    if row["pending_reason"] == "in_review" and \
-            store.get_stage(conn, row["package"], row["version"]) == "pending_review":
-        # A review interrupted by a kill, and still not done: the first-park alert it never got.
-        _alert_heuristic(cfg, conn, rid, row["package"], row["version"], row["triage_score"], fired_rules)
     return True, go_on
 
 
@@ -367,7 +342,7 @@ def _alert_unscanned(cfg, conn, rid, package, version, note, *, stage, score=0.0
       manual review.` (refusals and `metadata_gone` keep their own endings).
     - `stage` names the outcome (`refused_to_fetch`, `too_large`, `gave_up`, ...). The alert is
       `suspicious-heuristic`, deduped on package|version|suspicious-heuristic|unscanned:<stage>, so it fires
-      once per outcome even after the first-park heuristic alert, and never again on a re-tick.
+      once per outcome, and never again on a re-tick.
     - `queue=True` records the UNREVIEWED verdict (`suspicious`, model `none`), so the release waits in
       `pending` until a person adjudicates it or a model review replaces the verdict. `queue=False` alerts
       only (nothing is left to review).
@@ -379,15 +354,6 @@ def _alert_unscanned(cfg, conn, rid, package, version, note, *, stage, score=0.0
         store.record_verdict(conn, rid, v)
     return notifier.emit(cfg, conn, dataclasses.replace(v, classification="suspicious-heuristic"), rid,
                          dedupe_suffix=f"unscanned:{stage}")
-
-
-def _park_too_large(cfg, conn, rid, package, version, score, fired_rules, detail, text, alert=True):
-    _park(conn, rid, "too_large", detail, text)
-    if alert:
-        _alert_unscanned(cfg, conn, rid, package, version,
-                         f"UNREVIEWED: its review input is too large for the model ({detail}); run "
-                         f"`review-pending` with a larger-context model. Not scanned. Needs manual review.",
-                         stage="too_large", score=score, fired_rules=fired_rules)
 
 
 def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=None) -> bool:
@@ -483,8 +449,6 @@ def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=
                 text = reviewer.build_review_input(d, tr, max_chars=cfg.reviewer.max_input_chars)
                 _review_failed(cfg, conn, rid, d.package, d.version, tr.score, tr.fired_rules, text,
                                f"{type(e).__name__}: {e}")
-                notifier.emit(cfg, conn, Verdict(d.package, d.version, "suspicious-heuristic",
-                                                 tr.score, tr.fired_rules, False), rid)
         # Only now, with evidence and review handled, do earlier failures stop counting: a crash in any step
         # above (they parse package content) must still reach gave_up.
         store.clear_fetch_failures(conn, rid, result.prior_error)

@@ -82,22 +82,18 @@ def test_a_quarantined_package_alerts_without_calling_it_malicious(tmp_cfg, caps
 
 # --- too_large -----------------------------------------------------------------------------------------
 
-def test_too_large_alerts_once_with_the_needed_size_and_the_cap(tmp_path, capsys, monkeypatch):
+def test_too_large_waits_in_the_queue_without_an_alert(tmp_path, capsys, monkeypatch):
     cfg, conn, rid, rvw = _setup(tmp_path, _Backend(), max_input_chars=10_000)
     orchestrator._review_escalated(cfg, conn, rvw, _diff("x" * 50_000), _T, rid)
-    out = capsys.readouterr().out
-    needed = store.pending_reviews(conn)[0]["pending_detail"].split()[1]
-    assert "pkg 1.0.0" in out and _unreviewed(out) and "score=60" in out
-    assert f"needs {needed} chars" in out and "cap 10000" in out
-    assert "run `review-pending` with a larger-context model" in out
-    assert len(_alerts(conn, "pkg")) == 1                        # still one alert, not heuristic + unscanned
+    assert capsys.readouterr().out == "" and _alerts(conn, "pkg") == []
+    detail = store.pending_reviews(conn)[0]["pending_detail"]
+    needed = detail.split()[1]
+    assert f"needs {needed} chars" in detail and "cap 10000" in detail
+    assert conn.execute("SELECT count(*) FROM verdicts").fetchone()[0] == 0
     for _ in range(2):                                           # re-ticks: the auto-drain leaves it parked
         orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=_Backend()), auto=True)
-    assert capsys.readouterr().out == "" and len(_alerts(conn, "pkg")) == 1
-    [item] = orchestrator.list_pending(cfg)
-    assert item["package"] == "pkg" and "larger-context model" in item["reasoning"]
-    out = _pending_cli(cfg, monkeypatch, capsys)
-    assert "(not scanned: too_large)" in out and "model: suspicious" not in out
+    assert capsys.readouterr().out == "" and _alerts(conn, "pkg") == []
+    assert orchestrator.list_pending(cfg) == []
 
 
 def test_a_too_large_release_that_is_later_reviewed_leaves_pending(tmp_path, capsys):
@@ -110,12 +106,11 @@ def test_a_too_large_release_that_is_later_reviewed_leaves_pending(tmp_path, cap
 
 # --- review_failed, retries exhausted ------------------------------------------------------------------
 
-def test_exhausted_review_retries_warn_once_after_the_first_park_alert(tmp_path, capsys, monkeypatch):
+def test_exhausted_review_retries_warn_once(tmp_path, capsys, monkeypatch):
     be = _Backend(fail=_TIMEOUT)
     cfg, conn, rid, rvw = _setup(tmp_path, be)
     orchestrator._review_escalated(cfg, conn, rvw, _diff(), _T, rid)
-    first = capsys.readouterr().out
-    assert "suspicious-heuristic" in first and "UNREVIEWED" not in first      # first park: heuristic alert
+    assert capsys.readouterr().out == ""                                      # first park: no alert
     orchestrator.drain_pending(cfg, conn, rvw, auto=True)                     # attempt 2
     assert capsys.readouterr().out == ""
     orchestrator.drain_pending(cfg, conn, rvw, auto=True)                     # attempt 3: exhausted
@@ -124,7 +119,7 @@ def test_exhausted_review_retries_warn_once_after_the_first_park_alert(tmp_path,
     for _ in range(2):                                                        # re-ticks: skipped, no alert
         orchestrator.drain_pending(cfg, conn, rvw, auto=True)
     assert capsys.readouterr().out == "" and len(be.calls) == 3
-    assert len(_alerts(conn, "pkg")) == 2                                     # first park + exhaustion
+    assert len(_alerts(conn, "pkg")) == 1                                     # the exhaustion alert only
     [item] = orchestrator.list_pending(cfg)
     assert "3 times" in item["reasoning"]
     out = _pending_cli(cfg, monkeypatch, capsys)
@@ -237,6 +232,8 @@ def test_a_row_back_on_an_auto_retried_reason_drops_its_stale_unreviewed_verdict
     # auto-retried reason, the auto-drain owns it again, so the stale "too large" verdict must go.
     cfg, conn, rid, rvw = _setup(tmp_path, _Backend(), max_input_chars=10_000)
     orchestrator._review_escalated(cfg, conn, rvw, _diff("x" * 50_000), _T, rid)
+    # the UNREVIEWED verdict a too_large park got before PR B, as an older run left it
+    store.record_verdict(conn, rid, orchestrator.Verdict("pkg", "1.0.0", "suspicious", 60.0, [], False, model="none"))
     assert [i["not_scanned"] for i in orchestrator.list_pending(cfg)] == ["too_large"]
     big = _big(cfg, max_input_chars=800_000)
     orchestrator.drain_pending(big, conn, reviewer.Reviewer(big, backend=_Backend(fail=fail)), auto=True)
@@ -249,9 +246,9 @@ def _parked(conn, rid, text, reason="endpoint_unreachable"):
     store.park_for_review(conn, rid, reason, "down", text)
 
 
-def test_a_cold_start_re_park_as_too_large_is_silent_until_the_cap_is_measured(tmp_path, capsys):
-    # (b): the 40,000-char cold-start cap is provisional. Re-parking over it must not claim the release needs a
-    # manual review; once the endpoint is measured and the row is still over the real cap, it warns, once.
+def test_a_re_park_as_too_large_is_silent_before_and_after_the_cap_is_measured(tmp_path, capsys):
+    # (b): the 40,000-char cold-start cap is provisional. Re-parking over it claims nothing; once the endpoint is
+    # measured and the row is still over the real cap, it waits in the queue for `review-pending`, silently.
     be = _Backend()
     cfg, conn, rid, rvw = _setup(tmp_path, be)
     _parked(conn, rid, "x" * 60_000)
@@ -263,9 +260,9 @@ def test_a_cold_start_re_park_as_too_large_is_silent_until_the_cap_is_measured(t
     gd.tok_s = 50.0                                          # measured: cap ~30,600 chars, still under 60,000
     for _ in range(2):
         orchestrator.drain_pending(cfg, conn, rvw, auto=True, guard=gd)
-    out = capsys.readouterr().out
-    assert _unreviewed(out) and "too large" in out and len(_alerts(conn, "pkg")) == 1
-    assert [i["not_scanned"] for i in orchestrator.list_pending(cfg)] == ["too_large"] and be.calls == []
+    assert capsys.readouterr().out == "" and _alerts(conn, "pkg") == []
+    assert store.pending_reviews(conn)[0]["pending_reason"] == "too_large"
+    assert orchestrator.list_pending(cfg) == [] and be.calls == []
 
 
 def test_lowering_max_review_attempts_still_warns_once(tmp_path, capsys):
@@ -280,7 +277,7 @@ def test_lowering_max_review_attempts_still_warns_once(tmp_path, capsys):
         orchestrator.drain_pending(low, conn, rvw, auto=True)
     out = capsys.readouterr().out
     assert _unreviewed(out) and "2 times" in out and "boom" in out
-    assert len(be.calls) == 2 and len(_alerts(conn, "pkg")) == 2               # first park + exhaustion, once
+    assert len(be.calls) == 2 and len(_alerts(conn, "pkg")) == 1               # the exhaustion alert only
     assert [i["not_scanned"] for i in orchestrator.list_pending(cfg)] == ["review_failed"]
 
 
@@ -301,12 +298,12 @@ def test_a_late_review_exception_parks_the_release_and_later_exhausts(tmp_path, 
     assert orchestrator._process_fetched(cfg, conn, rvw, None, NewRelease("pkg", "1.0.0", 1), art)
     row = conn.execute("SELECT stage, pending_reason, review_attempts, fetch_attempts FROM releases").fetchone()
     assert tuple(row) == ("pending_review", "review_failed", 1, 0)
-    assert "suspicious-heuristic" in capsys.readouterr().out                  # the first-park alert
+    assert capsys.readouterr().out == ""                                      # a park sends no alert
     for _ in range(3):                                                         # exceptions and timeouts alike
         orchestrator.drain_pending(cfg, conn, rvw, auto=True)
         monkeypatch.setattr(rvw, "review_text", real)
     out = capsys.readouterr().out
-    assert _unreviewed(out) and "3 times" in out and len(_alerts(conn, "pkg")) == 2
+    assert _unreviewed(out) and "3 times" in out and len(_alerts(conn, "pkg")) == 1
     assert store.get_stage(conn, "pkg", "1.0.0") == "pending_review" and len(be.calls) == 1
 
 
@@ -410,18 +407,17 @@ def test_a_too_large_row_alerts_once_per_outcome_through_exhaustion_to_a_benign_
     be = _Backend(fail=RuntimeError("500"))
     cfg, conn, rid, rvw = _setup(tmp_path, be, max_input_chars=10_000)
     orchestrator._review_escalated(cfg, conn, rvw, _diff("x" * 50_000), _T, rid)
-    assert [k for (k,) in _alerts(conn, "pkg")] == ["pkg|1.0.0|suspicious-heuristic|unscanned:too_large"]
+    assert _alerts(conn, "pkg") == []
     big = _big(cfg, max_input_chars=200_000)
     rvw2 = reviewer.Reviewer(big, backend=be)
     for _ in range(4):
         orchestrator.drain_pending(big, conn, rvw2, auto=False)
-    assert [k for (k,) in _alerts(conn, "pkg")] == ["pkg|1.0.0|suspicious-heuristic|unscanned:too_large",
-                                                    "pkg|1.0.0|suspicious-heuristic|unscanned:review_failed"]
+    assert [k for (k,) in _alerts(conn, "pkg")] == ["pkg|1.0.0|suspicious-heuristic|unscanned:review_failed"]
     be.fail = None
     orchestrator.drain_pending(big, conn, rvw2, auto=False)
     v = conn.execute("SELECT classification, model FROM verdicts WHERE release_id=?", (rid,)).fetchone()
     assert tuple(v) == ("benign", "m") and store.get_stage(conn, "pkg", "1.0.0") == "reviewed"
-    assert orchestrator.list_pending(cfg) == [] and len(_alerts(conn, "pkg")) == 2
+    assert orchestrator.list_pending(cfg) == [] and len(_alerts(conn, "pkg")) == 1
 
 
 # --- a kill mid-review never loses the release ------------------------------------------------------------
@@ -452,7 +448,7 @@ def test_a_kill_during_the_model_call_leaves_the_release_in_the_auto_drain_queue
     assert len(be.calls) == 1 and store.get_stage(conn, "pkg", "1.1") == "reviewed"
 
 
-def test_an_interrupted_review_the_drain_cannot_finish_gets_the_first_park_alert(tmp_path, capsys):
+def test_an_interrupted_review_the_drain_cannot_finish_stays_queued_without_an_alert(tmp_path, capsys):
     from tests.test_pending_queue import _cfg
     cfg = _cfg(tmp_path)
     conn = store.connect(cfg); store.init_schema(conn)
@@ -462,7 +458,7 @@ def test_an_interrupted_review_the_drain_cannot_finish_gets_the_first_park_alert
     rvw = reviewer.Reviewer(cfg, backend=_Backend(fail=_REFUSED))
     for _ in range(2):
         orchestrator.drain_pending(cfg, conn, rvw, auto=True)
-    assert [k for (k,) in _alerts(conn, "pkg")] == ["pkg|1.1|suspicious-heuristic"]
+    assert _alerts(conn, "pkg") == []
     assert store.pending_reviews(conn)[0]["pending_reason"] == "endpoint_unreachable"
 
 
@@ -479,24 +475,23 @@ def test_a_finished_review_sends_no_extra_alert(tmp_path, capsys, reply, alerts)
     assert store.pending_reviews(conn) == []
 
 
-def test_a_first_park_over_the_cold_start_cap_does_not_claim_too_large_until_the_cap_is_measured(tmp_path,
-                                                                                                capsys):
-    # The cold-start cap is provisional: over it at first park, the release gets the heuristic alert every park
-    # gets, not the "too large, needs manual review" one. Once measured and still over the real cap, that one.
+def test_a_first_park_over_the_cold_start_cap_is_silent(tmp_path, capsys):
+    # The cold-start cap is provisional: over it at first park, and once measured and still over the real cap,
+    # the release waits in the queue as too_large with no alert.
     be = _Backend()
     cfg, conn, rid, rvw = _setup(tmp_path, be)
     gd = guard_mod.ReviewerGuard(cfg, be, conn, memory=None, out=lambda m: None)
     assert gd.cap_is_provisional()
     orchestrator._review_escalated(cfg, conn, rvw, _diff("x" * 60_000), _T, rid, guard=gd)
     assert store.pending_reviews(conn)[0]["pending_reason"] == "too_large" and be.calls == []
-    assert [k for (k,) in _alerts(conn, "pkg")] == ["pkg|1.0.0|suspicious-heuristic"]
+    assert _alerts(conn, "pkg") == []
     assert "UNREVIEWED" not in capsys.readouterr().out
     gd.tok_s = 50.0                                          # measured: cap ~30,600 chars, still under 60,000
     for _ in range(2):
         orchestrator.drain_pending(cfg, conn, rvw, auto=True, guard=gd)
-    assert [k for (k,) in _alerts(conn, "pkg")] == ["pkg|1.0.0|suspicious-heuristic",
-                                                    "pkg|1.0.0|suspicious-heuristic|unscanned:too_large"]
-    assert [i["not_scanned"] for i in orchestrator.list_pending(cfg)] == ["too_large"] and be.calls == []
+    assert _alerts(conn, "pkg") == []
+    assert orchestrator.list_pending(cfg) == [] and be.calls == []
+    assert store.pending_reviews(conn)[0]["pending_reason"] == "too_large"
 
 
 def test_the_gave_up_alert_clips_a_long_error(tmp_cfg, capsys):

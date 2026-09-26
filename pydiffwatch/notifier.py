@@ -31,8 +31,8 @@ def post_webhook(cfg, text) -> bool:
 
 def emit(cfg, conn, verdict: Verdict, release_id: int, dedupe_suffix: str = ""):
     """Print and post one alert, at most once per package|version|classification[|dedupe_suffix]. The suffix
-    lets a second, different alert for the same release through (e.g. an unscanned outcome after the
-    first-park heuristic alert) while a re-tick of either is still deduped."""
+    lets a second, different alert for the same release through (e.g. an exhaustion alert after a too_large
+    outcome from an older run) while a re-tick of either is still deduped."""
     dedupe_key = f"{verdict.package}|{verdict.version}|{verdict.classification}"
     if dedupe_suffix:
         dedupe_key += f"|{dedupe_suffix}"

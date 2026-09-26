@@ -252,7 +252,8 @@ def test_a_weak_malicious_verdict_from_the_review_queue_is_downgraded_with_one_a
     # as process_release does before a review
     store.update_stage(conn, rid, "triaged", _T.score, json.dumps([r.__dict__ for r in _T.fired_rules]))
     orchestrator._review_escalated(cfg, conn, rvw, _diff(), _T, rid, offline=True)
-    parked = conn.execute("SELECT count(*) FROM alerts").fetchone()[0]         # the park's own heuristic alert
+    parked = conn.execute("SELECT count(*) FROM alerts").fetchone()[0]         # a park sends no alert
+    assert parked == 0
     be = _Backend()
     be.complete = lambda **kw: be.calls.append(kw) or (
         '{"runs_when":"user-command","classification":"malicious","confidence":0.95,"urgent":true,'

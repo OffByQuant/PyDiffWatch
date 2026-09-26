@@ -1,6 +1,7 @@
 """spec U2: a benign verdict on truncated review input is not final. If the input cap dropped a file
 that carried fired-rule weight, the model never saw it — the release goes to needs_adjudication with
-"reviewed partially: <files> not shown" instead of being saved silently, and alerts once."""
+"reviewed partially: <files> not shown" instead of being saved silently. It sends no alert: it waits in `pending`
+for a person (spec B §3.1)."""
 import json
 from pydiffwatch.config import Config, ReviewerConfig
 from pydiffwatch import store, orchestrator, reviewer
@@ -57,9 +58,7 @@ def test_truncated_input_with_dropped_weighted_file_goes_to_adjudication(tmp_pat
     assert row["classification"] == "benign"                 # the model's actual verdict is kept
     assert "reviewed partially" in row["reasoning"] and "big.py" in row["reasoning"]
     assert "looks fine" in row["reasoning"]                   # the model's own reasoning is kept too
-    assert _alert_count(conn) == 1
-    alert = conn.execute("SELECT classification FROM alerts WHERE release_id=?", (rid,)).fetchone()
-    assert alert["classification"] == "suspicious-heuristic"
+    assert _alert_count(conn) == 0
 
 
 def test_truncated_input_with_only_zero_weight_files_dropped_stays_benign(tmp_path):
@@ -100,9 +99,9 @@ def test_second_record_of_same_release_does_not_re_alert(tmp_path):
                confidence=0.8, attack_type="none", reasoning="looks fine",
                cited_hunk="setup.py:1-1", recommended_action="dismiss", model="m")
     orchestrator._record(cfg, conn, rid, v, 50.0, dropped=["big.py"])
-    assert _alert_count(conn) == 1
+    assert _alert_count(conn) == 0
     orchestrator._record(cfg, conn, rid, v, 50.0, dropped=["big.py"])   # e.g. a re-drain of the same row
-    assert _alert_count(conn) == 1
+    assert _alert_count(conn) == 0
     assert store.get_stage(conn, "p", "1.0") == "needs_adjudication"
 
 
@@ -134,11 +133,10 @@ def test_offline_park_then_auto_drain_still_adjudicates_partial_review(tmp_path)
     row = conn.execute("SELECT classification, reasoning FROM verdicts WHERE release_id=?", (rid,)).fetchone()
     assert row["classification"] == "benign"
     assert "reviewed partially" in row["reasoning"] and "big.py" in row["reasoning"]
-    # 2 alerts total: the existing park-time heuristic alert, plus this one partial-review alert
-    # (different dedupe suffix, so neither swallows the other); a second drain must not add a third.
-    assert _alert_count(conn) == 2 and _partial_review_alert_count(conn) == 1
+    # a partial review never alerts; it waits in `pending`
+    assert _alert_count(conn) == 0 and _partial_review_alert_count(conn) == 0
     orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=_FakeBackend([])), auto=True)
-    assert _alert_count(conn) == 2
+    assert _alert_count(conn) == 0
 
 
 def test_too_large_park_then_review_pending_still_adjudicates_partial_review(tmp_path):
@@ -165,7 +163,7 @@ def test_too_large_park_then_review_pending_still_adjudicates_partial_review(tmp
     row = conn.execute("SELECT classification, reasoning FROM verdicts WHERE release_id=?", (rid,)).fetchone()
     assert row["classification"] == "benign"
     assert "reviewed partially" in row["reasoning"] and "setup.py" in row["reasoning"]
-    assert _alert_count(conn) == 2 and _partial_review_alert_count(conn) == 1
+    assert _alert_count(conn) == 0 and _partial_review_alert_count(conn) == 0
 
 
 def test_dropped_from_text_ignores_non_file_rules():

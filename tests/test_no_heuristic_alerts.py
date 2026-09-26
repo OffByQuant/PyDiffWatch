@@ -131,3 +131,92 @@ def test_reviewer_off_one_oversized_source_alone_queues_silently(tmp_path, monke
     rules = [r["rule"] for r in json.loads(conn.execute("SELECT triage_rules FROM releases").fetchone()[0])]
     assert rules == ["binary-source-too-large"] and emitted == []
     _assert_queued_disabled(conn, rid)
+
+
+# --- every parking path queues without an alert --------------------------------------------------------------
+
+class _Deferring:
+    """A reviewer guard that admits nothing: the release parks as model_busy."""
+    def input_cap_chars(self): return 200_000
+    def cap_explain(self): return "cap 200000"
+    def cap_is_provisional(self): return False
+    def admit(self): return "breaker open after a timeout"
+
+
+def _assert_quiet(conn, emitted, reason):
+    assert emitted == [] and conn.execute("SELECT count(*) FROM alerts").fetchone()[0] == 0
+    assert [r["pending_reason"] for r in store.pending_reviews(conn)] == [reason]
+    assert conn.execute("SELECT count(*) FROM verdicts").fetchone()[0] == 0
+
+
+def test_an_unreachable_endpoint_park_is_silent(tmp_path, monkeypatch):
+    emitted = _emitted(monkeypatch)
+    cfg, conn, rid, rvw = _setup(tmp_path, _Backend())
+    orchestrator._review_escalated(cfg, conn, rvw, _diff(), _T, rid, offline=True)
+    _assert_quiet(conn, emitted, "endpoint_unreachable")
+
+
+def test_a_measured_too_large_park_is_silent(tmp_path, monkeypatch):
+    emitted = _emitted(monkeypatch)
+    be = _Backend()
+    cfg, conn, rid, rvw = _setup(tmp_path, be, max_input_chars=10_000)
+    orchestrator._review_escalated(cfg, conn, rvw, _diff("x" * 50_000), _T, rid)
+    _assert_quiet(conn, emitted, "too_large")
+    assert be.calls == [] and "x" * 50_000 in store.review_input(store.pending_reviews(conn)[0])
+
+
+def test_a_provisional_too_large_park_is_silent(tmp_path, monkeypatch):
+    emitted = _emitted(monkeypatch)
+    be = _Backend()
+    cfg, conn, rid, rvw = _setup(tmp_path, be)
+    gd = guard_mod.ReviewerGuard(cfg, be, conn, memory=None, out=lambda m: None)
+    assert gd.cap_is_provisional()
+    orchestrator._review_escalated(cfg, conn, rvw, _diff("x" * 60_000), _T, rid, guard=gd)
+    _assert_quiet(conn, emitted, "too_large")
+
+
+def test_a_model_busy_park_is_silent(tmp_path, monkeypatch):
+    emitted = _emitted(monkeypatch)
+    be = _Backend()
+    cfg, conn, rid, rvw = _setup(tmp_path, be)
+    orchestrator._review_escalated(cfg, conn, rvw, _diff(), _T, rid, guard=_Deferring())
+    _assert_quiet(conn, emitted, "model_busy")
+    assert be.calls == []
+
+
+def test_a_review_that_raises_in_process_fetched_parks_silently(tmp_path, monkeypatch):
+    emitted = _emitted(monkeypatch)
+    cfg, conn, rid, rvw = _setup(tmp_path, _Backend())
+    monkeypatch.setattr(differ, "build_diff", lambda art, *_: _diff())
+    monkeypatch.setattr(engine, "triage", lambda *a, **k: _T)
+    monkeypatch.setattr(rvw, "prepare", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("prepare broke")))
+    orchestrator._process_fetched(cfg, conn, rvw, None, NewRelease("pkg", "1.0.0", 1),
+                                  ArtifactSet("pkg", "1.0.0", "0.9", "sdist", {}, {}, {}))
+    _assert_quiet(conn, emitted, "review_failed")
+
+
+def test_an_interrupted_review_the_drain_cannot_finish_stays_queued_silently(tmp_path, monkeypatch):
+    emitted = _emitted(monkeypatch)
+    cfg, conn, rid, _ = _setup(tmp_path, _Backend())
+    store.park_for_review(conn, rid, "in_review", "the review was interrupted before it finished",
+                          reviewer.build_review_input(_diff(), _T, max_chars=cfg.reviewer.max_input_chars))
+    rvw = reviewer.Reviewer(cfg, backend=_Backend(fail=_REFUSED))
+    for _ in range(2):
+        orchestrator.drain_pending(cfg, conn, rvw, auto=True)
+    _assert_quiet(conn, emitted, "endpoint_unreachable")
+
+
+def test_a_partial_benign_review_waits_for_a_person_without_an_alert(tmp_path, monkeypatch):
+    emitted = _emitted(monkeypatch)
+    small = FileDiff("setup.py", "modified", [Hunk((0, 0), (0, 1), ["os.system('id')"], [])])
+    big = FileDiff("big.py", "modified", [Hunk((0, 0), (0, 1), ["X" * 3000], [])])
+    tr = TriageResult(50.0, [FiredRule("autoexec", 50.0, "setup.py", (1, 1)),
+                             FiredRule("autoexec", 40.0, "big.py", (1, 1))], True)
+    cfg, conn, rid, _ = _setup(tmp_path, _Backend(), max_input_chars=500)    # big.py can't fit; setup.py can
+    orchestrator._review_escalated(cfg, conn, reviewer.Reviewer(cfg, backend=_Backend()),
+                                   Diff("pkg", "1.0.0", False, [small, big], []), tr, rid)
+    assert store.get_stage(conn, "pkg", "1.0.0") == "needs_adjudication" and emitted == []
+    [v] = conn.execute("SELECT classification, reasoning FROM verdicts").fetchall()
+    assert v["classification"] == "benign" and v["reasoning"].startswith("reviewed partially:")
+    c = dashboard.counts([dict(r) for r in store.all_verdicts(conn)])
+    assert (c["partial"], c["not_scanned"]) == (1, 0)
