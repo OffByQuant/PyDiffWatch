@@ -2,7 +2,7 @@ import io, gzip, tarfile, hashlib, json, time, urllib.request, urllib.error, pos
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from .config import Config
-from .models import NewRelease, ArtifactSet
+from .models import NewRelease, ArtifactSet, Download
 from . import quarantine, deps, egress, execctx
 
 class RefusedToExtract(Exception): ...
@@ -281,10 +281,15 @@ def _switched_from(releases: dict, version: str) -> str | None:
                 and (ts := first(files)) is not None and ts < t), default=None)
     return prev[1] if prev and _sdist(releases[prev[1]]) else None
 
-def fetch_artifacts(cfg, rel: NewRelease, attempt: int = 1) -> ArtifactSet | NoSdist:
-    """Fetch + extract the sdist(s) for one release. The baseline is resolved from PyPI's version
-    history (the package JSON), NOT our DB: an UPDATE (a prior version exists) is diffed against its
-    predecessor; a genuinely NEW package (no prior) is handled per cfg.new_package_policy.
+def _prior_unavailable(prior_ver, e) -> str:
+    return f"prior {prior_ver} sdist unavailable ({type(e).__name__}: {e}); diffed against nothing"
+
+
+def download(cfg, rel: NewRelease, attempt: int = 1) -> Download | NoSdist:
+    """The network half of a scan: the package JSON, both sdists as bytes, and the dependency screening. Opens no
+    archive (extract_download does). The baseline is resolved from PyPI's version history (the package JSON), NOT
+    our DB: an UPDATE (a prior version exists) is diffed against its predecessor; a genuinely NEW package (no
+    prior) is handled per cfg.new_package_policy.
     Attempt k (a retry) gives the package JSON and the sdist downloads k times their deadlines. The
     requires_dist and dependency lookups keep theirs: they swallow every error, so more time can't turn a
     failure into a success, only lengthen the retry."""
@@ -313,48 +318,66 @@ def fetch_artifacts(cfg, rel: NewRelease, attempt: int = 1) -> ArtifactSet | NoS
     info = meta.get("info") or {}
     # The package-level JSON carries the LATEST version's info; another version's claim is not this one's.
     summary = info.get("summary") if info.get("version") == rel.version else None
-
     if is_new and cfg.new_package_policy == "skip":
         # New package, skip policy: don't even download — but still record who shipped it, so a later
         # version of this package has a maintainer baseline to diff against (maintainer-set-change).
-        return ArtifactSet(rel.package, rel.version, None, "sdist", {}, {}, {}, [],
-                           is_new_package=True, maintainer_metadata=mtmeta, description=summary)
+        return Download(rel.package, rel.version, None, True, None, None, None, mtmeta, [], None, summary)
+    new_blob = _download(new_sd["url"], slow)
+    prior_ver = prior_blob = prior_error = None
+    dep_findings: list[dict] = []
+    req_change: dict = {}
+    if not is_new:
+        prior_ver, prior_url = pred
+        try:
+            prior_blob = _download(prior_url, slow)
+        except Exception as e:     # as npm does: diff against nothing (every file reported), and say so
+            prior_error = _prior_unavailable(prior_ver, e)
+        # signal 5: flag suspicious newly-added dependencies vs the predecessor (update path only).
+        dep_findings = _screen_added_deps(meta, rel.package, prior_ver, cfg, change=req_change, version=rel.version)
+    return Download(rel.package, rel.version, prior_ver, is_new, new_blob, prior_blob, prior_error, mtmeta,
+                    dep_findings, req_change if any(req_change.values()) else None, summary)
 
-    new_files, new_bins = extract_sdist(_download(new_sd["url"], slow), cfg)
-    summary = _pkginfo_summary(new_files) or summary     # before the surface filter drops PKG-INFO
+
+def extract_download(cfg, dl: Download) -> ArtifactSet:
+    """The parsing half of a scan: unpack both sdists and keep what changed. Touches no network. Raises
+    RefusedToExtract for the new sdist only; a prior that fails to unpack is diffed against nothing."""
+    if dl.new_blob is None:     # a new package under the skip policy: nothing was downloaded
+        return ArtifactSet(dl.package, dl.version, None, "sdist", {}, {}, {}, [], is_new_package=True,
+                           maintainer_metadata=dl.maintainer_metadata, description=dl.description)
+    new_files, new_bins = extract_sdist(dl.new_blob, cfg)
+    summary = _pkginfo_summary(new_files) or dl.description   # before the surface filter drops PKG-INFO
     # Before the prior comparison drops unchanged ones: the execution context must know an oversized
     # setup.py is there even when it did not change (padding it must not read as "absent").
     too_large = tuple(b["path"] for b in new_bins if b.get("reason") == "source-too-large")
     prior_files: dict[str, bytes] = {}
-    prior_bins = None
-    prior_ver = None
-    prior_error = None
-    dep_findings: list[dict] = []
+    prior_error = dl.prior_error
     surface_omitted = None
-    req_change: dict = {}
-    if is_new:
+    if dl.is_new_package:
         if cfg.new_package_policy == "surface":
             # Scan only the install/import-time surface — small, never truncated, high-value.
             n = len(new_files)
             new_files = {p: b for p, b in new_files.items() if _is_surface(p)}
             surface_omitted = n - len(new_files)          # the reviewer is told these exist (B11)
         # "full": keep the whole tree (legacy whole-codebase scan)
-    else:
-        prior_ver, prior_url = pred
+    elif dl.prior_blob is not None:
         try:
-            prior_files, prior_bins = extract_sdist(_download(prior_url, slow), cfg)
+            prior_files, prior_bins = extract_sdist(dl.prior_blob, cfg)
         except Exception as e:     # as npm does: diff against nothing (every file reported), and say so
-            prior_error = f"prior {prior_ver} sdist unavailable ({type(e).__name__}: {e}); diffed against nothing"
-        if prior_bins is not None:
+            prior_error = _prior_unavailable(dl.prior_version, e)
+        else:
             # Only what this release adds or changes is a signal; an unchanged oversized/binary/foreign
             # file republished release after release is not.
             same = {(b["path"], b.get("sha256")) for b in prior_bins if b.get("sha256")}
             new_bins = [b for b in new_bins if (b["path"], b.get("sha256")) not in same]
-        # signal 5: flag suspicious newly-added dependencies vs the predecessor (update path only).
-        dep_findings = _screen_added_deps(meta, rel.package, prior_ver, cfg, change=req_change, version=rel.version)
-    return ArtifactSet(rel.package, rel.version, prior_ver, "sdist",
+    return ArtifactSet(dl.package, dl.version, dl.prior_version, "sdist",
                        new_files, prior_files, {}, _cap_foreign(new_bins, cfg),
-                       is_new_package=is_new, maintainer_metadata=mtmeta,
-                       added_dep_findings=dep_findings, prior_error=prior_error, description=summary,
+                       is_new_package=dl.is_new_package, maintainer_metadata=dl.maintainer_metadata,
+                       added_dep_findings=list(dl.added_dep_findings), prior_error=prior_error, description=summary,
                        too_large=too_large, surface_omitted=surface_omitted,
-                       requires_dist_change=req_change if any(req_change.values()) else None)
+                       requires_dist_change=dl.requires_dist_change)
+
+
+def fetch_artifacts(cfg, rel: NewRelease, attempt: int = 1) -> ArtifactSet | NoSdist:
+    """download + extract_download in one call (tests and one-off tools; the pipeline calls the halves)."""
+    dl = download(cfg, rel, attempt)
+    return extract_download(cfg, dl) if isinstance(dl, Download) else dl   # a stubbed None passes through
