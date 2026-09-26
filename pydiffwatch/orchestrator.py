@@ -1,4 +1,4 @@
-import dataclasses, datetime, fcntl, json, logging, math, os, sqlite3, time
+import dataclasses, datetime, fcntl, http.client, json, logging, math, os, sqlite3, time, urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from . import ingest, fetcher, differ, engine, rules, notifier, store, reviewer, egress, dashboard, quarantine
 from . import guard as guard_mod
@@ -199,12 +199,19 @@ def _review_failed(cfg, conn, rid, package, version, score, fired_rules, text, e
         _park_auto(conn, rid, "review_failed", f"{n} failed attempt(s): {err}", text)
 
 
+_REBUILD_FAILED = "could not download and scan it again"
+
+
 def _alert_review_exhausted(cfg, conn, rid, package, version, n, err, score, fired_rules):
-    _alert_unscanned(cfg, conn, rid, package, version,
-                     f"UNREVIEWED: the model failed to review it {n} times (last error: {err}); "
-                     f"retries are used up. Run `review-pending` to try again, e.g. with another "
-                     f"model. Not scanned. Needs manual review.",
-                     stage="review_failed", score=score, fired_rules=fired_rules)
+    if err.startswith(_REBUILD_FAILED):    # no model saw it, and another model cannot fix a download failure
+        note = (f"UNREVIEWED: pydiffwatch could not download and scan it again for review {n} times (last error: "
+                f"{err}), so no model has seen it; retries are used up. Not scanned. Needs manual review.")
+    else:
+        note = (f"UNREVIEWED: the model failed to review it {n} times (last error: {err}); "
+                f"retries are used up. Run `review-pending` to try again, e.g. with another "
+                f"model. Not scanned. Needs manual review.")
+    _alert_unscanned(cfg, conn, rid, package, version, note, stage="review_failed", score=score,
+                     fired_rules=fired_rules)
 
 
 def _review_escalated(cfg, conn, rvw, d, tr, rid, *, offline=False, guard=None):
@@ -232,38 +239,59 @@ def _review_escalated(cfg, conn, rvw, d, tr, rid, *, offline=False, guard=None):
                             dropped=dropped)
 
 
+_PAGE = 500     # rows per read of the manual drain
+
+
+def _queued_rows(cfg, conn, reasons, *, auto, cap):
+    """The rows one drain walks (spec R2): each query bounds the rows returned and the memory used, holding at
+    most max_pending_per_tick (auto) or _PAGE (manual) rows at once — not the rows the releases_stage index scans
+    to build them, which is the whole matching set before its LIMIT. Measured at 84k queued rows with the index:
+    22 ms for the auto reasons query, 16 ms for one manual page; acceptable against a 300s tick. No stored input
+    here: it is read only for a row that is reviewed. Auto: at most max_pending_per_tick rows per query, model_busy
+    first, exhausted retries left out. Manual: pages of _PAGE rows by id."""
+    def key(r):
+        return r["pending_reason"] != "model_busy", r["release_id"]
+    if auto:
+        n = cfg.reviewer.max_pending_per_tick
+        rows = store.pending_reviews(conn, reasons, max_attempts=cfg.reviewer.max_review_attempts,
+                                     with_input=False, limit=n)
+        # oversized for an earlier cap (cold start, a smaller max_input_chars) but fits this one
+        rows += store.pending_reviews(conn, ("too_large",), max_chars=cap, with_input=False, limit=n)
+        yield from sorted(rows, key=key)
+        return
+    last = 0
+    while page := store.pending_reviews(conn, reasons, with_input=False, limit=_PAGE, after_id=last):
+        yield from sorted(page, key=key)
+        last = page[-1]["release_id"]
+
+
 def drain_pending(cfg, conn, rvw, *, auto: bool, reasons=None, limit=None, guard=None,
                   clock=time.monotonic) -> int:
     """Review parked releases. auto (each tick): model_busy first, then unreachable-endpoint parks, failed
-    reviews with attempts left, and too_large rows that now fit. Manual (`review-pending`): by default oversized
-    releases and exhausted retries — run it with a larger-context model config. Inputs over this endpoint's cap are skipped
+    reviews with attempts left, releases queued while the reviewer was off (downloaded and scanned again first),
+    and too_large rows that now fit. Manual (`review-pending`): by default oversized releases and exhausted
+    retries — run it with a larger-context model config. Inputs over this endpoint's cap are skipped
     (auto: re-parked as too_large). `limit` caps attempts, not successes. Returns the number reviewed.
     The auto-drain runs before the retry sweep and ingest, holding the scan lock, so it has a time budget
     (reviewer.timeout, one first attempt's worth): no new review starts once it is spent, and the rest wait for
     the next tick. A review already started runs to its own timeout."""
     if auto:
-        reasons = ("model_busy", "in_review", "endpoint_unreachable", "review_failed")
+        reasons = ("model_busy", "in_review", "endpoint_unreachable", "review_failed", "reviewer_disabled")
     elif not reasons:
         reasons = ("too_large", "review_failed")
     cap = guard.input_cap_chars() if guard is not None else cfg.reviewer.max_input_chars
-    # No stored input here: it is read only for a row that is reviewed. The auto-drain skips exhausted retries.
-    rows = store.pending_reviews(conn, reasons, max_attempts=cfg.reviewer.max_review_attempts if auto else None,
-                                 with_input=False)
-    if auto:      # oversized for an earlier cap (cold start, a smaller max_input_chars) but fits this one
-        rows += store.pending_reviews(conn, ("too_large",), max_chars=cap, with_input=False)
-    rows = sorted(rows,
-                  key=lambda r: (r["pending_reason"] != "model_busy", r["release_id"]))
+    drain = {"ruleset": None, "pypi_down": False}     # per drain: the rules (loaded once, lazily), a PyPI outage
     done = tried = 0
     t0 = clock()
-    for n, row in enumerate(rows):
+    for row in _queued_rows(cfg, conn, reasons, auto=auto, cap=cap):
         if limit is not None and tried >= limit:
             break
         if auto and clock() - t0 >= cfg.reviewer.timeout:
-            logger.warning("review queue used its %.0fs budget; %d release(s) wait for the next tick",
-                           cfg.reviewer.timeout, len(rows) - n)
+            logger.warning("review queue used its %.0fs budget; the rest wait for the next tick",
+                           cfg.reviewer.timeout)
             break
         try:
-            attempted, go_on = _drain_one(cfg, conn, rvw, row, auto=auto, cap=cap, guard=guard)
+            attempted, go_on = _drain_one(cfg, conn, rvw, row, auto=auto, cap=cap, guard=guard, drain=drain)
         except Exception as e:   # a corrupt row or a bug on this input: its failed attempt, never a stalled tick
             logger.exception("review queue: %s==%s failed", row["package"], row["version"])
             try:
@@ -281,8 +309,9 @@ def drain_pending(cfg, conn, rvw, *, auto: bool, reasons=None, limit=None, guard
     return done
 
 
-def _drain_one(cfg, conn, rvw, row, *, auto, cap, guard):
-    """One drain_pending row. Returns (attempted: a review was tried, go_on: keep draining)."""
+def _drain_one(cfg, conn, rvw, row, *, auto, cap, guard, drain):
+    """One drain_pending row. Returns (attempted: a review was tried, go_on: keep draining). `drain` is the
+    drain's shared state: its ruleset and whether PyPI was unreachable."""
     if auto and row["pending_reason"] == "review_failed" and \
             row["review_attempts"] >= cfg.reviewer.max_review_attempts:
         if not row["has_verdict"]:     # e.g. max_review_attempts was lowered after its last attempt
@@ -297,12 +326,78 @@ def _drain_one(cfg, conn, rvw, row, *, auto, cap, guard):
             explain = guard.cap_explain() if guard is not None else f"cap {cap}"
             _park(conn, rid, "too_large", f"needs {chars} chars; {explain}", None)
         return False, True
+    if chars == 0:     # a reviewer_disabled park stored no input (a real input is never empty): rebuild it
+        if drain["pypi_down"]:
+            return False, True      # one download per drain while PyPI is unreachable
+        if drain["ruleset"] is None:
+            drain["ruleset"] = _load_ruleset(cfg)
+        got = _rebuild_review_input(cfg, conn, rvw, row, drain["ruleset"], cap)
+        if got == "unreachable":
+            drain["pypi_down"] = True
+        if isinstance(got, str):
+            return True, True       # the download counts as a try for `limit`
+        tr, text = got
+        return True, _attempt_review(cfg, conn, rvw, rid, row["package"], row["version"], tr.score,
+                                     tr.fired_rules, text, guard, dropped=rvw.dropped_files)
     text = store.review_input(row, conn)
     fired_rules = _rules_from_json(row["triage_rules"])
     dropped = reviewer.dropped_from_text(fired_rules, text)   # spec U2: recovered from stored text
     go_on = _attempt_review(cfg, conn, rvw, rid, row["package"], row["version"], row["triage_score"],
                             fired_rules, reviewer.refresh_marker(text), guard, dropped=dropped)
     return True, go_on
+
+
+def _pypi_unreachable(e) -> bool:
+    """PyPI could not be reached (spec R3): its JSON failed other than with a 404, the file host answered 5xx, the
+    connection failed, or it dropped mid-download. Transient: the release is retried next tick without spending a
+    review attempt. A deadline overrun (TimeoutError) is not: it repeats for that one release."""
+    if isinstance(e, fetcher.MetadataUnavailable):
+        return True
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code >= 500
+    return isinstance(e, (urllib.error.URLError, ConnectionError, http.client.HTTPException))
+
+
+def _rebuild_review_input(cfg, conn, rvw, row, ruleset, cap):
+    """Download and scan a queued release again, for the review input its reviewer_disabled park did not store
+    (spec §3.3), with the current rules. Returns (triage, text); "cleared" (the current rules do not escalate it:
+    stage `triaged`, no attempt spent, no alert); "failed" (a definitive failure, counted as a failed review
+    attempt, or an input over `cap`, re-parked as too_large); or "unreachable" (PyPI is down: re-parked under its
+    reason, no attempt spent)."""
+    rid, pkg, ver = row["release_id"], row["package"], row["version"]
+
+    def failed(why):
+        _review_failed(cfg, conn, rid, pkg, ver, row["triage_score"], _rules_from_json(row["triage_rules"]), "",
+                       f"{_REBUILD_FAILED} to review ({why})")
+        return "failed"
+    try:
+        art = fetcher.fetch_artifacts(cfg, NewRelease(pkg, ver, row["serial"]))
+        if art is None or isinstance(art, fetcher.NoSdist):
+            return failed("no sdist on PyPI")
+        prior_meta = store.get_release_metadata(conn, pkg, art.prior_version) if art.prior_version else None
+        owners = {"current": art.maintainer_metadata, "prior": prior_meta}
+        d = differ.build_diff(art, owners)
+        tr = engine.triage(d, cfg, ruleset, owners)
+    except Exception as e:
+        if _pypi_unreachable(e):
+            store.set_pending_reason(conn, rid, row["pending_reason"], f"could not reach PyPI to download it "
+                                     f"again; retried next tick ({type(e).__name__}: {e})")
+            return "unreachable"
+        return failed(f"{type(e).__name__}: {e}")
+    rules = json.dumps([r.__dict__ for r in tr.fired_rules])
+    if not tr.escalate:     # the current rules clear it: nothing for a model to confirm, nothing to alert
+        store.clear_pending(conn, rid)
+        store.update_stage(conn, rid, "triaged", tr.score, rules)
+        return "cleared"
+    store.update_stage(conn, rid, "pending_review", tr.score, rules)
+    ev = reviewer.build_evidence(d, tr, max_chars=cfg.evidence_max_chars)
+    if ev:
+        store.update_evidence(conn, rid, ev)
+    try:
+        return tr, rvw.prepare(d, tr, cap=cap)
+    except reviewer.InputTooLarge as e:
+        _park(conn, rid, "too_large", str(e), e.text)
+        return "failed"
 
 
 

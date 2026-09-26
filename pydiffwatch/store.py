@@ -72,6 +72,9 @@ def migrate_schema(conn):
                       "queued for review, so the reason was not kept. Not scanned. Needs manual review.", _now()))
         conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('unreviewed_refusals', ?)", (_now(),))
         conn.commit()
+    # The review queue's reads (every tick: pending_review_counts, the drain, `pending`) use it instead of a scan.
+    conn.execute("CREATE INDEX IF NOT EXISTS releases_stage ON releases(stage, pending_reason)")
+    conn.commit()
 
 def get_last_serial(conn) -> int:
     return conn.execute("SELECT last_serial FROM cursor WHERE id=1").fetchone()[0]
@@ -240,13 +243,15 @@ def clear_pending(conn, release_id):
                  (release_id,))
     conn.commit()
 
-def pending_reviews(conn, reasons=None, max_chars=None, max_attempts=None, with_input=True):
+def pending_reviews(conn, reasons=None, max_chars=None, max_attempts=None, with_input=True, limit=None,
+                    after_id=None):
     """Rows parked for review and not labelled by a person, optionally only those with `reasons` or input at most
-    `max_chars`. With `max_attempts`, a review_failed row with that many attempts that has already warned (has a
-    verdict) is left out: the auto-drain never retries it. `with_input=False` leaves the stored input out
-    (review_input(row, conn) loads it). `has_verdict` says whether a row has a verdict; `review_input_chars` is the
-    input's length."""
-    sql = ("SELECT id AS release_id, package, version, triage_score, triage_rules, pending_reason, "
+    `max_chars`. `limit` bounds the read (spec R2): model_busy rows first, then by id; with `after_id` (one page of
+    the manual drain) only rows past that id, by id. With `max_attempts`, a review_failed row with that many
+    attempts that has already warned (has a verdict) is left out: the auto-drain never retries it.
+    `with_input=False` leaves the stored input out (review_input(row, conn) loads it). `has_verdict` says whether a
+    row has a verdict; `review_input_chars` is the input's length."""
+    sql = ("SELECT id AS release_id, package, version, serial, triage_score, triage_rules, pending_reason, "
            "pending_detail, COALESCE(review_attempts,0) AS review_attempts, review_input_chars, "
            + ("review_input, " if with_input else "") +
            "EXISTS(SELECT 1 FROM verdicts v WHERE v.release_id = releases.id) AS has_verdict "
@@ -261,7 +266,13 @@ def pending_reviews(conn, reasons=None, max_chars=None, max_attempts=None, with_
     if max_chars is not None:
         sql += " AND review_input_chars <= ?"
         params.append(max_chars)
-    return conn.execute(sql + " ORDER BY id", params).fetchall()
+    if after_id is not None:
+        sql += " AND id > ?"
+        params.append(after_id)
+    if limit is None:
+        return conn.execute(sql + " ORDER BY id", params).fetchall()
+    order = " ORDER BY id" if after_id is not None else " ORDER BY pending_reason != 'model_busy', id"
+    return conn.execute(sql + order + " LIMIT ?", params + [limit]).fetchall()
 
 def review_input(row, conn=None) -> str:
     """A parked row's stored review input; read from `conn` when the row was selected without it."""
