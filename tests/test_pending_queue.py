@@ -137,8 +137,8 @@ def test_unreachable_model_does_not_pin_the_cursor(tmp_path, monkeypatch, scan_s
     monkeypatch.setattr(ingest, "changes_since", lambda *a, **k: [rel])
     art = ArtifactSet("pkg", "1.0.0", "0.9.0", "sdist", {}, {}, {})
     scan_stub.fetch(lambda cfg, rel, **k: art)
-    monkeypatch.setattr(orchestrator.differ, "build_diff", lambda art, *_: _diff())
-    monkeypatch.setattr(orchestrator.engine, "triage", lambda *a, **k: _T)
+    monkeypatch.setattr(orchestrator.sandbox, "analyze",
+                        lambda cfg, dl, owners, ruleset, backend=None: (_diff(), _T, None))
     monkeypatch.setattr(orchestrator, "_probe_reviewer", lambda cfg: (False, "127.0.0.1:9"))
     orchestrator.run_once(cfg, seed_if_fresh=False)
     conn = store.connect(cfg)

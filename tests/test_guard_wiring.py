@@ -122,8 +122,8 @@ def test_hung_endpoint_costs_one_timeout_and_the_cursor_advances(tmp_path, monke
     monkeypatch.setattr(ingest, "changes_since", lambda *a, **k: rels)
     art = ArtifactSet("a", "1.0.0", "0.9.0", "sdist", {}, {}, {})
     scan_stub.fetch(lambda cfg, rel, **k: art)
-    monkeypatch.setattr(orchestrator.differ, "build_diff", lambda a, *_: _diff("x"))
-    monkeypatch.setattr(orchestrator.engine, "triage", lambda *a, **k: _T)
+    monkeypatch.setattr(orchestrator.sandbox, "analyze",
+                        lambda cfg, dl, owners, ruleset, backend=None: (_diff("x"), _T, None))
     monkeypatch.setattr(orchestrator, "_probe_reviewer", lambda cfg: (True, "127.0.0.1:8000"))
     monkeypatch.setattr(orchestrator, "_build_reviewer", lambda cfg: reviewer.Reviewer(cfg, backend=be))
     conn = store.connect(cfg)

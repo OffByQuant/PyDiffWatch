@@ -268,7 +268,7 @@ def test_hostile_signal_strings_cannot_forge_a_heading(bad):
 
 # ---- the pipeline: the maintainer context reaches the block ----
 
-def test_process_fetched_gives_the_reviewer_the_signals(tmp_path):
+def test_process_fetched_gives_the_reviewer_the_signals(tmp_path, scan_stub):
     cfg = Config(db_path=tmp_path / "o.sqlite", lock_path=tmp_path / "lk")
     conn = store.connect(cfg); store.init_schema(conn)
     prior = store.record_release(conn, "p", "1.0", 1, False, None, "sdist")
@@ -286,7 +286,8 @@ def test_process_fetched_gives_the_reviewer_the_signals(tmp_path):
         def review_text(self, *a, **kw):
             return Verdict("p", "1.1", "benign", 60.0, [], False, confidence=0.5, attack_type="none",
                            reasoning="r", cited_hunk="", recommended_action="monitor", model="m")
-    orchestrator._process_fetched(cfg, conn, _R(), orchestrator._load_ruleset(cfg), NewRelease("p", "1.1", 5), art)
+    orchestrator._process_fetched(cfg, conn, _R(), orchestrator._load_ruleset(cfg), NewRelease("p", "1.1", 5),
+                                  scan_stub.dl(art))
     body = _untrusted(seen["text"])
     assert "  dependency reqeusts: typosquat of requests (a popular package)" in body
     assert "  maintainer set changed: alice -> mallory" in body

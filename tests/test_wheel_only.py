@@ -145,7 +145,7 @@ def test_prune_keeps_the_waiting_and_the_switch_rows(tmp_cfg, monkeypatch, capsy
     conn = _switch_alerted(tmp_cfg, monkeypatch, capsys)                  # sw 1.1: no_sdist, with the warning
     _pypi(monkeypatch, {"sw": _meta("sw", SW), "wt": _meta("wt", SW)})
     orchestrator._process_fetched(tmp_cfg, conn, None, None, NewRelease("wt", "1.1", 11),
-                                  fetcher.fetch_artifacts(tmp_cfg, NewRelease("wt", "1.1", 11)))
+                                  fetcher.download(tmp_cfg, NewRelease("wt", "1.1", 11)))
     assert store.get_stage(conn, "wt", "1.1") == "no_sdist_wait"
     for pkg in ("sw", "wt"):                                              # so 1.1 is not the newest
         store.record_release(conn, pkg, "9.9", 99, False, None, "sdist")

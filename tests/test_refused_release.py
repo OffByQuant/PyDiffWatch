@@ -5,15 +5,17 @@ from pydiffwatch import fetcher, notifier, orchestrator, store
 from pydiffwatch.models import NewRelease
 
 
-def _refuse(cfg, exc, capsys):
+def _refuse(cfg, exc, capsys, scan_stub=None):
     conn = store.connect(cfg); store.init_schema(conn)
     rel = NewRelease("big-native-pkg", "0.1.0", 7)
+    if isinstance(exc, fetcher.RefusedToExtract):
+        exc = scan_stub.dl(exc, rel.package, rel.version)
     orchestrator._process_fetched(cfg, conn, None, None, rel, exc)
     return conn, capsys.readouterr().out
 
 
-def test_refused_extract_alert_names_the_reason_and_asks_for_a_manual_review(tmp_cfg, capsys):
-    _, out = _refuse(tmp_cfg, fetcher.RefusedToExtract("decompressed-size"), capsys)
+def test_refused_extract_alert_names_the_reason_and_asks_for_a_manual_review(tmp_cfg, capsys, scan_stub):
+    _, out = _refuse(tmp_cfg, fetcher.RefusedToExtract("decompressed-size"), capsys, scan_stub)
     assert "big-native-pkg 0.1.0" in out
     assert "decompressed-size" in out and "manual review" in out and "UNREVIEWED" in out
 
@@ -25,7 +27,7 @@ def test_size_refusal_alerts_with_its_reason(tmp_cfg, capsys):
 
 
 def test_refused_release_waits_in_pending_without_a_refetch(tmp_cfg, capsys, monkeypatch, scan_stub):
-    conn, _ = _refuse(tmp_cfg, fetcher.RefusedToExtract("members"), capsys)
+    conn, _ = _refuse(tmp_cfg, fetcher.RefusedToExtract("members"), capsys, scan_stub)
     assert store.get_stage(conn, "big-native-pkg", "0.1.0") == "refused_to_extract"
     scan_stub.fetch(lambda *a: (_ for _ in ()).throw(AssertionError("refetched")))
     [item] = orchestrator.list_pending(tmp_cfg)
@@ -40,8 +42,8 @@ def test_size_refused_release_waits_in_pending(tmp_cfg, capsys, monkeypatch, sca
     assert "download-size" in item["reasoning"] and "refused" in item["fetch_error"]
 
 
-def test_refused_release_can_be_adjudicated(tmp_cfg, capsys, monkeypatch):
-    conn, _ = _refuse(tmp_cfg, fetcher.RefusedToExtract("total-size"), capsys)
+def test_refused_release_can_be_adjudicated(tmp_cfg, capsys, monkeypatch, scan_stub):
+    conn, _ = _refuse(tmp_cfg, fetcher.RefusedToExtract("total-size"), capsys, scan_stub)
     monkeypatch.setattr(notifier, "post_webhook", lambda *a: True)
     rid = conn.execute("SELECT id FROM releases").fetchone()[0]
     assert len(orchestrator.list_pending(tmp_cfg)) == 1
@@ -49,8 +51,8 @@ def test_refused_release_can_be_adjudicated(tmp_cfg, capsys, monkeypatch):
     assert orchestrator.list_pending(tmp_cfg) == []
 
 
-def test_zip_refusal_names_the_format_and_drops_malformed(tmp_cfg, capsys):
-    conn, out = _refuse(tmp_cfg, fetcher.RefusedToExtract("zip-sdist"), capsys)
+def test_zip_refusal_names_the_format_and_drops_malformed(tmp_cfg, capsys, scan_stub):
+    conn, out = _refuse(tmp_cfg, fetcher.RefusedToExtract("zip-sdist"), capsys, scan_stub)
     assert store.get_stage(conn, "big-native-pkg", "0.1.0") == "refused_to_extract"
     assert "(zip-sdist: it is a zip archive, which pydiffwatch does not unpack)" in out
     assert "Oversized archives can hide a payload from scanners." in out and "malformed" not in out
