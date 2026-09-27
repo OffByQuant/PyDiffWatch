@@ -84,3 +84,33 @@ def test_load_config_on_a_directory_raises_file_not_found(tmp_path):
     # Final review: path.exists() let a directory through to read_text(), an IsADirectoryError traceback.
     with pytest.raises(FileNotFoundError, match="not a file"):
         load_config(tmp_path)
+
+
+# ---- C2: the parse sandbox keys ----
+
+def test_parse_sandbox_defaults():
+    c = Config()
+    assert (c.parse_sandbox, c.parse_timeout_s, c.parse_memory_max) == ("auto", 120.0, "2G")
+
+
+def test_load_config_passes_the_parse_sandbox_keys_through(tmp_path):
+    p = tmp_path / "c.toml"
+    p.write_text('parse_sandbox = "on"\nparse_timeout_s = 30.0\nparse_memory_max = "1G"\n')
+    c = load_config(p)
+    assert (c.parse_sandbox, c.parse_timeout_s, c.parse_memory_max) == ("on", 30.0, "1G")
+
+
+@pytest.mark.parametrize("bad", ["On", "yes", "", True])
+def test_a_mistyped_parse_sandbox_is_refused_not_read_as_auto(bad):
+    # Review Focus 5: "On" must not quietly mean "auto" (scan unsandboxed) for a user who asked to refuse
+    with pytest.raises(ValueError, match='parse_sandbox must be "auto", "on" or "off"'):
+        Config(parse_sandbox=bad)
+
+
+def test_the_cli_refuses_a_mistyped_parse_sandbox(tmp_path):
+    import argparse
+    from pydiffwatch.__main__ import _cfg
+    p = tmp_path / "c.toml"
+    p.write_text('parse_sandbox = "On"\n')
+    with pytest.raises(SystemExit, match='pydiffwatch: parse_sandbox must be "auto", "on" or "off", got \'On\''):
+        _cfg(argparse.Namespace(config=str(p), model=None, endpoint=None))
