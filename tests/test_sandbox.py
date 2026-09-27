@@ -36,7 +36,7 @@ def test_analyze_renders_signals_from_the_parents_data():
              requires_dist_change={"added": ["reqeusts"], "removed": []})
     owners = {"current": {"roles": ["mallory"]}, "prior": {"roles": ["alice"]}}
     d, _, _ = sandbox.analyze(Config(), dl, owners, rules.load_rules(_RULES))
-    assert "dependency reqeusts: typosquat of requests (a popular package)" in d.signals
+    assert "dependency reqeusts: its name is one or two edits away from the popular package requests; not looked up" in d.signals
     assert "maintainer set changed: alice -> mallory" in d.signals
     assert d.added_dep_findings == dl.added_dep_findings
 
@@ -831,3 +831,12 @@ def test_a_non_string_requires_python_is_a_malformed_reply():
     out["diff"]["requires_python"] = ">=3.14," + "x" * 5000
     with pytest.raises(sandbox.SandboxError, match="malformed requires_python"):
         sandbox._decode_output(json.dumps(out).encode(), cfg, dl, rs)
+
+
+def test_a_looked_up_finding_renders_the_parents_owner_fact():
+    finding = {"name": "reqursts", "reason": "typosquat", "target": "requests", "first_upload": "2026-09-01",
+               "releases": 1, "owner": "different", "same_author_email": False, "same_org": False,
+               "same_author_as_target": False, "pypi_org": None}
+    dl = _dl({"p/a.py": b"x = 2\n"}, {"p/a.py": b"x = 1\n"}, added_dep_findings=[finding])
+    d, _, _ = sandbox.analyze(Config(), dl, None, rules.load_rules(_RULES))
+    assert "a different PyPI owner from this package" in d.signals

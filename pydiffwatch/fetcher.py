@@ -7,7 +7,6 @@ from . import quarantine, deps, egress, execctx
 
 class RefusedToExtract(Exception): ...
 class RefusedToFetch(Exception): ...
-class MetadataGone(Exception): ...          # PyPI's JSON metadata 404s: the project was removed
 class MetadataUnavailable(Exception): ...   # any other metadata failure: retried on later ticks
 
 
@@ -16,6 +15,15 @@ class NoSdist:
     """This version has no sdist (wheel-only, or its wheels uploaded before its sdist). `switched_from`: the
     previous release, when it had an sdist — a switch to wheel-only, which dodges an sdist-only scan."""
     switched_from: str | None = None
+
+
+@dataclass(frozen=True)
+class Removed:
+    """PyPI no longer serves this release (npm #39 port). kind: "project_gone" (the project JSON answers 404) or
+    "version_gone" (the JSON is live but lists no such version). `at`: the changelog's `remove release` time when
+    it was in the same batch, else None (the removal is then confirmed at one re-check before it is recorded)."""
+    kind: str
+    at: str | None = None
 
 class _BoundedReader:
     """Forward-only wrapper over a decompressed stream that refuses once cumulative bytes read
@@ -239,7 +247,7 @@ def _screen_added_deps(meta: dict, package: str, pred_version: str | None, cfg: 
         return []
     return deps.screen_added_deps(added, _corpus(), fetch_json=lambda n: _dep_json(n, cfg),
                                   now=datetime.now(timezone.utc), brandnew_days=cfg.dep_brandnew_days,
-                                  cap=cfg.max_dep_lookups)
+                                  cap=cfg.max_dep_lookups, own=deps.identity(meta))
 
 def _maintainer_metadata(meta: dict, new_sd: dict | None) -> dict:
     """Maintainer identity captured from the package JSON we already fetched — author/maintainer names,
@@ -292,7 +300,7 @@ def _prior_unavailable(prior_ver, e) -> str:
     return f"prior {prior_ver} sdist unavailable ({type(e).__name__}: {e}); diffed against nothing"
 
 
-def download(cfg, rel: NewRelease, attempt: int = 1) -> Download | NoSdist:
+def download(cfg, rel: NewRelease, attempt: int = 1) -> Download | NoSdist | Removed:
     """The network half of a scan: the package JSON, both sdists as bytes, and the dependency screening. Opens no
     archive (extract_download does). The baseline is resolved from PyPI's version history (the package JSON), NOT
     our DB: an UPDATE (a prior version exists) is diffed against its predecessor; a genuinely NEW package (no
@@ -310,12 +318,14 @@ def download(cfg, rel: NewRelease, attempt: int = 1) -> Download | NoSdist:
         meta = _package_json(rel.package, slow)
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            raise MetadataGone(f"{rel.package}: PyPI metadata returned 404") from e
+            return Removed("project_gone", rel.removed_at)
         raise MetadataUnavailable(f"{rel.package}: PyPI metadata returned HTTP {e.code}") from e
     except RefusedToFetch:
         raise                                         # over the size cap: a deterministic refusal
     except Exception as e:
         raise MetadataUnavailable(f"{rel.package}: {type(e).__name__}: {e}") from e
+    if rel.version not in (meta.get("releases") or {}):
+        return Removed("version_gone", rel.removed_at)
     new_sd = _sdist(meta.get("releases", {}).get(rel.version))
     if not new_sd:
         return NoSdist(_switched_from(meta.get("releases", {}), rel.version))   # wheel-only: not scanned
@@ -385,7 +395,7 @@ def extract_download(cfg, dl: Download) -> ArtifactSet:
                        requires_dist_change=dl.requires_dist_change, requires_python=requires_python)
 
 
-def fetch_artifacts(cfg, rel: NewRelease, attempt: int = 1) -> ArtifactSet | NoSdist:
+def fetch_artifacts(cfg, rel: NewRelease, attempt: int = 1) -> ArtifactSet | NoSdist | Removed:
     """download + extract_download in one call (tests and one-off tools; the pipeline calls the halves)."""
     dl = download(cfg, rel, attempt)
     return extract_download(cfg, dl) if isinstance(dl, Download) else dl   # a stubbed None passes through

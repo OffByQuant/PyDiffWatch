@@ -46,7 +46,8 @@ def migrate_schema(conn):
         conn.execute("ALTER TABLE releases ADD COLUMN evidence TEXT"); conn.commit()
     for col, typ in (("review_attempts", "INTEGER DEFAULT 0"), ("pending_reason", "TEXT"),
                      ("pending_detail", "TEXT"), ("review_input", "BLOB"),
-                     ("fetch_attempts", "INTEGER DEFAULT 0"), ("fetch_note", "TEXT"), ("recheck_at", "REAL")):
+                     ("fetch_attempts", "INTEGER DEFAULT 0"), ("fetch_note", "TEXT"), ("recheck_at", "REAL"),
+                     ("removed_reason", "TEXT"), ("removed_at", "TEXT")):
         try:
             conn.execute(f"SELECT {col} FROM releases LIMIT 1")
         except sqlite3.OperationalError:
@@ -71,6 +72,12 @@ def migrate_schema(conn):
                      ("UNREVIEWED: pydiffwatch refused to download or unpack it, recorded before refusals were "
                       "queued for review, so the reason was not kept. Not scanned. Needs manual review.", _now()))
         conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('unreviewed_refusals', ?)", (_now(),))
+        conn.commit()
+    if conn.execute("SELECT 1 FROM meta WHERE key='removed_before_scan'").fetchone() is None:
+        # PR E: metadata_gone was only ever set on a project-JSON 404, so it is project_gone. Its alert rows stay.
+        conn.execute("UPDATE releases SET stage='removed_before_scan', removed_reason='project_gone', removed_at=NULL "
+                     "WHERE stage='metadata_gone'")
+        conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('removed_before_scan', ?)", (_now(),))
         conn.commit()
     # The review queue's reads (every tick: pending_review_counts, the drain, `pending`) use it instead of a scan.
     conn.execute("CREATE INDEX IF NOT EXISTS releases_stage ON releases(stage, pending_reason)")
@@ -328,6 +335,20 @@ def wait_for_sdist(conn, release_id, recheck_at):
 
 def recheck_at(conn, release_id):
     return conn.execute("SELECT recheck_at FROM releases WHERE id=?", (release_id,)).fetchone()[0]
+
+def set_recheck_at(conn, release_id, t):
+    """Set only the re-check time (PR E D6: a queued release PyPI stopped serving waits one re-check)."""
+    conn.execute("UPDATE releases SET recheck_at=? WHERE id=?", (t, release_id))
+    conn.commit()
+
+def record_removed(conn, release_id, reason, at):
+    conn.execute("UPDATE releases SET stage='removed_before_scan', removed_reason=?, removed_at=? WHERE id=?",
+                 (reason, at, release_id))
+    conn.commit()
+
+def removed_counts(conn) -> dict:
+    return dict(conn.execute("SELECT COALESCE(removed_reason, 'unknown'), count(*) FROM releases "
+                             "WHERE stage='removed_before_scan' GROUP BY 1").fetchall())
 
 # Stages a release reaches only after its sdist was downloaded, or refused for its size: the store's own evidence
 # that a package shipped one. refused_to_fetch also covers a quarantine refusal and an over-size package JSON,

@@ -258,6 +258,10 @@ def _status_strip(status: dict) -> str:
     pending = status.get("pending_review") or {}
     pending_txt = (f"{sum(pending.values())} pending LLM review ("
                    + ", ".join(f"{k}: {v}" for k, v in sorted(pending.items())) + ")") if pending else ""
+    removed = status.get("removed") or {}
+    removed_txt = (f"{sum(removed.values())} removed before scan ("
+                   + ", ".join(f"{k.replace('_', ' ')}: {v}" for k, v in sorted(removed.items())) + ")"
+                   ) if removed else ""
     retry = status.get("retry") or {}
     backlog = []
     if retry.get("retrying"):
@@ -275,7 +279,7 @@ def _status_strip(status: dict) -> str:
   <span class="stat">last poll: {e(age)}</span>
   <span class="stat">cursor: {e(serial_txt)}</span>
   <span class="stat">{releases} releases · {_counts_text(model_reviewed, model_flagged, partial, not_scanned)}</span>
-{f'  <span class="stat">{e(pending_txt)}</span>' + chr(10) if pending_txt else ''}{f'  <span class="stat">{e(retry_txt)}</span>' + chr(10) if retry_txt else ''}{f'  <span class="stat">{e(guard_txt)}</span>' + chr(10) if guard_txt else ''}</div>"""
+{f'  <span class="stat">{e(pending_txt)}</span>' + chr(10) if pending_txt else ''}{f'  <span class="stat">{e(removed_txt)}</span>' + chr(10) if removed_txt else ''}{f'  <span class="stat">{e(retry_txt)}</span>' + chr(10) if retry_txt else ''}{f'  <span class="stat">{e(guard_txt)}</span>' + chr(10) if guard_txt else ''}</div>"""
 
 
 def render_dashboard(rows, status: dict = None, generated_at: str = "") -> str:

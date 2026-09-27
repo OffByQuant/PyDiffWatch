@@ -308,7 +308,6 @@ def test_the_rebuild_scores_the_release_with_the_current_rules(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize("result", [
-    fetcher.MetadataGone("pkg: PyPI metadata returned 404"),
     fetcher.NoSdist(),
     fetcher.RefusedToExtract("members"),
     TimeoutError("download took longer than 120s"),
@@ -410,7 +409,7 @@ def test_a_rebuild_downloads_with_the_attempt_it_is_on(tmp_path, monkeypatch, sc
     def fetch(cfg, rel, attempt=1):
         seen.append(attempt)
         if len(seen) == 1:
-            raise fetcher.MetadataGone("pkg: PyPI metadata returned 404")
+            raise fetcher.RefusedToExtract("members")
         return _art()
     scan_stub.fetch(fetch)
     rvw = reviewer.Reviewer(cfg, backend=_Backend())
@@ -472,7 +471,7 @@ def test_a_rebuilt_input_the_guard_defers_is_stored_and_never_downloaded_twice(t
 def test_a_lowered_max_review_attempts_after_a_failed_rebuild_alerts_with_the_rebuild_wording(tmp_path,
                                                                                                monkeypatch, scan_stub):
     cfg, conn, rid = _queued_off(tmp_path, scan_stub)
-    _fetch(scan_stub, fetcher.MetadataGone("pkg: PyPI metadata returned 404"))
+    _fetch(scan_stub, fetcher.RefusedToExtract("members"))
     orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=_Backend()), auto=True)     # attempt 1 of 3
     low = dataclasses.replace(cfg, reviewer=dataclasses.replace(cfg.reviewer, max_review_attempts=1))
     orchestrator.drain_pending(low, conn, reviewer.Reviewer(low, backend=_Backend()), auto=True)
@@ -609,7 +608,7 @@ def test_one_project_whose_metadata_is_gone_for_good_does_not_block_the_other_re
 
 def test_an_exhausted_rebuild_the_current_rules_clear_drops_its_unreviewed_verdict(tmp_path, monkeypatch, scan_stub):
     cfg, conn, rid = _queued_off(tmp_path, scan_stub)
-    _fetch(scan_stub, fetcher.MetadataGone("pkg: PyPI metadata returned 404"))
+    _fetch(scan_stub, fetcher.RefusedToExtract("members"))
     rvw = reviewer.Reviewer(cfg, backend=_Backend())
     for _ in range(cfg.reviewer.max_review_attempts + 1):
         orchestrator.drain_pending(cfg, conn, rvw, auto=True)

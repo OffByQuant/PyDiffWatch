@@ -1,3 +1,4 @@
+import json
 import dataclasses
 import gzip, hashlib, tarfile
 from pydiffwatch import fetcher
@@ -512,3 +513,29 @@ def test_requires_python_is_none_without_the_header(monkeypatch):
 
 def test_a_pkg_info_with_a_bom_parses(monkeypatch):
     assert _art_with({"PKG-INFO": _pkginfo(">=3.14", bom=True), "p/a.py": b""}, monkeypatch).requires_python == ">=3.14"
+
+
+# ---- PR E: the screen knows who published the package ----
+
+def test_a_same_owner_dependency_is_cleared_end_to_end(monkeypatch):
+    from datetime import datetime, timezone, timedelta
+    meta = _meta("acme", [("1.0", "2026-01-01T00:00:00Z"), ("1.1", "2026-02-01T00:00:00Z")])
+    meta["info"] = {"requires_dist": ["reqursts"]}
+    meta["ownership"] = {"roles": [{"role": "Owner", "user": "acme-dev"}]}
+    monkeypatch.setattr(fetcher, "_package_json", lambda p, cfg: meta)
+    monkeypatch.setattr(fetcher, "_requires_dist", lambda pkg, ver, cfg: [])
+    old = (datetime.now(timezone.utc) - timedelta(days=400)).isoformat()
+    monkeypatch.setattr(fetcher, "_dep_json", lambda name, cfg: {
+        "ownership": {"roles": [{"role": "Owner", "user": "ACME-dev"}]},
+        "releases": {"1.0": [{"upload_time_iso_8601": old}]}})
+    blobs = {"mock://acme/1.0": make_sdist({"acme/__init__.py": b"x=1\n"}),
+             "mock://acme/1.1": make_sdist({"acme/__init__.py": b"x=2\n"})}
+    monkeypatch.setattr(fetcher, "_download", lambda url, cfg: blobs[url])
+    art = fetcher.fetch_artifacts(Config(), NewRelease("acme", "1.1", 9))
+    assert art.added_dep_findings == []            # same owner: not a typosquat; 400 days old: not brand-new
+
+
+def test_maintainer_metadata_still_has_no_email(monkeypatch):
+    meta = _meta("acme", [("1.0", "2026-01-01T00:00:00Z")])
+    meta["info"] = {"author_email": "a@b.org", "maintainer_email": "c@d.org"}
+    assert "@" not in json.dumps(fetcher._maintainer_metadata(meta, None))

@@ -281,10 +281,18 @@ it would have declared reads `unknown (<file> unparseable)` instead of a bare "n
 at all, "none" means "none declared *literally* in setup.py" — setup.py is arbitrary code).
 
 **Signals.** A `--- dependency / binary / ownership signals (PyPI metadata and the sdist's file list;
-context, not code) ---` block lists Requires-Dist changes and each dependency finding (typosquat /
-nonexistent / brand-new), added binaries (path, size, reason) and a maintainer-set change — PyDiffWatch's
+context, not code) ---` block lists Requires-Dist changes and each dependency finding (a look-alike name /
+not on PyPI / brand-new), added binaries (path, size, reason) and a maintainer-set change — PyDiffWatch's
 own heuristic screening of metadata, not code for the model to weigh on its own; a dependency-only fire no
 longer dumps every changed file, only the build files and any code lines that name the flagged dependency.
+
+A dependency whose name is one or two edits from a popular package is looked up on PyPI before it is flagged.
+It is not flagged as a look-alike when it shares a PyPI owner with the package, or when it is at least a year old
+with at least 5 releases. Otherwise its line gives the facts: when it was first published, how many releases it
+has, whether its PyPI owner differs from the package's, its PyPI organisation, and whether its metadata names the
+same author email or code-host organisation as the package, or the same author as the popular package. Author
+email and organisation are author-declared, so they are shown but never clear a finding. No line calls a
+dependency a typosquat; that is for the model to judge.
 
 **Hunks.** Each selected file's diff follows, one `@@ new L<start>-<end>` line per hunk giving the new-file
 line range its added/removed lines occupy — the same `file:line-range` shape the model is asked to answer in
@@ -366,9 +374,12 @@ Clear-malicious verdicts alert immediately; borderline "suspicious" ones queue f
 
 **Downloads have deadlines.** Each sdist download is capped at `fetch_deadline_s` (120s total) and PyPI's
 JSON metadata at `packument_deadline_s` (300s total, since a big project lists every release ever
-published); metadata is also capped at `max_metadata_bytes` (64 MB). A metadata **404** means the release
-was pulled before it could be scanned — that's terminal (`metadata_gone`) and alerts on its own, since a
-release PyPI itself removed fast is worth a look. Any other failure on a release (a metadata timeout, 5xx
+published); metadata is also capped at `max_metadata_bytes` (64 MB). A release PyPI no longer serves (its
+project answers **404**, or its JSON no longer lists the version) is **removed before scan**: recorded with its
+kind (`project gone` / `version gone`), with no alert and no `pending` entry, since the files are gone and nobody
+can act on it; the status strip counts them. Unless the changelog already showed its `remove release` event, it
+is re-checked once, `wheel_only_grace_minutes` later, before it is recorded, so a JSON that lags a new upload is
+never mistaken for a removal. Any other failure on a release (a metadata timeout, 5xx
 or malformed JSON, a failed or timed-out sdist download, an error while diffing or scoring it) retries on
 later ticks without holding up the releases after it; after 3 attempts it becomes `gave_up` and shows up
 in `pending`, with the error kept on the release row (`fetch_note`). Each retry attempt gets that many
@@ -376,7 +387,8 @@ times `fetch_deadline_s`/`packument_deadline_s` (attempt 2 gets 240s/600s, attem
 pre-ingest sweep re-fetches releases due for retry, most-tried first, before a time budget of its own
 (`packument_deadline_s`) runs out — the rest wait for the next tick. `pending` and the dashboard's status
 strip show that backlog: `N release(s) being retried (oldest first seen <age>), M given up on` in `pending`,
-`N scan(s) retrying (oldest first seen <age>) · M scan(s) given up` on the dashboard. A retry backlog
+`N scan(s) retrying (oldest first seen <age>) · M scan(s) given up` on the dashboard. Releases PyPI removed
+before they were scanned show as `N removed before scan (project gone: a, version gone: b)`. A retry backlog
 whose oldest row keeps getting older means PyPI (or your network) keeps failing it. If the
 release's *prior* version fails to download, it's diffed against nothing (every file in the new release
 reported as added) rather than skipped, and the release's evidence says so. Within a diff, an
@@ -440,7 +452,7 @@ later review doesn't depend on PyPI still hosting the sdist.
 | `endpoint_unreachable` | the model server is down (each tick prints a warning) | every tick, once it's back |
 | `review_failed` | a review timed out or failed; retried at `timeout` × attempt (300s, 600s, 900s) | every tick, up to `max_review_attempts` (3) |
 | `too_large` | the highest-risk file alone exceeds `max_input_chars` (200k chars) | `review-pending` with a larger-context model; the auto-drain also takes it once it fits the endpoint's cap. No alert |
-| `reviewer_disabled` | no reviewer this run (`reviewer_enabled = false`, or the anthropic backend has no key); no review input or evidence is stored | every tick once a reviewer is enabled: downloaded and scanned again, then reviewed; a PyPI outage spends no attempt |
+| `reviewer_disabled` | no reviewer this run (`reviewer_enabled = false`, or the anthropic backend has no key); no review input or evidence is stored | every tick once a reviewer is enabled: downloaded and scanned again, then reviewed; a PyPI outage spends no attempt; a release PyPI no longer serves when it is downloaded again is re-checked once, then counted as removed before scan (no attempt spent, no alert) |
 
 Each tick retries at most `max_pending_per_tick` (20) queued releases before scanning, and starts no new one once `timeout` (300s) has passed since the first, so a slow model can't hold up the scan for hours. The rest wait for
 you — typically with a bigger model pointed at the same database:
@@ -789,8 +801,8 @@ alert until a model reviews it.
 **Every outcome that leaves a release unscannable alerts once, then waits for you.** A release pydiffwatch could not get a model
 verdict on is never silently dropped: each such outcome fires exactly one `suspicious-heuristic` alert
 (deduped per release + outcome, so a re-tick never repeats it) whose `reasoning` starts `UNREVIEWED:` and
-ends `Not scanned. Needs manual review.` (refusals, `metadata_gone` and `no_content` end differently — see below), and —
-except `metadata_gone`, which alerts only — the release then waits in `pending` labelled
+ends `Not scanned. Needs manual review.` (refusals and `no_content` end differently — see below), and the
+release then waits in `pending` labelled
 `(not scanned: <stage>)`:
 
 | Outcome | `pending` label | Alert wording |
@@ -798,7 +810,6 @@ except `metadata_gone`, which alerts only — the release then waits in `pending
 | Refused to download the sdist (over-size) | `(not scanned: refused_to_fetch)` | `UNREVIEWED: pydiffwatch refused to download it (<reason>: <why>), so nothing in it was scanned. Oversized archives can hide a payload from scanners. Needs manual review.` |
 | A new release of a project on the quarantine list | `(not scanned: refused_to_fetch)` | `UNREVIEWED: this project is on pydiffwatch's quarantine list (<reason>), so this release was not downloaded. Not scanned. Needs manual review.` |
 | Refused to unpack the sdist (over-size archive) | `(not scanned: refused_to_extract)` | `UNREVIEWED: pydiffwatch refused to unpack its sdist (<reason>: <why>), so nothing in it was scanned. Oversized archives can hide a payload from scanners. Needs manual review.` |
-| Metadata 404s before the release could be scanned | *(alert only — not queued; the files are gone)* | `UNREVIEWED: removed from PyPI before it could be scanned (its metadata returns 404); the files are gone, so there is nothing to review.` |
 | Download/scan failed `METADATA_ATTEMPTS` (3) times running (including a corrupt, truncated or non-gzip sdist) | `(not scanned: gave_up)` | `UNREVIEWED: pydiffwatch failed to download or scan it 3 times and gave up (last error: <last error>). Not scanned. Needs manual review.` |
 | Review failed `max_review_attempts` (3) times running | `(not scanned: review_failed)` | `` UNREVIEWED: the model failed to review it <n> times (last error: <last error>); retries are used up. Run `review-pending` to try again, e.g. with another model. Not scanned. Needs manual review. `` or, when the release could not be downloaded again for review: `` UNREVIEWED: pydiffwatch could not download and scan it again for review <n> times (last error: <last error>), so no model has seen it; retries are used up. Not scanned. Needs manual review. `` |
 | With the reviewer on, triage fired only on signals with no text to show the model (a dependency, binary or maintainer change) | `(not scanned: no_content)` | `UNREVIEWED: triage fired (<rules>) but none of the flagged content could be shown to the reviewer. Needs a human.` |

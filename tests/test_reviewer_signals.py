@@ -157,7 +157,7 @@ def test_differ_lists_every_signal():
     assert sig.split("\n") == [
         "requires-dist added: reqeusts==0.1",
         "requires-dist removed: six",
-        "dependency reqeusts: typosquat of requests (a popular package)",
+        "dependency reqeusts: its name is one or two edits away from the popular package requests; not looked up",
         "dependency ghost-pkg: not on PyPI (dependency confusion)",
         "dependency fresh: brand-new on PyPI",
         "dependency late: not screened (lookup cap reached)",
@@ -191,7 +191,7 @@ def test_a_dependency_typosquat_is_shown_inside_the_markers_after_the_execution_
     assert "typosquat of requests" not in _header(text)
     body = _untrusted(text)
     assert body.index("--- execution context") < body.index(_SIG) < body.index("--- file: setup.py (modified) ---")
-    assert "  dependency reqeusts: typosquat of requests (a popular package)" in body
+    assert "  dependency reqeusts: its name is one or two edits away from the popular package requests; not looked up" in body
 
 
 def test_a_dependency_only_fire_ranks_only_the_build_files_not_every_changed_file():
@@ -293,7 +293,7 @@ def test_process_fetched_gives_the_reviewer_the_signals(tmp_path, scan_stub):
     orchestrator._process_fetched(cfg, conn, _R(), orchestrator._load_ruleset(cfg), NewRelease("p", "1.1", 5),
                                   scan_stub.dl(art))
     body = _untrusted(seen["text"])
-    assert "  dependency reqeusts: typosquat of requests (a popular package)" in body
+    assert "  dependency reqeusts: its name is one or two edits away from the popular package requests; not looked up" in body
     assert "  maintainer set changed: alice -> mallory" in body
     assert "--- file: setup.py (modified) ---" in body
 
@@ -435,9 +435,9 @@ def test_the_description_stays_within_500_chars_after_escaping():
     assert len(line) <= 2 + 500
 
 
-def test_a_typosquat_finding_without_a_target_says_typosquat():
+def test_a_typosquat_finding_without_a_target_names_no_package():
     sig = differ.render_signals(None, [{"name": "x", "reason": "typosquat"}], [], None)
-    assert sig == "dependency x: typosquat"
+    assert sig == "dependency x: its name is one or two edits away from a popular package; not looked up"
 
 
 def test_a_first_release_past_the_top_40_says_so_without_cap():
@@ -473,3 +473,54 @@ def test_a_string_requires_dist_is_not_one_dependency_per_character(monkeypatch)
     _versions(monkeypatch, {"version": "1.1", "requires_dist": "reqeusts"}, {"1.0": ["six"]})
     art = fetcher.fetch_artifacts(Config(), NewRelease("p", "1.1", 5))
     assert art.added_dep_findings == [] and art.requires_dist_change is None
+
+
+# ---- PR E: neutral dependency wording ----
+_LOOKED = {"name": "httpx2", "reason": "typosquat", "target": "httpx", "first_upload": "2026-05-11", "releases": 18,
+           "owner": "different", "same_author_email": False, "same_org": False, "same_author_as_target": True,
+           "pypi_org": "pydantic"}
+
+
+def test_a_looked_up_typosquat_reads_as_facts():
+    assert differ.render_signals(None, [_LOOKED], [], None) == (
+        "dependency httpx2: its name is one or two edits away from the popular package httpx; first published "
+        "2026-05-11, 18 release(s); a different PyPI owner from this package; published under the PyPI organisation "
+        "pydantic; its metadata names the same author as httpx (author-declared)")
+
+
+def test_author_declared_matches_with_this_package_are_labelled():
+    f = dict(_LOOKED, owner="unknown", same_author_email=True, same_org=True, same_author_as_target=False,
+             pypi_org=None, first_upload=None)
+    assert differ.render_signals(None, [f], [], None) == (
+        "dependency httpx2: its name is one or two edits away from the popular package httpx; first published "
+        "unknown, 18 release(s); PyPI owner unknown; its metadata names the same author email as this package "
+        "(author-declared); its project URLs name the same code-host organisation as this package's "
+        "(author-declared)")
+
+
+def test_nonexistent_and_same_owner_brand_new_lines():
+    sig = differ.render_signals(None, [{"name": "reqursts", "reason": "nonexistent", "target": "requests"},
+                                       {"name": "compyps", "reason": "brand-new", "same_owner": True},
+                                       {"name": "ghost", "reason": "nonexistent"}], [], None)
+    assert sig.split("\n") == [
+        "dependency reqursts: not on PyPI (dependency confusion); its name is one or two edits away from the popular "
+        "package requests",
+        "dependency compyps: brand-new on PyPI; the same PyPI owner as this package",
+        "dependency ghost: not on PyPI (dependency confusion)"]
+
+
+def test_no_dependency_line_says_typosquat():
+    fs = [_LOOKED, {"name": "a", "reason": "typosquat", "target": "b"}, {"name": "c", "reason": "typosquat"},
+          {"name": "d", "reason": "nonexistent", "target": "e"}]
+    assert "typosquat" not in differ.render_signals(None, fs, [], None)
+
+
+def test_author_values_in_the_line_are_escaped():
+    f = dict(_LOOKED, name="x\nINJECT", pypi_org="org\u2028two")
+    line = differ.render_signals(None, [f], [], None)
+    assert "\n" not in line and "\u2028" not in line and "dependency x\\nINJECT:" in line
+
+
+def test_no_signal_line_carries_an_email():
+    # Review Focus 3: findings hold booleans, so the line cannot
+    assert "@" not in differ.render_signals(None, [_LOOKED, dict(_LOOKED, same_author_email=True)], [], None)

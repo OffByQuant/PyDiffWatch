@@ -6,13 +6,51 @@ the gate is REPUTATION-based: an established, popular dep (in the vendored top-P
 with NO network call; only suspicious names (typosquat-close / nonexistent / brand-new) are flagged.
 No vet-mcp — vet is a peer scanner; depending on it for detection makes DiffWatch downstream/too-late.
 """
+import email.utils
 import os
 import re
+import urllib.parse
 from datetime import datetime, timezone
 
 _CORPUS_PATH = os.path.join(os.path.dirname(__file__), "data", "top_pypi_names.txt")
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")   # leading token of a Requires-Dist line
 _MIN_TYPOSQUAT_LEN = 5   # don't flag distance-1 noise on very short names (<=4 chars)
+_ESTABLISHED_DAYS = 365       # a typosquat-close dep this old AND with this many releases is not a fresh squat
+_ESTABLISHED_RELEASES = 5
+_CODE_HOSTS = {"github.com", "gitlab.com", "codeberg.org", "bitbucket.org"}
+
+
+def identity(meta) -> dict:
+    """Who a package's PyPI JSON says it is: owners (verified PyPI accounts), author/maintainer emails and code-host
+    orgs (both author-declared). Emails are compared in memory only; never stored, logged or rendered."""
+    meta = meta if isinstance(meta, dict) else {}
+    info = meta.get("info") if isinstance(meta.get("info"), dict) else {}
+    own = meta.get("ownership") if isinstance(meta.get("ownership"), dict) else {}
+    roles = own.get("roles") if isinstance(own.get("roles"), list) else []
+    out = {"roles": {r["user"].lower() for r in roles if isinstance(r, dict) and isinstance(r.get("user"), str)},
+           "emails": set(), "orgs": set()}
+    fields = [v for v in (info.get("author_email"), info.get("maintainer_email")) if isinstance(v, str)]
+    for _, addr in email.utils.getaddresses(fields):
+        if "@" in addr:
+            out["emails"].add(addr.strip().lower())
+    urls = info.get("project_urls")
+    urls = list(urls.values()) if isinstance(urls, dict) else []
+    for u in urls + [info.get("home_page")]:
+        if not isinstance(u, str):
+            continue
+        try:
+            p = urllib.parse.urlsplit(u)
+        except ValueError:
+            continue
+        seg = p.path.strip("/").split("/")[0].lower()
+        if (p.hostname or "").lower() in _CODE_HOSTS and seg:
+            out["orgs"].add((p.hostname.lower(), seg))
+    return out
+
+
+def _release_count(meta) -> int:
+    rel = meta.get("releases") if isinstance(meta, dict) else None
+    return sum(1 for files in (rel.values() if isinstance(rel, dict) else ()) if isinstance(files, list) and files)
 
 
 def normalize_name(name: str) -> str:
@@ -74,46 +112,79 @@ def nearest_corpus(name: str, corpus, max_dist: int = 2) -> str | None:
 
 
 def screen_added_deps(added, corpus, *, fetch_json, now=None, brandnew_days: int = 30,
-                      cap: int = 10, cache: dict | None = None) -> list[dict]:
-    """Classify each added (normalized) dep name. Returns a finding dict per suspicious dep:
-      {"name", "reason": "typosquat", "target"} | {"name", "reason": "nonexistent"} |
-      {"name", "reason": "brand-new"} | {"name", "reason": "not-screened-cap"}.
-    Established/popular deps (in corpus) and mature existing deps produce NO finding. `fetch_json(name)`
-    returns the parsed /pypi/{name}/json dict, or None for a 404. Network is bounded to `cap` fetches;
-    overflow deps are RECORDED (never silently dropped). `cache` (name -> json|None) skips re-fetches."""
+                      cap: int = 10, cache: dict | None = None, own: dict | None = None) -> list[dict]:
+    """Classify each added (normalized) dep name. Established/popular deps (in corpus) produce no finding and no
+    fetch. A name within 2 edits of the corpus is looked up (PR E): a shared PyPI owner with `own` (the scanned
+    package's identity) or age >= _ESTABLISHED_DAYS with >= _ESTABLISHED_RELEASES releases clears the typosquat
+    reading; author-declared matches only annotate. A capped or failed lookup keeps the plain typosquat finding.
+    `fetch_json(name)` returns the /pypi/{name}/json dict, None for a 404, {} on a transient error. Network is
+    bounded to `cap` fetches; `cache` (name -> json|None) skips re-fetches."""
     now = now or datetime.now(timezone.utc)
     cache = cache if cache is not None else {}
+    own = own or {"roles": set(), "emails": set(), "orgs": set()}
     findings, fetched = [], 0
+
+    def lookup(name):
+        nonlocal fetched
+        if name not in cache:
+            if fetched >= cap:
+                return "capped"
+            got = fetch_json(name)
+            cache[name] = got if got is None or isinstance(got, dict) else {}   # non-dict JSON reads as no data
+            fetched += 1
+        return cache[name]
+
     for name in sorted(added):
         if name in corpus:
             continue                                 # popular -> reputable, no fetch, no flag
         target = nearest_corpus(name, corpus)
-        if target:
-            findings.append({"name": name, "reason": "typosquat", "target": target})
-            continue                                 # decided locally, no network
-        if name not in cache:
-            if fetched >= cap:
-                findings.append({"name": name, "reason": "not-screened-cap"})
-                continue
-            cache[name] = fetch_json(name)
-            fetched += 1
-        meta = cache[name]
-        if meta is None:
-            findings.append({"name": name, "reason": "nonexistent"})
+        meta = lookup(name)
+        if meta == "capped":
+            findings.append({"name": name, "reason": "typosquat", "target": target} if target
+                            else {"name": name, "reason": "not-screened-cap"})
             continue
+        if meta is None:
+            findings.append({"name": name, "reason": "nonexistent", **({"target": target} if target else {})})
+            continue
+        same_owner = False
+        if target:
+            if not meta:
+                findings.append({"name": name, "reason": "typosquat", "target": target})   # never cleared on no data
+                continue
+            ident = identity(meta)
+            same_owner = bool(ident["roles"] and own["roles"] and ident["roles"] & own["roles"])
+            if not same_owner:
+                earliest, n = _earliest_upload(meta), _release_count(meta)
+                if earliest is not None and (now - earliest).days >= _ESTABLISHED_DAYS and n >= _ESTABLISHED_RELEASES:
+                    continue
+                tmeta = lookup(target) if ident["emails"] else None   # nothing to compare: spend no GET
+                tident = identity(tmeta) if isinstance(tmeta, dict) and tmeta else None
+                org = (meta.get("ownership") or {}).get("organization") if isinstance(meta.get("ownership"), dict) else None
+                findings.append({
+                    "name": name, "reason": "typosquat", "target": target,
+                    "first_upload": earliest.date().isoformat() if earliest else None, "releases": n,
+                    "owner": "different" if ident["roles"] and own["roles"] else "unknown",
+                    "same_author_email": bool(ident["emails"] & own["emails"]),
+                    "same_org": bool(ident["orgs"] & own["orgs"]),
+                    "same_author_as_target": bool(tident and ident["emails"] & tident["emails"]),
+                    "pypi_org": org if isinstance(org, str) and org else None})
+                continue
+        if not meta:
+            continue                                 # a transient error on a non-candidate: unknown age, no flag
         earliest = _earliest_upload(meta)
         if earliest is not None and (now - earliest).days < brandnew_days:
-            findings.append({"name": name, "reason": "brand-new"})
+            findings.append({"name": name, "reason": "brand-new", **({"same_owner": True} if same_owner else {})})
     return findings
 
 
 def _earliest_upload(meta: dict):
     """Earliest release upload time across all versions, or None if unavailable."""
     times = []
-    for files in (meta.get("releases") or {}).values():
-        for f in files or []:
-            ts = f.get("upload_time_iso_8601")
-            if ts:
+    rel = meta.get("releases") if isinstance(meta, dict) else None
+    for files in (rel.values() if isinstance(rel, dict) else ()):
+        for f in files if isinstance(files, list) else ():
+            ts = f.get("upload_time_iso_8601") if isinstance(f, dict) else None
+            if isinstance(ts, str):
                 try:
                     times.append(datetime.fromisoformat(ts.replace("Z", "+00:00")))
                 except ValueError:

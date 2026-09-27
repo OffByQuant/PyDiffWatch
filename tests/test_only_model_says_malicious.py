@@ -89,7 +89,9 @@ def test_heuristic_only_high_score_is_queued_without_an_alert(tmp_path, scan_stu
     (fetcher.RefusedToFetch("download-size"), "refused_to_fetch"),
     (fetcher.RefusedToFetch("quarantined"), "refused_to_fetch"),
     (fetcher.RefusedToExtract("members"), "refused_to_extract"),
-    (fetcher.MetadataGone("404"), "metadata_gone"),
+    (fetcher.Removed("project_gone", "t"), "removed_before_scan"),
+    (fetcher.Removed("version_gone", "t"), "removed_before_scan"),
+    (fetcher.Removed("project_gone"), "no_sdist_wait"),
 ])
 def test_fetch_outcomes_never_malicious(tmp_path, result, stage, scan_stub):
     cfg = _cfg(tmp_path)
@@ -97,8 +99,11 @@ def test_fetch_outcomes_never_malicious(tmp_path, result, stage, scan_stub):
     if isinstance(result, (ArtifactSet, fetcher.RefusedToExtract)):
         result = scan_stub.dl(result, "p", "1.1")
     orchestrator._process_fetched(cfg, conn, None, None, NewRelease("p", "1.1", 5), result)
-    _assert_never_malicious(conn, stage)
-
+    if isinstance(result, fetcher.Removed):
+        assert store.get_stage(conn, "p", "1.1") == stage
+        _assert_never_malicious(conn, alerted=False)
+    else:
+        _assert_never_malicious(conn, stage)
 
 def test_switch_to_wheel_only_never_malicious(tmp_path):
     cfg = _cfg(tmp_path, wheel_only_grace_minutes=0)
