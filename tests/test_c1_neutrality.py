@@ -34,6 +34,7 @@ def _canon_art(x):
     if isinstance(x, fetcher.NoSdist):
         return {"no_sdist": x.switched_from}
     d = dataclasses.asdict(x)
+    assert d.pop("requires_python") is None     # PR D added the field after the goldens; the fixtures have no PKG-INFO
     for k in ("new_files", "prior_files"):
         d[k] = {p: hashlib.sha256(b).hexdigest() for p, b in d[k].items()}
     return d
@@ -78,6 +79,12 @@ def _fetch_cases(monkeypatch):
     return {name: _canon_art(fetcher.fetch_artifacts(cfg, NewRelease(p, v, 5))) for name, cfg, p, v in cases}
 
 
+def _canon_diff(d):
+    out = dataclasses.asdict(d)
+    assert out.pop("requires_python") is None   # PR D added the field after the goldens
+    return out
+
+
 def test_fetch_is_unchanged(monkeypatch):
     _golden("c1_neutrality_fetch.json", _fetch_cases(monkeypatch))
 
@@ -120,6 +127,6 @@ def test_scan_is_unchanged(monkeypatch):
     scopes = {r.applies_to for r in ruleset if r.id in {f.rule for f in tr.fired_rules}}
     assert {"code", "binary", "dep", "maintainer"} <= scopes, scopes     # the fixture exercises every merge path
     assert "maintainer set changed" in d.signals and "requires-dist added" in d.signals
-    _golden("c1_neutrality_scan.json", {"diff": dataclasses.asdict(d),
+    _golden("c1_neutrality_scan.json", {"diff": _canon_diff(d),
                                          "fired": [dataclasses.asdict(f) for f in tr.fired_rules],
                                          "score": tr.score, "escalate": tr.escalate, "prior_error": prior_error})

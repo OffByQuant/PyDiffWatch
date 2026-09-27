@@ -480,3 +480,35 @@ def test_a_refusing_new_sdist_raises_from_extract_download_not_download(monkeypa
     dl = fetcher.download(cfg, NewRelease("acme", "1.1", 5))         # no refusal here
     with pytest.raises(fetcher.RefusedToExtract, match="members"):
         fetcher.extract_download(cfg, dl)
+
+
+# ---- PR D: Requires-Python ----
+
+def _pkginfo(rp=None, bom=False):
+    body = b"Metadata-Version: 2.1\nName: p\n" + (f"Requires-Python: {rp}\n".encode() if rp else b"")
+    return (b"\xef\xbb\xbf" if bom else b"") + body
+
+
+def _art_with(files, monkeypatch, versions=(("1.0", "2026-01-01T00:00:00Z"),)):
+    monkeypatch.setattr(fetcher, "_package_json", lambda p, cfg: _meta("p", list(versions)))
+    monkeypatch.setattr(fetcher, "_download", lambda url, cfg: make_sdist(files))
+    return fetcher.fetch_artifacts(Config(), NewRelease("p", versions[-1][0], 5))
+
+
+def test_requires_python_is_read_from_pkg_info(monkeypatch):
+    art = _art_with({"PKG-INFO": _pkginfo(">=3.14"), "p/a.py": b"x=1\n"}, monkeypatch)
+    assert art.requires_python == ">=3.14"
+
+
+def test_requires_python_survives_the_surface_filter_on_a_new_package(monkeypatch):
+    art = _art_with({"PKG-INFO": _pkginfo("<4.0,>=3.14"), "setup.py": b"", "p/a.py": b""}, monkeypatch)
+    assert "PKG-INFO" not in art.new_files and art.requires_python == "<4.0,>=3.14"
+
+
+def test_requires_python_is_none_without_the_header(monkeypatch):
+    assert _art_with({"PKG-INFO": _pkginfo(), "p/a.py": b""}, monkeypatch).requires_python is None
+    assert _art_with({"p/a.py": b""}, monkeypatch).requires_python is None
+
+
+def test_a_pkg_info_with_a_bom_parses(monkeypatch):
+    assert _art_with({"PKG-INFO": _pkginfo(">=3.14", bom=True), "p/a.py": b""}, monkeypatch).requires_python == ">=3.14"

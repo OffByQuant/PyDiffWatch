@@ -162,6 +162,13 @@ def _pkginfo_summary(files: dict[str, bytes]) -> str | None:
     v = next((v for k, v in (m or {}).items() if k.lower() == "summary"), None)
     return v if isinstance(v, str) and v.strip() not in ("", "UNKNOWN") else None
 
+def _pkginfo_requires_python(files: dict[str, bytes]) -> str | None:
+    """`Requires-Python:` from the sdist's own top-level PKG-INFO, verbatim; None when absent or blank (spec D §3.3)."""
+    data = files.get("PKG-INFO")
+    m = execctx.parse_mapping(data, execctx.KINDS["PKG-INFO"]) if data is not None else None
+    v = next((v for k, v in (m or {}).items() if k.lower() == "requires-python"), None)
+    return v.strip() if isinstance(v, str) and v.strip() else None
+
 def _package_json(package: str, cfg: Config) -> dict:
     url = f"{cfg.pypi_base}/pypi/{package}/json"
     egress.assert_web_scheme(url)
@@ -346,6 +353,7 @@ def extract_download(cfg, dl: Download) -> ArtifactSet:
                            maintainer_metadata=dl.maintainer_metadata, description=dl.description)
     new_files, new_bins = extract_sdist(dl.new_blob, cfg)
     summary = _pkginfo_summary(new_files) or dl.description   # before the surface filter drops PKG-INFO
+    requires_python = _pkginfo_requires_python(new_files)
     # Before the prior comparison drops unchanged ones: the execution context must know an oversized
     # setup.py is there even when it did not change (padding it must not read as "absent").
     too_large = tuple(b["path"] for b in new_bins if b.get("reason") == "source-too-large")
@@ -374,7 +382,7 @@ def extract_download(cfg, dl: Download) -> ArtifactSet:
                        is_new_package=dl.is_new_package, maintainer_metadata=dl.maintainer_metadata,
                        added_dep_findings=list(dl.added_dep_findings), prior_error=prior_error, description=summary,
                        too_large=too_large, surface_omitted=surface_omitted,
-                       requires_dist_change=dl.requires_dist_change)
+                       requires_dist_change=dl.requires_dist_change, requires_python=requires_python)
 
 
 def fetch_artifacts(cfg, rel: NewRelease, attempt: int = 1) -> ArtifactSet | NoSdist:

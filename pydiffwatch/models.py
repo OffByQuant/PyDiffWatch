@@ -22,6 +22,7 @@ class ArtifactSet:
     too_large: tuple[str, ...] = ()  # this version's source members too large to scan (unfiltered by the prior)
     surface_omitted: int | None = None   # a first release under `surface`: source files the filter left out
     requires_dist_change: dict | None = None   # {"added": [...], "removed": [...]} Requires-Dist lines, when known
+    requires_python: str | None = None   # PKG-INFO's Requires-Python, verbatim (author-written); None when absent
 
 @dataclass(frozen=True)
 class Download:
@@ -57,6 +58,7 @@ class Diff:
     baseline_unavailable: str = "" # the prior version whose sdist could not be fetched (diffed against nothing)
     surface_omitted: int | None = None   # a first release under `surface`: source files not shown
     signals: str = ""              # dependency / binary / ownership signals, one per line (author strings escaped)
+    requires_python: str | None = None   # from the ArtifactSet: the release's declared interpreter floor, verbatim
 
 @dataclass(frozen=True)
 class FiredRule:
