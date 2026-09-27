@@ -94,3 +94,14 @@ def _restore_pydiffwatch_logger():
     yield
     log.setLevel(level)
     log.handlers[:] = handlers
+
+
+@pytest.fixture(autouse=True)
+def _scan_in_process(request, monkeypatch):
+    """Tests stub fetcher._download (and scan_stub stubs extraction) in this process, which a sandboxed worker
+    would not see: every test scans in-process, and every module but test_sandbox never probes (spec §3.2).
+    test_sandbox.py exercises the real sandbox and stubs choose itself where an entry point calls it."""
+    from pydiffwatch import sandbox
+    monkeypatch.setattr(sandbox, "_backend", "off")
+    if request.module.__name__.split(".")[-1] != "test_sandbox":
+        monkeypatch.setattr(sandbox, "choose", lambda cfg, **k: "off")

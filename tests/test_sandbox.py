@@ -520,3 +520,134 @@ def test_the_profile_closes_the_checkout_and_other_processes_but_not_the_package
                           "-c", _BOUNDARY, str(sandbox._ROOT), str(sandbox._PKG)],
                          capture_output=True, text=True, check=True, env={})
     assert got.stdout.split() == ["blocked", "open", "open", "blocked", "open"]
+
+
+# ---- C2: proving the sandbox holds ----
+
+_HELD = {"network": "blocked", "write": "blocked", "home_read": "blocked", "db_read": "blocked",
+         "exec": "blocked", "services": "blocked", "env": "clean"}
+
+
+def test_auto_uses_the_platform_sandbox_when_the_probe_holds():
+    which = lambda b: "/usr/bin/" + b                                 # noqa: E731
+    assert sandbox.choose(Config(), which=which, probe=lambda c, b: _HELD, platform="darwin") == "seatbelt"
+    linux = {**_HELD, "exec": "open", "services": "n/a", "home_read": "unknown"}   # the unit's limits, not exec's
+    assert sandbox.choose(Config(), which=which, probe=lambda c, b: linux, platform="linux") == "systemd"
+
+
+def test_auto_without_a_working_sandbox_scans_in_process_and_says_so(capsys, caplog):
+    leaky = {**_HELD, "exec": "open"}
+    assert sandbox.choose(Config(), which=lambda b: b, probe=lambda c, b: leaky, platform="darwin") == "off"
+    assert sandbox.choose(Config(), which=lambda b: None, probe=None, platform="linux") == "off"
+    out = capsys.readouterr().out
+    assert out.count("[pydiffwatch] WARNING: scanning WITHOUT a sandbox (") == 2
+    assert "the seatbelt sandbox did not hold: " in out
+    assert "no sandbox-exec (macOS) or systemd-run (Linux) on this machine" in out
+    assert out.count('Set parse_sandbox = "on" to refuse to scan instead.') == 2
+    assert [r.levelname for r in caplog.records if "WITHOUT a sandbox" in r.getMessage()] == ["WARNING", "WARNING"]
+
+
+def test_auto_falls_back_when_the_probe_cannot_run(capsys):
+    def broken(c, b):
+        raise sandbox.SandboxError("seatbelt sandbox exited 65: bad profile")
+    assert sandbox.choose(Config(), which=lambda b: b, probe=broken, platform="darwin") == "off"
+    assert "the seatbelt sandbox could not run: seatbelt sandbox exited 65" in capsys.readouterr().out
+
+
+def test_on_refuses_to_scan_without_a_working_sandbox():
+    with pytest.raises(sandbox.SandboxError, match='^parse_sandbox = "on" but no sandbox-exec'):
+        sandbox.choose(Config(parse_sandbox="on"), which=lambda b: None, probe=None, platform="linux")
+    with pytest.raises(sandbox.SandboxError, match='^parse_sandbox = "on" but the seatbelt sandbox did not hold'):
+        sandbox.choose(Config(parse_sandbox="on"), which=lambda b: b, probe=lambda c, b: {**_HELD, "db_read": "open"},
+                       platform="darwin")
+
+
+def test_off_never_probes():
+    assert sandbox.choose(Config(parse_sandbox="off"), which=None, probe=None, platform="darwin") == "off"
+
+
+def test_a_probe_reply_missing_a_check_is_rejected_and_leaves_no_files(tmp_path, monkeypatch):
+    cfg, seen = _cfg(tmp_path), {}
+    monkeypatch.setenv("PYDIFFWATCH_CANARY_KEY", "sk-canary-0123456789")
+
+    def run(cfg_, backend, payload):
+        seen["head"] = json.loads(payload)
+        return json.dumps({k: v for k, v in _HELD.items() if k != "services"}).encode()
+    monkeypatch.setattr(sandbox, "_run", run)
+    with pytest.raises(sandbox.SandboxError, match="probe result"):
+        sandbox.probe(cfg, "seatbelt")
+    head = seen["head"]
+    assert head["probe"] is True and head["db_file"].startswith(os.path.realpath(tmp_path))
+    assert hashlib.sha256(b"sk-canary-0123456789").hexdigest() in head["env_hashes"]
+    assert "sk-canary" not in json.dumps(head)                        # hashes only, never the values
+    assert list(tmp_path.glob(".sandbox-probe-*")) == []
+
+
+def test_a_worker_that_cannot_import_its_scan_code_fails_the_probe(tmp_path, monkeypatch):
+    # Review Focus 1 / Ruling R3: a `pip install --user` layout leaves PyYAML unreadable inside the box; the probe
+    # must fail (so choose falls back or refuses) rather than hold while every scan fails. No sandbox, any OS.
+    shadow = tmp_path / "shadow"
+    shadow.mkdir()
+    (shadow / "yaml.py").write_text("raise ImportError('yaml is not readable here')\n")
+    real = sandbox._import_paths
+    monkeypatch.setattr(sandbox, "_import_paths", lambda: [str(shadow)] + real())
+    monkeypatch.setattr(sandbox, "_seatbelt_cmd", lambda cfg: sandbox._worker_argv(cfg))
+    with pytest.raises(sandbox.SandboxError, match="yaml is not readable here"):
+        sandbox.probe(_cfg(tmp_path), "seatbelt")
+
+
+@pytest.mark.parametrize("error,seen", [
+    (PermissionError(errno.EPERM, "Operation not permitted"), "blocked"),          # Seatbelt's deny
+    (OSError(errno.ENETUNREACH, "Network is unreachable"), "blocked"),            # PrivateNetwork=yes
+    (ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused"), "open"),   # the packet left the box
+    (TimeoutError("timed out"), "open"),
+])
+def test_the_probe_counts_only_a_network_deny_as_blocked(error, seen, monkeypatch):
+    # Ruling R14: an offline host or a firewall that drops the packet must not look like a sandbox that holds
+    from pydiffwatch import _parse_worker
+
+    def connect(*a, **k):
+        raise error
+    monkeypatch.setattr(_parse_worker.socket, "create_connection", connect)
+    assert _parse_worker._net() == seen
+
+
+@seatbelt
+def test_the_seatbelt_probe_holds_all_seven(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYDIFFWATCH_CANARY_KEY", "sk-canary-0123456789")
+    assert sandbox.probe(_cfg(tmp_path), "seatbelt") == _HELD
+
+
+def _probe_db_in(tmp_path, db_dir):
+    """Probe with the database in db_dir, a directory inside pydiffwatch/ (Ruling R7): the checkout's only readable
+    directory, so only the private-dir deny can make db_read blocked."""
+    try:
+        return sandbox.probe(_cfg(tmp_path, db_path=db_dir / "db.sqlite"), "seatbelt")["db_read"]
+    finally:
+        for p in (sandbox._PKG / ".diffwatch-probe-test", sandbox._PKG / '.diffwatch probe "q" \\ dir'):
+            if p.exists():
+                p.rmdir()
+
+
+@seatbelt
+def test_a_database_inside_the_package_dir_is_unreadable(tmp_path):
+    db_dir = sandbox._PKG / ".diffwatch-probe-test"
+    db_dir.mkdir(exist_ok=True)
+    assert _probe_db_in(tmp_path, db_dir) == "blocked"
+
+
+@seatbelt
+def test_a_database_reached_through_a_symlink_is_unreadable(tmp_path):
+    # Review Focus 3
+    real = sandbox._PKG / ".diffwatch-probe-test"
+    real.mkdir(exist_ok=True)
+    (tmp_path / "db-link").symlink_to(real)
+    assert _probe_db_in(tmp_path, tmp_path / "db-link") == "blocked"
+
+
+@seatbelt
+def test_a_database_dir_with_a_space_quotes_and_a_backslash_is_unreadable(tmp_path):
+    # Review Focus 2: a mis-quoted profile would fail to load (SandboxError) or match the wrong path
+    odd = sandbox._PKG / '.diffwatch probe "q" \\ dir'
+    odd.mkdir(exist_ok=True)
+    assert _probe_db_in(tmp_path, odd) == "blocked"

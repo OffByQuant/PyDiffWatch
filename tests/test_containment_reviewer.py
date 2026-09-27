@@ -307,3 +307,23 @@ def test_the_parse_worker_never_fetches_or_runs_package_content():
     assert not bad, f"_parse_worker.py must never fetch, exec, install or unpickle (§6); found: {bad}"
     attrs = {n.attr for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Attribute)}
     assert "expanduser" not in attrs, "every path reaches the worker absolute; inside the sandbox '~' is unresolvable"
+
+
+def test_parse_worker_only_starts_true_in_its_probe():
+    src = (_DIFFWATCH / "_parse_worker.py").read_text()
+    assert _launch_pin(src, only_in="run_program", argv=["/usr/bin/true"]) == []
+
+
+_GOOD_WORKER = ("import subprocess\n"
+                "def _probe(head):\n"
+                "    def run_program():\n"
+                "        subprocess.run(['/usr/bin/true'], capture_output=True, timeout=5)\n")
+
+
+def test_the_worker_pin_catches_another_site_a_shell_and_another_program():
+    pin = lambda s: _launch_pin(s, only_in="run_program", argv=["/usr/bin/true"])   # noqa: E731
+    assert pin(_GOOD_WORKER) == []
+    assert pin(_GOOD_WORKER + "def main():\n    subprocess.run(['/usr/bin/true'])\n")
+    assert pin(_GOOD_WORKER.replace("timeout=5)", "timeout=5, shell=True)"))
+    assert pin(_GOOD_WORKER.replace("'/usr/bin/true'", "'/bin/sh'"))
+    assert pin(_GOOD_WORKER.replace("subprocess.run(", "subprocess.Popen("))

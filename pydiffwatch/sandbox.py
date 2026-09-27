@@ -9,9 +9,12 @@ and the dep and maintainer rule results from its own metadata (npm #31), merged 
 The sandbox keeps a parser exploit away from the network, the database and the user's files. It cannot make an
 exploited parser tell the truth about the package that exploited it."""
 import dataclasses
+import hashlib
 import json
+import logging
 import math
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -23,12 +26,21 @@ from .config import Config
 from .models import Diff, Download, FileDiff, FiredRule, Hunk, TriageResult
 from .rules import Rule
 
-_backend = "off"
+logger = logging.getLogger(__name__)
+
+_backend = "off"      # set once per run by choose(): "seatbelt" | "systemd" | "off"
 _PARENT_RULES = {"maintainer", "dep"}
 _PATH_FIELDS = ("db_path", "cache_dir", "lock_path", "rules_dir")
 _ROOT = Path(__file__).resolve().parent.parent      # the directory pydiffwatch is imported from
 _PKG = _ROOT / "pydiffwatch"
 _SYSTEMD_ENV = ("PATH", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
+# What the probe must find. home_read may also be "unknown" (no readable file in HOME to try).
+_PROBE_OK = {"network": "blocked", "write": "blocked", "db_read": "blocked", "env": "clean"}
+_PROBE_OK_SEATBELT = {"exec": "blocked", "services": "blocked"}     # Linux children inherit the unit's limits
+_PROBE_KEYS = {"network", "write", "home_read", "db_read", "exec", "services", "env"}
+# Environment variables whose values are not secrets (the probe's env check hashes every other value >= 8 chars)
+_PLAIN_ENV = {"PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TERM", "TMPDIR", "PWD", "SHLVL", "_",
+              "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "__CF_USER_TEXT_ENCODING"}
 
 
 class SandboxError(Exception):
@@ -379,3 +391,77 @@ def analyze(cfg, dl, owners, ruleset, backend=None):
                             signals=differ.render_signals(dl.requires_dist_change, dl.added_dep_findings,
                                                           d.added_binaries, owners))
     return d, _with_parent_rules(cfg, dl, d, tr, owners, ruleset), prior_error
+
+
+# ---- proving the sandbox holds, before any package byte is parsed ----
+def _home_sentinel() -> str | None:
+    """A file in the home directory the worker must not be able to read."""
+    home = _home()
+    try:
+        names = sorted(os.listdir(home))
+    except OSError:
+        return None
+    for n in names:
+        p = os.path.join(home, n)
+        if os.path.isfile(p) and os.access(p, os.R_OK):
+            return p
+    return None
+
+
+def probe(cfg, backend: str) -> dict:
+    """Run the worker once in probe mode. It tries to reach the network, write next to the database, read the
+    database directory and a file in HOME, start /usr/bin/true, look up a macOS service, and find this process's
+    environment values (it gets their sha256 hashes, never the values). Returns {check: "blocked" | "open" |
+    "unknown" | "n/a"}, with env "clean" | "leaked"."""
+    db_dir = Path(cfg.db_path).resolve().parent
+    db_dir.mkdir(parents=True, exist_ok=True)
+    target = db_dir / f".sandbox-probe-write-{os.getpid()}"
+    sentinel = db_dir / f".sandbox-probe-read-{os.getpid()}"
+    sentinel.write_text("x")
+    env_hashes = sorted({hashlib.sha256(v.encode("utf-8", "surrogateescape")).hexdigest()
+                         for k, v in os.environ.items()
+                         if k not in _PLAIN_ENV and not k.startswith("LC_") and len(v) >= 8})
+    head = {"probe": True, "write_target": str(target), "db_file": str(sentinel), "home_file": _home_sentinel(),
+            "env_hashes": env_hashes, "sys_path": _import_paths()}
+    try:
+        raw = _run(cfg, backend, json.dumps(head, sort_keys=True).encode() + b"\n")
+    finally:
+        for p in (target, sentinel):
+            p.unlink(missing_ok=True)
+    try:
+        res = json.loads(raw)
+    except (ValueError, UnicodeDecodeError, RecursionError) as e:
+        raise SandboxError(f"sandbox probe sent back something that is not JSON: {e}") from e
+    _check(isinstance(res, dict) and set(res) == _PROBE_KEYS, "probe result")
+    return res
+
+
+def _holds(res: dict, backend: str) -> bool:
+    need = {**_PROBE_OK, **(_PROBE_OK_SEATBELT if backend == "seatbelt" else {})}
+    return all(res.get(k) == v for k, v in need.items()) and res.get("home_read") != "open"
+
+
+def choose(cfg, which=shutil.which, probe=probe, platform=sys.platform) -> str:
+    """Pick this run's sandbox and prove it holds (spec decision 3). "auto" falls back to scanning in-process,
+    loudly; "on" refuses (SandboxError); "off" never probes."""
+    mode = cfg.parse_sandbox
+    if mode == "off":
+        return "off"
+    backend = ("seatbelt" if platform == "darwin" and which("sandbox-exec")
+               else "systemd" if platform.startswith("linux") and which("systemd-run") else None)
+    why = "no sandbox-exec (macOS) or systemd-run (Linux) on this machine"
+    if backend:
+        try:
+            res = probe(cfg, backend)
+            if _holds(res, backend):
+                return backend
+            why = f"the {backend} sandbox did not hold: {res}"
+        except SandboxError as e:
+            why = f"the {backend} sandbox could not run: {e}"
+    if mode == "on":
+        raise SandboxError(f'parse_sandbox = "on" but {why}')
+    msg = (f"[pydiffwatch] WARNING: scanning WITHOUT a sandbox ({why}). Package files are unpacked and parsed "
+           f'inside this process. Set parse_sandbox = "on" to refuse to scan instead.')
+    print(msg, flush=True)
+    logger.warning(msg)
+    return "off"
