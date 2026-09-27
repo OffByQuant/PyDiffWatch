@@ -8,6 +8,9 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "live_local: test makes real calls to the local Qwen endpoint (skips hermetic network block)")
+    config.addinivalue_line(
+        "markers",
+        "seatbelt: test runs the real macOS Seatbelt sandbox (sandbox-exec); skipped elsewhere")
 
 
 @pytest.fixture(autouse=True)
@@ -79,3 +82,26 @@ def scan_stub(monkeypatch):
 
     monkeypatch.setattr(fetcher, "extract_download", extract)
     return _Stub()
+
+
+@pytest.fixture(autouse=True)
+def _restore_pydiffwatch_logger():
+    """cli.main() configures the pydiffwatch logger (INFO, a stderr handler); put it back after every test, so no
+    test depends on whether an earlier one ran main()."""
+    import logging
+    log = logging.getLogger("pydiffwatch")
+    level, handlers = log.level, list(log.handlers)
+    yield
+    log.setLevel(level)
+    log.handlers[:] = handlers
+
+
+@pytest.fixture(autouse=True)
+def _scan_in_process(request, monkeypatch):
+    """Tests stub fetcher._download (and scan_stub stubs extraction) in this process, which a sandboxed worker
+    would not see: every test scans in-process, and every module but test_sandbox never probes (spec §3.2).
+    test_sandbox.py exercises the real sandbox and stubs choose itself where an entry point calls it."""
+    from pydiffwatch import sandbox
+    monkeypatch.setattr(sandbox, "_backend", "off")
+    if request.module.__name__.split(".")[-1] != "test_sandbox":
+        monkeypatch.setattr(sandbox, "choose", lambda cfg, **k: "off")

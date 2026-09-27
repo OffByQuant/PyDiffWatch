@@ -8,8 +8,13 @@ reviewer path and must never execute, install, unpickle, or socket-fetch analyze
     URL embedded in package content can never become the egress target is proven behaviorally in
     test_backends.py (test_local_egress_url_is_config_endpoint_not_package_content).
 
-These AST guards fail the suite if a future change introduces a forbidden primitive into either
-module."""
+  * sandbox.py and _parse_worker.py are the only modules that start a process, and each launch site is pinned
+    below: sandbox._run starts the parse worker (one subprocess.Popen of sandbox-exec or systemd-run, never a
+    shell, its stdout read up to a cap), and the worker's probe runs ["/usr/bin/true"] once, in _probe's
+    run_program, to prove the sandbox denies it.
+
+These AST guards fail the suite if a future change introduces a forbidden primitive into any of these
+modules."""
 import ast
 import pathlib
 
@@ -200,3 +205,130 @@ def test_execctx_only_parses_never_executes_imports_or_fetches():
     bad = _violations(src, _EXECCTX_FORBIDDEN) + _disk_violations(src)
     assert not bad, f"execctx.py must only statically parse build metadata, never run it (§6); found: {bad}"
     assert "open(" not in src, "execctx.py is pure: it gets bytes, it never opens files"
+
+
+# ---- the parse sandbox: the only process launches in pydiffwatch ----
+
+def _attr_chain(node) -> str:
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def _process_calls(tree) -> list:
+    """(innermost enclosing function name, call) for every subprocess.* call; "<module>" at module level.
+    ast.walk visits outer functions first, so the last function written for a call is its innermost."""
+    innermost = {}
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for c in ast.walk(fn):
+                if isinstance(c, ast.Call) and _attr_chain(c.func).startswith("subprocess."):
+                    innermost[id(c)] = (fn.name, c)
+    for c in ast.walk(tree):
+        if isinstance(c, ast.Call) and _attr_chain(c.func).startswith("subprocess.") and id(c) not in innermost:
+            innermost[id(c)] = ("<module>", c)
+    return list(innermost.values())
+
+
+def _launch_pin(src: str, *, only_in=None, argv=None, call="subprocess.run") -> list[str]:
+    """What breaks a module's launch pin: anything but exactly one `call`; a shell= keyword; subprocess
+    imported under another name or from-imported (which would hide a call from the count); with only_in, the call
+    outside that function; with argv, a first argument other than that literal list."""
+    tree = ast.parse(src)
+    bad = [f"import subprocess as {a.asname}" for n in ast.walk(tree) if isinstance(n, ast.Import)
+           for a in n.names if a.name == "subprocess" and a.asname]
+    bad += [f"from {n.module} import ..." for n in ast.walk(tree)
+            if isinstance(n, ast.ImportFrom) and (n.module or "").split(".")[0] == "subprocess"]
+    calls = _process_calls(tree)
+    if [_attr_chain(c.func) for _, c in calls] != [call]:
+        bad.append(f"process launches: {[_attr_chain(c.func) for _, c in calls]}")
+    for fn, c in calls:
+        if any(kw.arg == "shell" for kw in c.keywords):
+            bad.append("shell=")
+        if only_in is not None and fn != only_in:
+            bad.append(f"a launch in {fn}")
+        if argv is not None and not (c.args and isinstance(c.args[0], ast.List)
+                                     and [getattr(e, "value", None) for e in c.args[0].elts] == argv):
+            bad.append("another program")
+    return bad
+
+
+def _imports(src: str) -> set[str]:
+    out = set()
+    for n in ast.walk(ast.parse(src)):
+        if isinstance(n, ast.Import):
+            out |= {a.name.split(".")[0] for a in n.names}
+        elif isinstance(n, ast.ImportFrom) and n.module and n.level == 0:
+            out.add(n.module.split(".")[0])
+    return out
+
+
+_SANDBOX_FORBIDDEN = (_EXEC_INSTALL_UNPICKLE - {"subprocess"}) | _NETWORK
+
+
+def test_sandbox_only_launches_its_worker_without_a_shell():
+    src = (_DIFFWATCH / "sandbox.py").read_text()
+    assert _launch_pin(src, call="subprocess.Popen") == []      # Ruling R12: one Popen, its stdout read up to a cap
+    launchers = {n.value for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Constant)
+                 and n.value in {"sandbox-exec", "systemd-run"}}
+    assert launchers == {"sandbox-exec", "systemd-run"}
+    bad = _violations(src, _SANDBOX_FORBIDDEN, allowed_calls={"subprocess.Popen"})
+    assert not bad, f"sandbox.py launches the worker and nothing else; no network, no exec (§6); found: {bad}"
+
+
+_GOOD_SANDBOX = ("import subprocess\n"
+                 "def _run(cmd, env):\n"
+                 "    return subprocess.run(cmd, input=b'', capture_output=True, timeout=1, env=env)\n")
+
+
+def test_the_launch_pin_catches_a_second_launch_a_shell_and_an_alias():
+    assert _launch_pin(_GOOD_SANDBOX) == []
+    assert _launch_pin(_GOOD_SANDBOX + "def other():\n    subprocess.run(['sh'])\n")
+    assert _launch_pin(_GOOD_SANDBOX.replace("env=env)", "env=env, shell=True)"))
+    assert _launch_pin(_GOOD_SANDBOX.replace("subprocess.run(", "subprocess.Popen("))
+    assert _launch_pin(_GOOD_SANDBOX, call="subprocess.Popen")
+    assert _launch_pin("import subprocess as sp\n" + _GOOD_SANDBOX)
+    assert _launch_pin("from subprocess import run\n" + _GOOD_SANDBOX)
+
+
+def test_only_the_sandbox_and_its_worker_can_start_a_process():
+    offenders = [p.name for p in sorted(_DIFFWATCH.glob("*.py"))
+                 if p.name not in ("sandbox.py", "_parse_worker.py") and {"subprocess", "pty"} & _imports(p.read_text())]
+    assert offenders == [], f"only sandbox.py and _parse_worker.py may start a process; found: {offenders}"
+
+
+# _parse_worker.py reads the request and runs the same scan code as the parent (fetcher/differ/engine, banned above).
+# Its own imports: no fetch, no exec/install/unpickle. socket and subprocess are there for the probe only (Task 6).
+_WORKER_FORBIDDEN = (_EXEC_INSTALL_UNPICKLE - {"subprocess"}) | (_NETWORK - {"socket"})
+
+
+def test_the_parse_worker_never_fetches_or_runs_package_content():
+    src = (_DIFFWATCH / "_parse_worker.py").read_text()
+    bad = _violations(src, _WORKER_FORBIDDEN)
+    assert not bad, f"_parse_worker.py must never fetch, exec, install or unpickle (§6); found: {bad}"
+    attrs = {n.attr for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Attribute)}
+    assert "expanduser" not in attrs, "every path reaches the worker absolute; inside the sandbox '~' is unresolvable"
+
+
+def test_parse_worker_only_starts_true_in_its_probe():
+    src = (_DIFFWATCH / "_parse_worker.py").read_text()
+    assert _launch_pin(src, only_in="run_program", argv=["/usr/bin/true"]) == []
+
+
+_GOOD_WORKER = ("import subprocess\n"
+                "def _probe(head):\n"
+                "    def run_program():\n"
+                "        subprocess.run(['/usr/bin/true'], capture_output=True, timeout=5)\n")
+
+
+def test_the_worker_pin_catches_another_site_a_shell_and_another_program():
+    pin = lambda s: _launch_pin(s, only_in="run_program", argv=["/usr/bin/true"])   # noqa: E731
+    assert pin(_GOOD_WORKER) == []
+    assert pin(_GOOD_WORKER + "def main():\n    subprocess.run(['/usr/bin/true'])\n")
+    assert pin(_GOOD_WORKER.replace("timeout=5)", "timeout=5, shell=True)"))
+    assert pin(_GOOD_WORKER.replace("'/usr/bin/true'", "'/bin/sh'"))
+    assert pin(_GOOD_WORKER.replace("subprocess.run(", "subprocess.Popen("))

@@ -1,6 +1,8 @@
 import argparse
 import dataclasses
-from . import egress, store
+import logging
+import sys
+from . import egress, sandbox, store
 from .config import Config, load_config
 from .orchestrator import (run_once, seed_now, list_pending, adjudicate, get_evidence,
                            backfill_evidence, export_dashboard, watch, review_pending,
@@ -19,6 +21,18 @@ def _cfg(args):
             rc = dataclasses.replace(rc, api_key_env=None)    # the config's key is for its own endpoint only
         cfg = dataclasses.replace(cfg, reviewer=rc, reviewer_enabled=True)
     return cfg
+
+
+def _configure_logging():
+    """INFO and up from pydiffwatch's own loggers, to stderr: the per-release scan timing, no_sdist_wait parking,
+    retries and every logged WARNING. Other libraries' loggers are left alone. Safe to call more than once."""
+    log = logging.getLogger("pydiffwatch")
+    if not any(getattr(h, "_pydiffwatch_cli", False) for h in log.handlers):
+        h = logging.StreamHandler(sys.stderr)
+        h._pydiffwatch_cli = True
+        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+        log.addHandler(h)
+    log.setLevel(logging.INFO)
 
 
 def _non_negative(text):
@@ -120,10 +134,18 @@ def main():
                     help="bind address for --serve (default: 127.0.0.1, localhost only; "
                          "use 0.0.0.0 to expose it to the local network)")
     args = p.parse_args()
+    _configure_logging()
     cfg = _cfg(args)
     # xmlrpc.client is defused at import in ingest.py (covers library importers too). The egress guard
     # mutates global socket state, so it stays a CLI-entry concern (see egress.py docstring).
     egress.install_guard(cfg)   # default-deny host allowlist for the whole process (see egress.py)
+    try:
+        _dispatch(args, cfg)
+    except sandbox.SandboxError as e:     # parse_sandbox = "on" and the sandbox does not hold (decision 4)
+        raise SystemExit(f"pydiffwatch: {e}")
+
+
+def _dispatch(args, cfg):
     if args.cmd == "run":
         n = run_once(cfg, seed_if_fresh=not args.backfill, recent=args.recent)
         print(f"[pydiffwatch] processed {n} releases")

@@ -45,56 +45,85 @@ be the boundary:
 This needs no code change in PyDiffWatch — it's deployment configuration — and it contains the entire
 pipeline, not just the parser. For most operators this is the right amount of hardening.
 
-### Optional: a per-stage sandboxed subprocess (contributor pattern)
+### Built in: the parse worker
 
-When you can't wrap the whole process (e.g. PyDiffWatch shares a host with other work), you can isolate
-*just* the parse stage in a sandboxed child. On Linux with systemd this is a small, dependency-free
-pattern using `systemd-run`:
+PyDiffWatch runs the parse stage in a sandboxed child process of its own, one per release, on macOS and Linux. It
+is on by default (`parse_sandbox = "auto"`); see [GETTING-STARTED.md §9](../../GETTING-STARTED.md#9-state-persistence--containment)
+for the three settings.
 
-```
-systemd-run --pipe --wait --collect --quiet \
-  --property=PrivateNetwork=yes          `# no egress from the parse stage` \
-  --property=ProtectSystem=strict        `# entire filesystem read-only` \
-  --property=ProtectHome=read-only       `# tighten to tmpfs if your code lives outside /home` \
-  --property=SystemCallFilter=@system-service  `# seccomp allowlist` \
-  --property=MemoryMax=512M \
-  --property=RuntimeMaxSec=30 \
-  --property=TasksMax=16 \
-  -- python -m pydiffwatch._parse_worker
-```
+| Runs in the worker (reads what the package author wrote) | Stays in PyDiffWatch's own process |
+|---|---|
+| unpacking the sdist (`gzip`, `tarfile`) and reading its PKG-INFO | the PyPI JSON, both sdist downloads, `Requires-Dist` and the dependency lookups |
+| the diff (`difflib`) and the execution context (`ast`, `tomllib`, `configparser`, `email.parser`) | the owner history from the database, and the signal line shown to the reviewer |
+| the `code` and `binary` rules (`ast.parse`, the rules' regular expressions) | the `dep` and `maintainer` rules, the score, the database, the reviewer and the alerts |
 
-The shape, if someone wants to contribute it:
+PyDiffWatch sends the worker the two sdists and the rules it has already loaded, on stdin, and gets JSON back.
+It checks every field: the types, that each rule id is one it loaded, that each weight is finite and not
+negative, and that the reply names the release it asked about. It then recomputes the score and replaces the
+dependency and ownership results with its own. So a worker taken over by a malicious archive can at most hide or
+invent `code`/`binary` findings. It cannot raise an alert, and it cannot change what PyDiffWatch computed itself.
 
-1. **Split `fetcher.fetch_artifacts`** into a networked half (`resolve_and_download` → the two sdist
-   blobs + maintainer metadata + dep findings) and a pure half (`extract → build_diff → triage`). The
-   pure half is the single source of truth, called both by the worker and by an in-process fallback.
-2. **A worker entry point** (`python -m pydiffwatch._parse_worker`) that reads `{cfg, bundle}` JSON from
-   stdin, runs the pure half, and writes `{diff, triage}` JSON to stdout. It imports no package code,
-   opens no socket, touches no sqlite. Blobs cross the pipe base64-encoded.
-3. **A dispatch** (`run_extract_parse(cfg, bundle)`) that runs the worker under `systemd-run` when
-   available and falls back to the pure function in-process otherwise (macOS/dev, or where `systemd-run`
-   is absent) — so the sandbox degrades cleanly and the pipeline still runs everywhere.
-4. **Map a worker crash/timeout** to the bounded retry queue (mirror the existing `_retry_later`
-   handling) so a sandbox failure never poisons the tick or silently drops a release.
+**macOS (Seatbelt, `sandbox-exec`).** The profile allows everything by default, then denies:
+- all network access and all file writes;
+- starting any program other than this Python, and forking;
+- Mach service lookups, which could ask LaunchServices to open a URL outside the sandbox;
+- sending a signal to any other process;
+- reading file contents under your home directory, and under the directory PyDiffWatch is imported from, except
+  the Python install and the `pydiffwatch/` package itself;
+- reading PyDiffWatch's database, cache and lock directories, wherever they are.
 
-Keep the LLM reviewer call in the **parent**, not the worker — the reviewer needs egress to the model
-endpoint, which the sandbox forbids by design, and the reviewer already handles only structured diff text
-(never raw archive bytes).
+File metadata (names, sizes, `stat`) stays readable everywhere. Files outside your home directory that your user
+can read (`/etc`, `/tmp` and `$TMPDIR`, `/Users/Shared`, other volumes) stay readable, as they are to any process
+of yours.
 
-`systemd-run` is Linux/systemd-specific; that is why the container/gVisor route above is the recommended
-default for a tool meant to run on any harness. The per-stage subprocess is the right call when you need
-isolation *without* containerizing the whole process — otherwise prefer the OS boundary.
+The worker gets an empty environment and a CPU limit of `parse_timeout_s`, and it is stopped after
+`parse_timeout_s` + 10 seconds. The CPU limit stops a parser that runs away; the wall clock is the bound that holds
+even for a worker that ignores the CPU limit's signal, as macOS allows. PyDiffWatch reads at most
+4 × `max_total_bytes` of the worker's reply, and only the last 500 bytes of its error output. macOS has no
+per-process memory limit, so the size caps bound its memory.
+
+**Linux (`systemd-run`).** The worker runs in a transient unit. The unit has:
+- `PrivateNetwork=yes`, `ProtectSystem=strict`, `ProtectHome=tmpfs`, `PrivateTmp=yes` and `NoNewPrivileges=yes`;
+- `SystemCallFilter=@system-service`;
+- `MemoryMax=<parse_memory_max>`, `RuntimeMaxSec=<parse_timeout_s>` and `TasksMax=16`;
+- `PrivateUsers=yes` when not running as root.
+
+The Python install and the package are bound read-only, and the database, cache and lock directories are made
+inaccessible. The unit inherits none of PyDiffWatch's environment.
+
+**The probe.** Before the first scan of every scanning command (each `run` and `watch` tick, `pending`,
+`review-pending` and `capture-evidence`), PyDiffWatch starts the worker once in probe mode. The worker tries to:
+- open a network connection;
+- write a file next to the database;
+- read a file there, and one in your home directory;
+- start `/usr/bin/true`;
+- look up a macOS service;
+- find any of PyDiffWatch's environment values.
+
+The sandbox is used only when every attempt the platform must stop fails (on Linux the unit's limits, not the
+child's, bound starting a program, and there is no Mach service to look up). Otherwise `parse_sandbox = "auto"` prints a WARNING and scans
+in-process, and `parse_sandbox = "on"` refuses to scan.
+
+The built-in worker narrows what a parser exploit can reach. It does not replace the container, gVisor or
+microVM boundary described above, which contains the whole process and is still the stronger choice.
 
 ## Verify
 
-The boundary, not just the plumbing, is what matters — a worker that *tries* to reach the network or write
-the disk must fail inside the sandbox:
+The boundary, not just the plumbing, is what matters. A worker that *tries* to reach the network, write the disk
+or read your files must fail. PyDiffWatch checks this itself on every run (the probe above). With
+`parse_sandbox = "on"`, a check that fails stops the run with `pydiffwatch: parse_sandbox = "on" but …` instead
+of scanning. On macOS, the test suite also runs the real sandbox:
 
 ```bash
-# inside the sandbox, both must fail:
-python -c "import socket; socket.getaddrinfo('pypi.org', 443)"   # PrivateNetwork -> fails
-python -c "open('/tmp/x','w')"                                   # ProtectSystem=strict -> read-only fs
+python3 -m pytest -q -m seatbelt tests/test_sandbox.py
 ```
 
-If either succeeds, the stage is not contained — the parser is still running with host network/disk
-authority.
+If you also run PyDiffWatch inside your own container, verify that boundary the same way. Both commands must fail
+inside it:
+
+```bash
+python -c "import socket; socket.getaddrinfo('pypi.org', 443)"   # no network -> fails
+python -c "open('/tmp/x','w')"                                   # read-only filesystem -> fails
+```
+
+If either succeeds, the container is not containing the process.

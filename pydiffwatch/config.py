@@ -78,7 +78,16 @@ class Config:
     wheel_only_grace_minutes: float = 60.0   # a switch to wheel-only is re-checked for a late sdist before it warns
     reviewer_enabled: bool = True
     rules_dir: Path = Path("rules/community")
+    # The parse sandbox (docs/hardening/parse-sandbox.md): "auto" scans in a sandboxed worker when the probe holds
+    # and otherwise warns and scans in-process; "on" refuses to scan without it; "off" scans in-process, silently.
+    parse_sandbox: str = "auto"
+    parse_timeout_s: float = 120.0     # the worker's CPU limit per release; its wall-clock limit is this + 10 s
+    parse_memory_max: str = "2G"       # the worker's MemoryMax (Linux/systemd only; macOS has no memory cap)
     reviewer: ReviewerConfig = field(default_factory=ReviewerConfig)
+
+    def __post_init__(self):
+        if self.parse_sandbox not in ("auto", "on", "off"):
+            raise ValueError(f'parse_sandbox must be "auto", "on" or "off", got {self.parse_sandbox!r}')
 
 
 def load_config(path) -> Config:

@@ -156,3 +156,9 @@ def test_a_corrupt_new_sdist_records_the_baseline_and_owners(tmp_path):
     row = conn.execute("SELECT stage, prior_version, maintainer_metadata, fetch_note FROM releases").fetchone()
     assert tuple(row)[:3] == ("metadata_retry", "1.0", '{"roles": ["alice"]}')
     assert "BadGzipFile" in row[3]
+
+
+def test_modules_other_than_test_sandbox_scan_in_process_and_never_probe():
+    # tests stub fetcher._download in this process, which a sandboxed worker would not see (spec §3.2 conftest)
+    assert sandbox._backend == "off"
+    assert sandbox.choose(Config(parse_sandbox="on"), which=lambda b: None) == "off"

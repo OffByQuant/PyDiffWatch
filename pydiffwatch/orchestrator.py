@@ -717,6 +717,7 @@ def run_once(cfg: Config, *, seed_if_fresh: bool = True, recent: int | None = No
                   f"catching up to now", flush=True)
         rvw = _build_reviewer(cfg)
         ruleset = _load_ruleset(cfg)
+        sandbox._backend = sandbox.choose(cfg)   # prove the parse sandbox holds before any package byte is parsed
         offline = False
         guard = None
         if rvw is not None:
@@ -779,6 +780,7 @@ def review_pending(cfg: Config, reasons=None, limit=None):
         rvw = _build_reviewer(cfg)
         if rvw is None:
             return 0, store.pending_review_counts(conn)
+        sandbox._backend = sandbox.choose(cfg)   # the drain's rebuild downloads and scans (spec §3.3)
         gd = guard_mod.ReviewerGuard(cfg, rvw.backend, conn)
         gd.begin_batch()
         n = drain_pending(cfg, conn, rvw, auto=False, reasons=reasons, limit=limit, guard=gd)
@@ -836,6 +838,7 @@ def queued_releases(cfg: Config, limit=50):
 def list_pending(cfg: Config):
     """Suspicious LLM verdicts awaiting adjudication. Each item carries the model's verdict plus the
     stored payload evidence (or the diff re-fetched from PyPI when evidence is absent on older rows)."""
+    sandbox._backend = sandbox.choose(cfg)       # a row without stored evidence is scanned again (Ruling R9)
     conn = store.connect(cfg); store.init_schema(conn)
     ruleset = _load_ruleset(cfg)
     items = []
@@ -881,6 +884,7 @@ def backfill_evidence(cfg: Config, release_id: int | None = None, all_flagged: b
     Re-fetches the immutable sdist, reproduces the diff, and stores the rendered payload. A pulled
     package can no longer be re-fetched, so the capture is reported as failed rather than crashing.
     Default scope = the reportable set; all_flagged widens to every row with a fired rule."""
+    sandbox._backend = sandbox.choose(cfg)       # before the connection opens (Ruling R9)
     conn = store.connect(cfg); store.init_schema(conn)
     ruleset = _load_ruleset(cfg)
     results = []
@@ -933,10 +937,14 @@ def watch(cfg: Config, interval: int = 300, out_path=None, iterations=None, slee
     """Daemon loop: scan one tick, refresh the dashboard, sleep, repeat until Ctrl-C. While a backlog is
     waiting (a --recent start, or a restart after downtime) the next tick starts at once instead.
     A failed scan is logged and skipped (the daemon stays up); the dashboard is
-    refreshed every tick so 'last poll' / reachability stay current. `iterations`
-    and `sleep_fn` exist for tests; in production both default to forever / time.sleep."""
+    refreshed every tick so 'last poll' / reachability stay current. The exception is a SandboxError: under
+    parse_sandbox = "on" a sandbox that does not hold stops the daemon, at startup or on the tick where it starts
+    failing (parse-sandbox spec decision 4). `iterations` and `sleep_fn` exist for tests; in production both
+    default to forever / time.sleep."""
     import time
     sleep_fn = sleep_fn or time.sleep
+    if cfg.parse_sandbox == "on":
+        sandbox.choose(cfg)     # before the first tick, even on a fresh cursor where run_once never reaches it
     n = 0
     try:
         while iterations is None or n < iterations:
@@ -945,9 +953,13 @@ def watch(cfg: Config, interval: int = 300, out_path=None, iterations=None, slee
                 before = _cursor(cfg)
                 try:
                     run_once(cfg, recent=recent)
+                except sandbox.SandboxError:
+                    raise                # only choose() raises it out of run_once: "on", and the sandbox fails
                 except Exception:
                     logger.exception("watch: scan tick failed; daemon continuing")
                 export_dashboard(cfg, out_path=out_path)
+            except sandbox.SandboxError:
+                raise
             except Exception:
                 logger.exception("watch: tick failed; daemon continuing")
             n += 1
