@@ -14,8 +14,8 @@ _PYPI = "https://pypi.org/project"
 _FLAGGED = ("malicious", "suspicious")
 
 
-def pypi_package_url(package: str) -> str:
-    return f"{_PYPI}/{quote(package, safe='')}/"
+def pypi_report_url(package: str) -> str:
+    return f"{_PYPI}/{quote(package, safe='')}/submit-malware-report/"
 
 
 def pypi_version_url(package: str, version: str) -> str:
@@ -108,7 +108,7 @@ def _card(row: dict) -> str:
     actions = [f'<a class="btn view" href="{e(pypi_version_url(pkg, ver))}" '
                f'target="_blank" rel="noopener noreferrer">View on PyPI ↗</a>']
     if flagged:
-        actions.insert(0, f'<a class="btn report" href="{e(pypi_package_url(pkg))}" '
+        actions.insert(0, f'<a class="btn report" href="{e(pypi_report_url(pkg))}" '
                        f'target="_blank" rel="noopener noreferrer">Report malware on PyPI ↗</a>')
     reasoning = row.get("reasoning") or ""
     cited = row.get("cited_hunk") or ""

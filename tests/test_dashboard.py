@@ -350,3 +350,10 @@ def test_reasoning_has_no_angle_brackets_so_it_pastes_into_pypis_report_form():
                                        "reasoning": "reads /proc/<pid>/cmdline and a <b>tag</b> & more"}])
     reason = re.search(r'<div class="reason">(.*?)</div>', out).group(1)
     assert reason == "reads /proc/‹pid›/cmdline and a ‹b›tag‹/b› &amp; more"
+
+
+def test_report_button_opens_pypis_malware_report_form_not_the_project_page():
+    # The two buttons used to land on the same project page; PyPI's report form lives one step deeper.
+    out = dashboard.render_dashboard([{"package": "evil pkg", "version": "1.0.0",
+                                       "classification": "malicious", "model": "qwen", "reasoning": "x"}])
+    assert ('class="btn report" href="https://pypi.org/project/evil%20pkg/submit-malware-report/"' in out)
