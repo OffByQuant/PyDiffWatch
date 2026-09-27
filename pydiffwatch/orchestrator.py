@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 # for a late sdist once wheel_only_grace_minutes are over.
 TERMINAL = {"triaged", "alerted", "reviewed", "new_package_skipped", "needs_adjudication",
             "refused_to_extract", "no_sdist", "refused_to_fetch", "pending_review",
-            "metadata_gone", "metadata_retry", "gave_up", "no_sdist_wait"}
+            "removed_before_scan", "metadata_retry", "gave_up", "no_sdist_wait"}
 
 
 def _load_ruleset(cfg):
@@ -305,7 +305,8 @@ def drain_pending(cfg, conn, rvw, *, auto: bool, reasons=None, limit=None, guard
         tried += attempted
         if not go_on:
             break
-        if attempted and store.get_stage(conn, row["package"], row["version"]) != "pending_review":
+        if attempted and store.get_stage(conn, row["package"], row["version"]) not in ("pending_review",
+                                                                                      "removed_before_scan"):
             done += 1
     return done
 
@@ -368,9 +369,11 @@ def _pypi_unreachable(e) -> bool:
 def _scan_release(cfg, rel, ruleset, *, attempt=1, conn=None, as_first_release=False):
     """Download and scan one release again, off the tick: the drain's rebuild, `pending`, `capture-evidence`.
     `conn`: triage sees the owner change, as the tick's scan does. `as_first_release`: diffed against nothing, as
-    a release first scanned with no predecessor was (the whole tree, R1). Returns (Diff, TriageResult), or None
-    when PyPI has no sdist for it."""
+    a release first scanned with no predecessor was (the whole tree, R1). Returns (Diff, TriageResult), None when
+    PyPI has no sdist for it, or the fetcher.Removed when PyPI no longer serves it."""
     dl = fetcher.download(cfg, rel, attempt=attempt)
+    if isinstance(dl, fetcher.Removed):
+        return dl                      # the caller decides (Ruling P1)
     if dl is None or isinstance(dl, fetcher.NoSdist):
         return None
     if as_first_release:
@@ -402,6 +405,8 @@ def _rebuild_review_input(cfg, conn, rvw, row, ruleset, cap):
     try:
         got = _scan_release(cfg, NewRelease(pkg, ver, row["serial"]), ruleset,
                             attempt=row["review_attempts"] + 1, conn=conn)
+        if isinstance(got, fetcher.Removed):
+            return _rebuild_removed(cfg, conn, row, got)
         if got is None:
             return failed("no sdist on PyPI")
         d, tr = got
@@ -429,13 +434,30 @@ def _rebuild_review_input(cfg, conn, rvw, row, ruleset, cap):
         return "failed"
 
 
+def _rebuild_removed(cfg, conn, row, removed) -> str:
+    """PR E D6: a reviewer_disabled release that PyPI stopped serving before its rebuild. First sight re-parks it
+    with detail `not on PyPI (<kind>); re-checked after <time>` and a re-check time; at or after the re-check, still
+    gone, it is recorded removed_before_scan (no verdict, no alert, out of the queue). No review attempt is spent."""
+    rid, now = row["release_id"], time.time()
+    if not (row["pending_detail"] or "").startswith("not on PyPI ("):
+        t = now + cfg.wheel_only_grace_minutes * 60
+        store.set_pending_reason(conn, rid, row["pending_reason"], f"not on PyPI ({removed.kind}); re-checked after "
+                                 f"{datetime.datetime.fromtimestamp(t, datetime.UTC).isoformat(timespec='seconds')}")
+        store.set_recheck_at(conn, rid, t)
+    elif (store.recheck_at(conn, rid) or now) <= now:
+        store.clear_pending(conn, rid)          # out of the queue's columns too
+        store.record_removed(conn, rid, removed.kind, None)
+    return "removed"
+
+
 
 def _fetch_one(cfg, rel, attempt=1):
     """Worker half of the pipeline — runs OFF the main thread. Does NO sqlite, NO notifier work and NO archive
     parsing (the main thread's sandbox.analyze does that): only the network — the package JSON, both sdists as
     bytes, the dependency screening. Attempt k (a retry of a failed release) gets k times the package-JSON and
     sdist deadlines (see fetcher.download), as review retries get timeout x attempt; attempt 1 keeps them as
-    configured. Returns the Download, a NoSdist, or the Exception it caught, for the main thread to map."""
+    configured. Returns the Download, a NoSdist, a Removed, or the Exception it caught, for the main thread to
+    map."""
     try:
         return fetcher.download(cfg, rel, attempt=attempt)
     except Exception as e:        # incl. RefusedToFetch — mapped on the main thread
@@ -463,7 +485,7 @@ def _alert_unscanned(cfg, conn, rid, package, version, note, *, stage, score=0.0
     """The one path for an outcome that leaves a release unscanned: alert once, and queue it for a person.
 
     - `note` is the alert's reasoning. By convention it starts `UNREVIEWED:` and ends `Not scanned. Needs
-      manual review.` (refusals and `metadata_gone` keep their own endings).
+      manual review.` (refusals keep their own endings).
     - `stage` names the outcome (`refused_to_fetch`, `no_sdist`, `gave_up`, ...). The alert is
       `suspicious-heuristic`, deduped on package|version|suspicious-heuristic|unscanned:<stage>, so it fires
       once per outcome, and never again on a re-tick.
@@ -495,9 +517,9 @@ def _refused_to_extract(cfg, conn, rid, rel, e):
 
 
 def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=None) -> bool:
-    """Main-thread half: record the release, map a completed fetch `result` (Download | NoSdist | Exception;
-    None is read as NoSdist) to a stage, scan it (sandbox.analyze), review, emit alerts. ALL sqlite + notifier
-    work happens here.
+    """Main-thread half: record the release, map a completed fetch `result` (Download | NoSdist | Removed |
+    Exception; None is read as NoSdist) to a stage, scan it (sandbox.analyze), review, emit alerts. ALL sqlite +
+    notifier work happens here.
     Returns True iff the release reached a terminal stage; a failure is queued for retry (_retry_later),
     which is terminal for the cursor."""
     rid = store.record_release(conn, rel.package, rel.version, rel.serial, False, None, "sdist")
@@ -516,13 +538,16 @@ def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=
             note = _refusal_note("download it", str(result))
         _alert_unscanned(cfg, conn, rid, rel.package, rel.version, note, stage="refused_to_fetch")
         return True   # deterministic refusal (over-size, quarantine) — terminal
-    if isinstance(result, fetcher.MetadataGone):
-        # PyPI pulls malware fast; a release gone before we read it is worth knowing about, and never a cursor
-        # pin. Not queued: with the files gone, a person can't review it either.
-        store.update_stage(conn, rid, "metadata_gone")
-        _alert_unscanned(cfg, conn, rid, rel.package, rel.version,
-                         "UNREVIEWED: removed from PyPI before it could be scanned (its metadata returns 404); "
-                         "the files are gone, so there is nothing to review.", stage="metadata_gone", queue=False)
+    if isinstance(result, fetcher.Removed):   # gone before we got to it: kept on record, nobody can act on it
+        now, recheck = time.time(), store.recheck_at(conn, rid)
+        due = was == "no_sdist_wait" and recheck is not None and recheck <= now
+        if result.at is None and not due:      # D3: an unevidenced removal is confirmed at one re-check
+            if was != "no_sdist_wait":
+                store.wait_for_sdist(conn, rid, now + cfg.wheel_only_grace_minutes * 60)
+                logger.info("%s==%s is not on PyPI (%s); re-checked in %.0f min", rel.package, rel.version,
+                            result.kind, cfg.wheel_only_grace_minutes)
+            return True
+        store.record_removed(conn, rid, result.kind, result.at)
         return True
     if isinstance(result, Exception):   # metadata or sdist download failed (incl. a deadline expiry)
         return _retry_later(cfg, conn, rid, rel, result)
@@ -862,7 +887,9 @@ def list_pending(cfg: Config):
         elif not stored:                                  # older row with no captured payload -> re-fetch
             try:
                 got = _scan_release(cfg, NewRelease(row["package"], row["version"], row["serial"]), ruleset)
-                if got is not None:
+                if isinstance(got, fetcher.Removed):
+                    err = f"removed from PyPI ({got.kind})"
+                elif got is not None:
                     d, tr = got
                     diff_text = reviewer.build_review_input(d, tr, max_chars=cfg.reviewer.max_input_chars)
             except Exception as e:
@@ -902,6 +929,10 @@ def backfill_evidence(cfg: Config, release_id: int | None = None, all_flagged: b
                 # predecessor exists today, reproduce the detection-time scan: diff against nothing.
                 got = _scan_release(cfg, NewRelease(pkg, ver, row["serial"]), ruleset,
                                     as_first_release=bool(row["is_first_release"]))
+                if isinstance(got, fetcher.Removed):
+                    results.append({"package": pkg, "version": ver, "captured": False,
+                                    "error": f"removed from PyPI ({got.kind})"})
+                    continue
                 if got is None:
                     results.append({"package": pkg, "version": ver, "captured": False, "error": "no sdist"})
                     continue
@@ -1037,6 +1068,7 @@ def export_dashboard(cfg: Config, out_path=None, generated_at: str = ""):
         releases_total = store.count_releases(conn)
         pending_review = store.pending_review_counts(conn)
         retry = _retry_backlog(conn)
+        removed = store.removed_counts(conn)
     finally:
         conn.close()
     reachable, reviewer_label = _probe_reviewer(cfg)
@@ -1049,7 +1081,7 @@ def export_dashboard(cfg: Config, out_path=None, generated_at: str = ""):
         "model_reviewed_total": c["model_reviewed"], "model_flagged_total": c["model_flagged"],
         "partial_total": c["partial"], "not_scanned_total": c["not_scanned"],
         "reviewer": reviewer_label, "model_reachable": reachable, "pending_review": pending_review,
-        "guard": guard_status(cfg), "retry": retry,
+        "guard": guard_status(cfg), "retry": retry, "removed": removed,
     }
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(dashboard.render_dashboard(rows, status=status, generated_at=generated_at))

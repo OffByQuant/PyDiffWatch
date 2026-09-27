@@ -115,7 +115,7 @@ def test_retention_keeps_findings_queues_and_the_newest_release_of_each_package(
     store.record_verdict(conn, refused, _verdict("unreviewed", "suspicious"))
     flagged = _old(conn, "bad", "1.0", 120, stage="reviewed")
     store.record_verdict(conn, flagged, _verdict("bad", "malicious"))
-    gone = _old(conn, "gone", "1.0", 120, stage="metadata_gone")
+    gone = _old(conn, "gone", "1.0", 120, stage="removed_before_scan")
     store.record_alert(conn, gone, "suspicious-heuristic", 0.0, "[]", "gone==1.0")
     for pkg in ("unreviewed", "bad", "gone"):
         _old(conn, pkg, "1.1", 1)

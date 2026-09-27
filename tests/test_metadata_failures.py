@@ -1,7 +1,8 @@
 """A release whose PyPI metadata can't be read must never pin the cursor. PyPI removes malware fast, so a 404
-on the JSON metadata is common and terminal: `metadata_gone`, with an alert saying it was removed before it
-could be scanned. Any other metadata failure is retried on later ticks (the retry lives on the release row,
-since the changelog already named the version) and given up on, visibly, after 3 attempts. A failed
+on the JSON metadata (or a live JSON without the version) is common: the release is recorded
+`removed_before_scan`, silently, after one re-check unless the changelog showed the removal. Any other
+metadata failure is retried on later ticks (the retry lives on the release row, since the changelog already
+named the version) and given up on, visibly, after 3 attempts. A failed
 download of the PRIOR sdist diffs against nothing rather than failing the release."""
 import sys
 import urllib.error
@@ -34,29 +35,16 @@ def _feed(monkeypatch, releases):
     monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: [r for r in releases if r.serial > since])
 
 
-def test_a_404_on_package_metadata_is_metadata_gone(monkeypatch):
+def test_a_404_on_package_metadata_is_project_gone(monkeypatch):
     monkeypatch.setattr(fetcher.urllib.request, "urlopen", _http(404))
-    with pytest.raises(fetcher.MetadataGone):
-        fetcher.fetch_artifacts(orchestrator.Config(), NewRelease("victim", "1.1", 1))
+    assert fetcher.fetch_artifacts(orchestrator.Config(), NewRelease("victim", "1.1", 1)) == \
+        fetcher.Removed("project_gone", None)
 
 
 def test_any_other_metadata_failure_is_metadata_unavailable(monkeypatch):
     monkeypatch.setattr(fetcher.urllib.request, "urlopen", _http(503))
     with pytest.raises(fetcher.MetadataUnavailable):
         fetcher.fetch_artifacts(orchestrator.Config(), NewRelease("victim", "1.1", 1))
-
-
-def test_a_404_is_terminal_alerts_and_never_pins_the_cursor(tmp_cfg, monkeypatch, capsys):
-    _feed(monkeypatch, [NewRelease("gone", "1.0", 10), NewRelease("after", "1.0", 11)])
-    monkeypatch.setattr(fetcher.urllib.request, "urlopen", _http(404))
-    orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
-    conn = store.connect(tmp_cfg)
-    assert store.get_stage(conn, "gone", "1.0") == "metadata_gone"
-    assert store.get_last_serial(conn) == 11
-    alert = conn.execute("SELECT a.classification FROM alerts a JOIN releases r ON r.id=a.release_id "
-                         "WHERE r.package='gone'").fetchone()
-    assert alert is not None and alert[0] == "suspicious-heuristic"
-    assert "removed from PyPI before it could be scanned" in capsys.readouterr().out
 
 
 def test_a_repeated_5xx_gives_up_after_3_attempts_without_pinning_the_cursor(tmp_cfg, monkeypatch):

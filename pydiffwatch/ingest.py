@@ -5,6 +5,7 @@
 from defusedxml.xmlrpc import monkey_patch as _defuse_xmlrpc
 import xmlrpc.client  # nosemgrep: python.lang.security.use-defused-xmlrpc.use-defused-xmlrpc
 _defuse_xmlrpc()
+import datetime
 import logging
 import urllib.parse
 
@@ -53,15 +54,27 @@ def changes_since(cfg: Config, since_serial: int) -> list[NewRelease]:
                        type(e).__name__, e, since_serial)
         return []  # next tick retries from the same serial — no gap
     best: dict[tuple[str, str], list] = {}   # (name, version) -> [serial, new release seen, sdist upload seen]
-    for name, version, _ts, action, serial in rows:
+    removed: dict[tuple[str, str], tuple] = {}   # (name, version) -> (serial, time) of a same-batch `remove release`
+    last: dict[tuple[str, str], int] = {}         # (name, version) -> its latest new-release/upload serial
+    for name, version, ts, action, serial in rows:
+        if action == "remove release" and version is not None:
+            if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+                try:
+                    removed[(name, version)] = (serial, datetime.datetime.fromtimestamp(ts, datetime.UTC).isoformat())
+                except (OverflowError, ValueError, OSError):
+                    pass                    # unrepresentable: no evidence, so the release waits one re-check
+            continue
         sdist = action.startswith(SDIST_UPLOAD_ACTION)
         if (action != "new release" and not sdist) or version is None:
             continue
         ev = best.setdefault((name, version), [serial, False, False])
+        last[(name, version)] = max(last.get((name, version), serial), serial)
         # The FIRST serial: the cursor never passes an event of an item not yet processed, even when the
         # per-run cap cuts the list (a later event of the item is re-seen next tick, a cheap no-op).
         ev[0] = min(ev[0], serial)
         ev[1 if not sdist else 2] = True
-    items = [NewRelease(package=n, version=v, serial=s, new_release=nr, sdist_upload=sd)
+    items = [NewRelease(package=n, version=v, serial=s, new_release=nr, sdist_upload=sd,
+                        removed_at=removed[(n, v)][1] if (n, v) in removed and removed[(n, v)][0] > last[(n, v)]
+                        else None)   # a removal evidences only when no re-upload followed it
              for (n, v), (s, nr, sd) in best.items()]
     return sorted(items, key=lambda r: r.serial)

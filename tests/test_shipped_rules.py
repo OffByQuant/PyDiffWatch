@@ -311,3 +311,15 @@ def test_syntax_newer_than_runtime(monkeypatch):
 def test_a_root_conftest_is_not_an_autoexec_location():
     d = _code("conftest.py", ["import os", "os.system(c)"])
     assert not _fires(d, "autoexec-location") and triage(d, Config(), RULES).score == 5
+
+
+def test_a_same_owner_brand_new_dependency_does_not_escalate_alone():
+    d = Diff("p", "1.1", False, [], [], added_dep_findings=[{"name": "compyps", "reason": "brand-new",
+                                                             "same_owner": True}])
+    t = triage(d, Config(), RULES)
+    assert t.score == 20 and not t.escalate
+
+
+def test_a_cleared_dependency_fires_no_dep_rule():
+    t = triage(Diff("p", "1.1", False, [], [], added_dep_findings=[]), Config(), RULES)
+    assert not [f for f in t.fired_rules if f.rule.startswith("dep-")]

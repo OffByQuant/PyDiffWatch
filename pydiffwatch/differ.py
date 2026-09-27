@@ -33,6 +33,35 @@ _DEP_REASONS = {"nonexistent": "not on PyPI (dependency confusion)", "brand-new"
                 "not-screened-cap": "not screened (lookup cap reached)"}
 
 
+_NEAR = "its name is one or two edits away from "     # nearest_corpus uses max_dist=2
+
+
+def _dep_line(f) -> str:
+    """One dependency finding as neutral facts (PR E): the reason's evidence, never the word "typosquat"."""
+    name, reason, target = _esc(f.get("name")), f.get("reason"), f.get("target")
+    near = _NEAR + (f"the popular package {_esc(target)}" if target else "a popular package")
+    if reason == "typosquat":
+        if "releases" not in f:
+            return f"dependency {name}: {near}; not looked up"
+        owner = "a different PyPI owner from this package" if f.get("owner") == "different" else "PyPI owner unknown"
+        line = (f"dependency {name}: {near}; first published {_esc(f.get('first_upload') or 'unknown')}, "
+                f"{int(f.get('releases') or 0)} release(s); {owner}")
+        if f.get("pypi_org"):
+            line += f"; published under the PyPI organisation {_esc(f['pypi_org'])}"
+        if f.get("same_author_email"):
+            line += "; its metadata names the same author email as this package (author-declared)"
+        if f.get("same_org"):
+            line += "; its project URLs name the same code-host organisation as this package's (author-declared)"
+        if f.get("same_author_as_target") and target:
+            line += f"; its metadata names the same author as {_esc(target)} (author-declared)"
+        return line
+    if reason == "nonexistent" and target:
+        return f"dependency {name}: not on PyPI (dependency confusion); {near}"
+    if reason == "brand-new" and f.get("same_owner"):
+        return f"dependency {name}: brand-new on PyPI; the same PyPI owner as this package"
+    return f"dependency {name}: {_DEP_REASONS.get(reason) or _esc(reason)}"
+
+
 def render_signals(requires_dist_change, added_dep_findings, added_binaries, maintainer_context) -> str:
     """The dependency / binary / ownership signals triage scored, one line each, for the reviewer (spec B2).
     Rendered by the parent from its own data (parse-sandbox spec decision 5). Every author-written value (names,
@@ -41,11 +70,7 @@ def render_signals(requires_dist_change, added_dep_findings, added_binaries, mai
     for key in ("added", "removed"):
         if items := (requires_dist_change or {}).get(key):
             out.append(f"requires-dist {key}: {_list(items)}")
-    deps = []
-    for f in added_dep_findings:
-        why = ((f"typosquat of {_esc(f['target'])} (a popular package)" if f.get("target") else "typosquat")
-               if f.get("reason") == "typosquat" else _DEP_REASONS.get(f.get("reason")) or _esc(f.get("reason")))
-        deps.append(f"dependency {_esc(f.get('name'))}: {why}")
+    deps = [_dep_line(f) for f in added_dep_findings]
     out += _capped("dependency", deps)
     bins = []
     # unscored oversized files last: the shared cap must never cut a scored line for one

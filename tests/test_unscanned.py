@@ -1,7 +1,7 @@
 """Every outcome that leaves a release unscanned warns once (spec U1, U3). The alert's reasoning starts
 `UNREVIEWED:`; the release waits in `pending`, which names the stage it stopped at instead of a model label;
-and a later tick never repeats the alert. `metadata_gone` also alerts, but stays out of `pending`: the files
-are gone, so nobody can review it."""
+and a later tick never repeats the alert. A release PyPI no longer serves is `removed_before_scan`: silent, after
+one re-check unless the changelog showed the removal, and out of `pending` (the files are gone)."""
 import dataclasses
 import json
 import sqlite3
@@ -128,17 +128,14 @@ def test_exhausted_review_retries_warn_once(tmp_path, capsys, monkeypatch, scan_
     assert "(not scanned: review_failed)" in out and "model: suspicious" not in out
 
 
-# --- metadata_gone -------------------------------------------------------------------------------------
+# --- removed_before_scan -------------------------------------------------------------------------------
 
-def test_metadata_gone_alerts_once_and_stays_out_of_pending(tmp_cfg, capsys, monkeypatch, scan_stub):
+def test_a_removed_release_is_silent_and_stays_out_of_pending(tmp_cfg, capsys, monkeypatch, scan_stub):
     conn = store.connect(tmp_cfg); store.init_schema(conn)
     rel = NewRelease("gone", "1.0", 3)
-    orchestrator._process_fetched(tmp_cfg, conn, None, None, rel, fetcher.MetadataGone("404"))
-    out = capsys.readouterr().out
-    assert "gone 1.0" in out and "removed from PyPI before it could be scanned" in out
-    assert "the files are gone, so there is nothing to review" in out
-    orchestrator._process_fetched(tmp_cfg, conn, None, None, rel, fetcher.MetadataGone("404"))
-    assert capsys.readouterr().out == "" and len(_alerts(conn, "gone")) == 1
+    orchestrator._process_fetched(tmp_cfg, conn, None, None, rel,
+                                  fetcher.Removed("project_gone", "2026-09-27T10:00:00+00:00"))
+    assert capsys.readouterr().out == "" and _alerts(conn, "gone") == []
     assert orchestrator.list_pending(tmp_cfg) == []
     assert "not scanned" not in _pending_cli(tmp_cfg, monkeypatch, capsys, scan_stub)
 
@@ -173,14 +170,15 @@ def test_prune_keeps_every_unscanned_row(tmp_path, capsys):
         orchestrator._process_fetched(cfg, conn, None, None, NewRelease("flaky", "1.0", 10), TimeoutError(str(i)))
     orchestrator._process_fetched(cfg, conn, None, None, NewRelease("cudrequest", "0.2.0", 11),
                                   fetcher.RefusedToFetch("quarantined: cudrequest"))
-    orchestrator._process_fetched(cfg, conn, None, None, NewRelease("gone", "1.0", 12), fetcher.MetadataGone("404"))
+    orchestrator._process_fetched(cfg, conn, None, None, NewRelease("gone", "1.0", 12),
+                                  fetcher.Removed("project_gone", "2026-09-27T10:00:00+00:00"))
     for pkg in ("pkg", "pkg2", "flaky", "cudrequest", "gone"):      # a newer release, so none is its package's newest
         store.record_release(conn, pkg, "9.9", 99, False, None, "sdist")
     conn.execute("UPDATE releases SET processed_at='2000-01-01T00:00:00+00:00' WHERE version != '9.9'")
     conn.commit()
     store.prune(conn, retention_days=1)
     kept = {r[0] for r in conn.execute("SELECT package FROM releases WHERE version != '9.9'")}
-    assert kept == {"pkg", "pkg2", "flaky", "cudrequest", "gone"}
+    assert kept == {"pkg", "pkg2", "flaky", "cudrequest"}
 
 
 # --- migration -----------------------------------------------------------------------------------------

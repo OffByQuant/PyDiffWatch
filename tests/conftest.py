@@ -77,7 +77,7 @@ def scan_stub(monkeypatch):
                     got = fn(cfg, rel, attempt=attempt) if takes_attempt else fn(cfg, rel)
                 except fetcher.RefusedToExtract as e:
                     return self.dl(e, rel.package, rel.version)
-                return got if got is None or isinstance(got, fetcher.NoSdist) else self.dl(got)
+                return got if got is None or isinstance(got, (fetcher.NoSdist, fetcher.Removed)) else self.dl(got)
             monkeypatch.setattr(fetcher, "download", download)
 
     monkeypatch.setattr(fetcher, "extract_download", extract)
