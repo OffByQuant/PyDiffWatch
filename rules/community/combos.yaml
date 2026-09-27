@@ -29,3 +29,23 @@
     all:
       - bound_call: {category: credential}
       - bound_call: {category: network}
+
+- id: combo-decode-run
+  description: A base64/binascii, codecs or zlib/gzip/bz2/lzma decode and a process spawn co-occur in a non-test file with no exec (a decoded command handed to a runner).
+  applies_to: code
+  weight: 45
+  attack_type: obfuscated-loader
+  match:
+    all:
+      - location_at_least: 1.0
+      - any:
+          - bound_call: {name: b64decode}
+          - bound_call: {name: urlsafe_b64decode}
+          - bound_call: {name: b32decode}
+          - bound_call: {name: b16decode}
+          - bound_call: {name: a85decode}
+          - bound_call: {name: unhexlify}
+          - bound_call: {name: decode}
+          - bound_call: {name: decompress}
+      - bound_call: {category: process}
+      - not: {bound_call: {category: exec}}

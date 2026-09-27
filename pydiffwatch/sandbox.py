@@ -144,7 +144,7 @@ def _encode_output(art, d: Diff, tr: TriageResult) -> bytes:
                              for f in d.changed],
                  "added_binaries": d.added_binaries, "description": d.description,
                  "exec_context": d.exec_context, "baseline_unavailable": d.baseline_unavailable,
-                 "surface_omitted": d.surface_omitted},
+                 "surface_omitted": d.surface_omitted, "requires_python": d.requires_python},
         "triage": {"fired_rules": [{"rule": r.rule, "weight": r.weight, "file": r.file, "lines": list(r.lines)}
                                    for r in tr.fired_rules]},
         "prior_error": art.prior_error}, sort_keys=True).encode()
@@ -217,7 +217,9 @@ def _decode_output(raw: bytes, cfg, dl: Download, ruleset):
         _check(omitted is None or type(omitted) is int, "surface_omitted")
         d = Diff(dd["package"], dd["version"], dd["is_first_release"], changed, bins, [],
                  _str(dd["description"], "description"), _str(dd["exec_context"], "exec context"),
-                 _str(dd["baseline_unavailable"], "baseline"), omitted, "")
+                 _str(dd["baseline_unavailable"], "baseline"), omitted, "",
+                 requires_python=_str(dd["requires_python"], "requires_python", optional=True))
+        _check(d.requires_python is None or len(d.requires_python) <= 4096, "requires_python")
         prior_error = _str(out["prior_error"], "prior_error", optional=True)
         known = {r.id for r in ruleset}
         fired = []

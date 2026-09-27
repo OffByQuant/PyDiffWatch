@@ -810,3 +810,24 @@ def test_the_webhook_url_never_reaches_the_worker():
     assert b"SECRETTOKEN" not in line and "webhook_url" not in head["cfg"]
     got_cfg, _, _ = sandbox._decode_input(head, io.BytesIO(sandbox._encode_input(cfg, _scan_dl(), []).split(b"\n", 1)[1]))
     assert got_cfg.webhook_url is None
+
+
+def test_requires_python_crosses_the_worker_reply():
+    cfg, rs = Config(), rules.load_rules(_RULES)
+    dl = _dl({"p/a.py": b"x = 2\n", "PKG-INFO": b"Metadata-Version: 2.1\nName: p\nRequires-Python: >=3.14\n"},
+             {"p/a.py": b"x = 1\n"})
+    art, d, tr = sandbox.compute(cfg, dl, rs)
+    got_d, _, _ = sandbox._decode_output(sandbox._encode_output(art, d, tr), cfg, dl, rs)
+    assert d.requires_python == ">=3.14" and got_d.requires_python == ">=3.14"
+
+
+def test_a_non_string_requires_python_is_a_malformed_reply():
+    # Review Focus 3
+    cfg, rs, dl = Config(), rules.load_rules(_RULES), _scan_dl()
+    out = json.loads(sandbox._encode_output(*sandbox.compute(cfg, dl, rs)))
+    out["diff"]["requires_python"] = 314
+    with pytest.raises(sandbox.SandboxError, match="malformed requires_python"):
+        sandbox._decode_output(json.dumps(out).encode(), cfg, dl, rs)
+    out["diff"]["requires_python"] = ">=3.14," + "x" * 5000
+    with pytest.raises(sandbox.SandboxError, match="malformed requires_python"):
+        sandbox._decode_output(json.dumps(out).encode(), cfg, dl, rs)

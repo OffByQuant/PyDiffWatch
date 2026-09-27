@@ -30,7 +30,13 @@ pip install -e .                 # core: stdlib + PyYAML + defusedxml
 pip install -e ".[claude]"       # ONLY if you'll use the Anthropic provider (pulls in the anthropic SDK)
 ```
 
-Requires Python 3.11+ (the config loader uses the stdlib `tomllib`). Verify the CLI:
+Requires Python 3.11+ (the config loader uses the stdlib `tomllib`).
+
+Run it on the newest CPython you can. A file using newer syntax than the interpreter can't be parsed, so its calls
+are unseen: when the package's Requires-Python says it needs that newer Python, the file scores a small
+`syntax-newer-than-runtime` weight instead of the syntax-error weight, and the log says so once per release.
+
+Verify the CLI:
 
 ```bash
 pydiffwatch -c examples/local-qwen.toml --help
@@ -351,7 +357,9 @@ pydiffwatch -c pydiffwatch.toml run
 
 `run` pulls every release since the last cursor (capped by `max_releases_per_run`), diffs each against
 its prior version, scores it with the ruleset, and escalates anything ≥ `threshold_t` to the reviewer.
-The broad `primitives` rule is capped (`max_total: 35`), so it can't escalate a release on its own. Rules
+The broad `primitives` rule is capped (`max_total: 35`), so it can't escalate a release on its own.
+Build files and `.pth` files are also checked for install-time shell, raw-socket, cloud-metadata and
+out-of-band-lookup strings (`py-install-code-dangerous`). Rules
 only ever clear or escalate: only the model or a person can call a release malicious. A flagged release
 no model has reviewed yet waits in the review queue without an alert.
 Clear-malicious verdicts alert immediately; borderline "suspicious" ones queue for your judgement.

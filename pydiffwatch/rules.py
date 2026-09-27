@@ -7,6 +7,7 @@ load time with a logged warning and never evaluated. This is what makes a commun
 safe to load without sandboxing — it can describe matches but can never execute code."""
 import logging
 import math
+import posixpath
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,7 @@ _PRED_SCOPE = {
     "bound_call": {"code"}, "autoexec_call": {"code"}, "import_present": {"code"}, "regex": {"code"},
     "blob_present": {"code"}, "syntax_error": {"code"}, "location_at_least": {"code"},
     "binary_reason": {"binary"}, "dep_reason": {"dep"}, "maintainer_changed": {"maintainer"},
+    "path_in": {"code"}, "encoded_url": {"code"}, "newer_syntax": {"code"},
 }
 
 
@@ -54,6 +56,15 @@ def _finite_number(v) -> bool:
 
 def _valid_max_total(v) -> bool:
     return _finite_number(v) and v > 0
+
+
+def _valid_path_entry(e) -> bool:
+    """A basename (no '/') or '*.<ext>': 1-200 characters, '*' only as the leading '*.'."""
+    if not isinstance(e, str) or not 1 <= len(e) <= 200 or "/" in e:
+        return False
+    if e.startswith("*."):
+        return len(e) > 2 and "*" not in e[2:]
+    return "*" not in e
 
 
 def _valid_pred_args(name, args, scope) -> bool:
@@ -90,8 +101,10 @@ def _valid_pred_args(name, args, scope) -> bool:
         except re.error:
             return False
         return True
-    if name in ("blob_present", "syntax_error", "maintainer_changed"):
+    if name in ("blob_present", "syntax_error", "maintainer_changed", "encoded_url", "newer_syntax"):
         return args is True
+    if name == "path_in":
+        return isinstance(args, list) and 1 <= len(args) <= 100 and all(_valid_path_entry(e) for e in args)
     if name == "location_at_least":
         return isinstance(args, (int, float)) and not isinstance(args, bool)
     if name == "binary_reason":
@@ -202,6 +215,13 @@ def _pred(name, args, ctx) -> bool:
         return ctx.get("reason") == args
     if name == "maintainer_changed":
         return ctx is True
+    if name == "path_in":                 # == and endswith only: no glob, no regex
+        base = posixpath.basename(ctx.path)
+        return any(base.endswith(e[1:]) if e.startswith("*.") else base == e for e in args)
+    if name == "encoded_url":
+        return ctx.encoded_url
+    if name == "newer_syntax":
+        return ctx.newer_syntax
     return False
 
 

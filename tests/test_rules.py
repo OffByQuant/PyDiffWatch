@@ -258,3 +258,42 @@ def test_load_rules_drops_huge_weight_keeps_others(tmp_path, caplog):
     with caplog.at_level(logging.WARNING):
         rules = load_rules(tmp_path)   # must NOT raise
     assert {r.id for r in rules} == {"ok"} and "huge" in caplog.text
+
+
+# ---- PR D: path_in, encoded_url, newer_syntax ----
+from pydiffwatch.facts import FileFacts as _FF
+
+
+def _rule(match, scope="code"):
+    return validate_rule({"id": "x", "applies_to": scope, "weight": 1, "match": match})
+
+
+def _at(path, **kw):
+    return _FF(path, (1, 1), 1.0, frozenset(), frozenset(), frozenset(), frozenset(), False, False, (), **kw)
+
+
+def test_path_in_is_accepted():
+    assert _rule({"path_in": ["setup.py", "*.pth"]}) is not None
+
+
+def test_path_in_is_rejected_when_malformed():
+    for bad in ("setup.py", [], ["a"] * 101, ["x" * 201], ["a/setup.py"], ["set*.py"], [1], ["*."]):
+        assert _rule({"path_in": bad}) is None, bad
+    assert _rule({"path_in": ["setup.py"]}, scope="binary") is None
+
+
+def test_path_in_matches_basenames_and_extensions_only():
+    m = {"path_in": ["setup.py", "*.pth"]}
+    assert evaluate(m, _at("setup.py")) and evaluate(m, _at("bindings/python/setup.py"))
+    assert not evaluate(m, _at("mysetup.py")) and not evaluate(m, _at("setup.pyc"))
+    assert evaluate(m, _at("x.pth")) and not evaluate(m, _at("x.pth.bak"))
+
+
+def test_encoded_url_and_newer_syntax_accept_only_true():
+    assert _rule({"encoded_url": True}) is not None and _rule({"newer_syntax": True}) is not None
+    assert _rule({"encoded_url": 1}) is None and _rule({"newer_syntax": "yes"}) is None
+    assert _rule({"encoded_url": True}, scope="dep") is None and _rule({"newer_syntax": True}, scope="dep") is None
+    assert evaluate({"encoded_url": True}, _at("m.py", encoded_url=True))
+    assert not evaluate({"encoded_url": True}, _at("m.py"))
+    assert evaluate({"newer_syntax": True}, _at("m.py", newer_syntax=True))
+    assert not evaluate({"newer_syntax": True}, _at("m.py"))

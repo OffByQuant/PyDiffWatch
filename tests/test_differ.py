@@ -36,3 +36,10 @@ def test_unscored_file_too_large_lines_sort_after_scored_ones_under_the_cap():
     added = [l for l in lines if l.startswith("added file")]
     assert added[0].startswith("added file p/big.py") and added[1].startswith("added file p/lib.so")
     assert "added file: … (+7 more)" in lines
+
+
+def test_requires_python_is_carried_to_the_diff():
+    import dataclasses
+    a = dataclasses.replace(_aset({"a.py": "x=1\n"}, {}), requires_python=">=3.14")
+    assert differ.build_diff(a).requires_python == ">=3.14"
+    assert differ.build_diff(_aset({"a.py": "x=1\n"}, {})).requires_python is None

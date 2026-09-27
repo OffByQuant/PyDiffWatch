@@ -162,3 +162,36 @@ def test_modules_other_than_test_sandbox_scan_in_process_and_never_probe():
     # tests stub fetcher._download in this process, which a sandboxed worker would not see (spec §3.2 conftest)
     assert sandbox._backend == "off"
     assert sandbox.choose(Config(parse_sandbox="on"), which=lambda b: None) == "off"
+
+
+# ---- PR D: the skew WARNING ----
+from pydiffwatch import facts
+
+_BAD = b"def f(:\n    pass\n"      # Ruling P1
+
+
+def _skew_run(tmp_path, scan_stub, caplog, monkeypatch, rp, files):
+    monkeypatch.setattr(facts, "RUNTIME", (3, 13))
+    cfg = _cfg(tmp_path)
+    conn = store.connect(cfg); store.init_schema(conn)
+    caplog.set_level(logging.WARNING, logger="pydiffwatch.orchestrator")
+    orchestrator._process_fetched(cfg, conn, None, orchestrator._load_ruleset(cfg), NewRelease("p", "1.1", 5),
+                                  scan_stub.dl(_art(new_files=files, prior_files={}, requires_python=rp)))
+    return [r.getMessage() for r in caplog.records if "syntax newer than Python" in r.getMessage()]
+
+
+def test_two_skew_files_log_one_warning(tmp_path, scan_stub, caplog, monkeypatch):
+    msgs = _skew_run(tmp_path, scan_stub, caplog, monkeypatch, ">=3.14", {"p/a.py": _BAD, "p/b.py": _BAD})
+    assert msgs == ["p==1.1: 2 file(s) use syntax newer than Python 3.13 (Requires-Python >=3.14); not parsed, "
+                    "not scanned — run pydiffwatch on a newer Python"]
+
+
+def test_a_release_without_skew_logs_no_warning(tmp_path, scan_stub, caplog, monkeypatch):
+    assert _skew_run(tmp_path, scan_stub, caplog, monkeypatch, ">=3.9", {"p/a.py": _BAD}) == []
+
+
+def test_the_skew_warning_is_one_line_for_a_folded_header(tmp_path, scan_stub, caplog, monkeypatch):
+    # Review Focus 2 (Ruling P3): an author-written value cannot forge a second log line.
+    # The first clause sets the floor; the second (ignored by requires_floor) carries the newline into the log text.
+    msgs = _skew_run(tmp_path, scan_stub, caplog, monkeypatch, ">=3.14,\nINFO forged", {"p/a.py": _BAD})
+    assert len(msgs) == 1 and "\n" not in msgs[0] and "\\n" in msgs[0]

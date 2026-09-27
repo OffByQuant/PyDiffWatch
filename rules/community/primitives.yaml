@@ -1,11 +1,19 @@
 # Code-level primitive and obfuscation signals. Weights are baseline defaults — tune for your corpus.
 - id: syntax-error-suspicious
-  description: A complete .py/.pyx/.pyi file fails to parse (often obfuscation, packing, or a dropped binary blob).
+  description: A complete .py/.pyi file fails to parse (often obfuscation, packing, or a dropped binary blob); Cython .pyx never counts, and outside auto-exec files syntax newer than the running interpreter under a Requires-Python floor is scored by syntax-newer-than-runtime instead.
   applies_to: code
   weight: 20
   location_scaled: true
   attack_type: obfuscation
   match: {syntax_error: true}
+
+- id: syntax-newer-than-runtime
+  description: A complete .py/.pyi file outside auto-exec locations fails to parse on this interpreter, and the release's Requires-Python floor is newer; it could not be scanned, but the model can read it.
+  applies_to: code
+  weight: 10
+  location_scaled: true
+  attack_type: unparsed-code
+  match: {newer_syntax: true}
 
 - id: primitives
   description: >
@@ -38,3 +46,13 @@
           - autoexec_call: {category: process}
           - autoexec_call: {category: exec}
           - autoexec_call: {category: network}
+
+- id: encoded-url-literal
+  description: An added string literal outside test files is a base64-encoded http(s) URL (a hidden endpoint).
+  applies_to: code
+  weight: 45
+  attack_type: obfuscated-loader
+  match:
+    all:
+      - location_at_least: 1.0
+      - encoded_url: true
