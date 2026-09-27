@@ -334,3 +334,53 @@ def test_the_docstring_mask_follows_line_numbers_across_hunks():
     fd = FileDiff("m.py", "modified", [Hunk((0, 0), (0, 1), lines[0:1], []),
                                        Hunk((1, 1), (2, 6), lines[2:6], [])], code)
     assert build_facts(Diff("p", "1.1", False, [fd], [])).files[0].blob_present is True
+
+
+# ---- PR D: interpreter skew ----
+from pydiffwatch import facts as facts_mod
+
+_UNPARSEABLE = "def f(:\n    pass\n"    # Ruling P1: fails on every CPython, so the tests hold on 3.14+
+
+
+def _skew(path, rp, runtime, monkeypatch):
+    monkeypatch.setattr(facts_mod, "RUNTIME", runtime)
+    added = _UNPARSEABLE.splitlines()
+    d = Diff("p", "1.1", False, [FileDiff(path, "modified", [Hunk((0, 0), (0, len(added)), added, [])],
+                                          _UNPARSEABLE)], [], requires_python=rp)
+    f = build_facts(d).files[0]
+    return f.syntax_error, f.newer_syntax
+
+
+@pytest.mark.parametrize("path,rp,runtime,expected", [
+    ("pkg/m.py", ">=3.14", (3, 13), (False, True)),
+    ("pkg/m.py", "<4.0,>=3.14", (3, 13), (False, True)),
+    ("pkg/m.py", "~=3.14", (3, 13), (False, True)),
+    ("pkg/m.py", "==3.14.*", (3, 13), (False, True)),
+    ("tests/test_m.py", ">=3.14", (3, 13), (False, True)),
+    ("pkg/m.py", ">=3.9", (3, 13), (True, False)),
+    ("pkg/m.py", None, (3, 13), (True, False)),
+    ("pkg/m.py", ">3.13", (3, 13), (True, False)),
+    ("pkg/m.py", "garbage", (3, 13), (True, False)),
+    ("pkg/__init__.py", ">=3.14", (3, 13), (True, False)),
+    ("setup.py", ">=3.14", (3, 13), (True, False)),
+    ("pkg/m.py", ">=3.14", (3, 14), (True, False)),
+])
+def test_skew_moves_only_non_autoexec_files_under_a_newer_floor(path, rp, runtime, expected, monkeypatch):
+    assert _skew(path, rp, runtime, monkeypatch) == expected
+
+
+def test_requires_floor():
+    rf = facts_mod.requires_floor
+    assert rf(">=3.14") == (3, 14) and rf("~=3.14") == (3, 14) and rf("==3.14.*") == (3, 14)
+    assert rf(">=3.9, <4") == (3, 9) and rf(">=3.10,>=3.12") == (3, 12) and rf(">=3") == (3, 0)
+    assert rf(None) is None and rf("") is None and rf(">3.13") is None and rf("garbage") is None
+
+
+def test_a_huge_version_number_is_no_floor():
+    # Review Focus 1 (Ruling P4): int() of a 5,000-digit string raises on CPython >= 3.11; the clause never counts.
+    assert facts_mod.requires_floor(">=3." + "9" * 5000) is None
+
+
+def test_a_pyx_under_a_newer_floor_is_neither(monkeypatch):
+    # Review Focus 5: Cython is not Python, so no syntax reading and no skew reading.
+    assert _skew("pkg/m.pyx", ">=3.14", (3, 13), monkeypatch) == (False, False)

@@ -9,6 +9,7 @@ import ast
 import math
 import posixpath
 import re
+import sys
 from dataclasses import dataclass
 
 BUILTIN_EXEC = {"exec", "eval", "compile", "__import__"}   # dangerous as bare builtins (no receiver)
@@ -35,6 +36,23 @@ _PRIM_BINDINGS = {
 }
 ENTROPY_X, ENTROPY_WINDOW, LONG_RUN_L, LONG_LINE = 4.5, 64, 128, 500
 _B64_RUN = re.compile(r"[A-Za-z0-9+/=]{%d,}" % LONG_RUN_L)
+RUNTIME = sys.version_info[:2]    # the interpreter the scan parses with (tests monkeypatch it)
+# One Requires-Python clause that sets a floor: >=V, ~=V, ==V or ==V.*. At most 4 digits per part (plan ruling P4).
+_FLOOR_CLAUSE = re.compile(r"\s*(?:>=|~=|==)\s*(\d{1,4})(?:\.(\d{1,4}))?(?:\.\d{1,4})*(?:\.\*)?\s*")
+
+
+def requires_floor(spec) -> tuple | None:
+    """The highest (major, minor) any >=, ~= or == clause names; None when no clause parses (spec D §3.3). Any other
+    operator is ignored, so a spec written only with `>3.13` has no floor and keeps the syntax flag."""
+    if not isinstance(spec, str):
+        return None
+    best = None
+    for clause in spec.split(","):
+        m = _FLOOR_CLAUSE.fullmatch(clause)
+        if m:
+            v = (int(m.group(1)), int(m.group(2) or 0))
+            best = v if best is None or v > best else best
+    return best
 
 
 def classify_location(path: str) -> float:
@@ -212,6 +230,7 @@ class FileFacts:
     blob_present: bool
     syntax_error: bool
     added_strs: tuple
+    newer_syntax: bool = False       # fails to parse here, outside auto-exec files, under a newer Requires-Python floor
 
 
 @dataclass(frozen=True)
@@ -268,7 +287,7 @@ def _pth_facts(fd, lines, loc, added_lines, added_strs) -> FileFacts:
                      frozenset(modules), _blob_present(added_strs), had_error, added_strs)
 
 
-def _file_facts(fd) -> FileFacts:
+def _file_facts(fd, floor=None) -> FileFacts:
     added_strs = tuple(ln for h in fd.hunks for ln in h.added)
     added_nums = tuple(j + 1 for h in fd.hunks for j in range(h.new_range[0], h.new_range[1]))
     added_lines = set(added_nums)
@@ -281,8 +300,12 @@ def _file_facts(fd) -> FileFacts:
     try:
         tree = ast.parse(fd.new_text.removeprefix("\ufeff"))    # Python accepts a BOM file; line numbers unchanged
     except SyntaxError:
-        syn = not fd.path.lower().endswith(".pyx")              # Cython is not Python: its parse failure is no evidence
-        return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, syn, added_strs)
+        newer = syn = False
+        if not fd.path.lower().endswith(".pyx"):                # Cython is not Python: its parse failure is no evidence
+            newer = loc < 3.0 and floor is not None and floor > RUNTIME   # decision 8: auto-exec files keep the flag
+            syn = not newer
+        return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, syn,
+                         added_strs, newer_syntax=newer)
     except (RecursionError, MemoryError, ValueError):   # deep nesting crashes the parser itself
         return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, True, added_strs)
     too_deep = _ast_too_deep(tree)   # additive flag only -- every walk below is iterative, so it never
@@ -338,6 +361,7 @@ def roles_change(maintainer_context) -> tuple[list, list] | None:
 
 
 def build_facts(diff, maintainer_context=None) -> DiffFacts:
-    files = tuple(_file_facts(fd) for fd in diff.changed if any(h.added for h in fd.hunks))
+    floor = requires_floor(getattr(diff, "requires_python", None))
+    files = tuple(_file_facts(fd, floor) for fd in diff.changed if any(h.added for h in fd.hunks))
     return DiffFacts(files, _normalize_binaries(diff.added_binaries),
                      tuple(diff.added_dep_findings), roles_change(maintainer_context) is not None)
