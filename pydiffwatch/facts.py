@@ -28,6 +28,7 @@ _PRIM_BINDINGS = {
     "b16decode": ("decode", {"base64"}), "b32decode": ("decode", {"base64"}),
     "a85decode": ("decode", {"base64"}), "unhexlify": ("decode", {"binascii"}),
     "decompress": ("decode", {"zlib", "gzip", "bz2", "lzma"}),
+    "decode": ("decode", {"codecs"}),                      # codecs.decode(s, "rot13"); never bytes.decode
     "loads": ("decode", {"pickle", "marshal", "dill"}),     # NOT json/yaml/toml — safe deserializers
     "load": ("decode", {"pickle", "marshal", "dill"}),
     "getenv": ("credential", {"os"}), "expanduser": ("credential", {"os.path", "posixpath"}),
@@ -39,7 +40,7 @@ _B64_RUN = re.compile(r"[A-Za-z0-9+/=]{%d,}" % LONG_RUN_L)
 def classify_location(path: str) -> float:
     base = posixpath.basename(path)
     if base in {"setup.py", "setup.cfg", "pyproject.toml"} or \
-       base in {"__init__.py", "conftest.py", "sitecustomize.py"} or path.endswith(".pth"):
+       base in {"__init__.py", "sitecustomize.py"} or path.endswith(".pth"):
         return 3.0
     segs = path.split("/")
     if any(s in {"tests", "test", "docs", "doc", "examples", "example"} for s in segs):
@@ -171,13 +172,32 @@ def _importtime_call_ids(tree) -> set:
     return ids
 
 
-def _blob_present(added_strs) -> bool:
-    for line in added_strs:
-        if _B64_RUN.search(line) or len(line) > LONG_LINE:
+def _blob_present(added_strs, prose=()) -> bool:
+    """prose[i] True: added line i is docstring text, which counts only toward the long-base64-run test (spec D
+    §3.5). An unparsed or non-Python file passes no mask."""
+    for i, line in enumerate(added_strs):
+        if _B64_RUN.search(line):
+            return True
+        if i < len(prose) and prose[i]:
+            continue
+        if len(line) > LONG_LINE:
             return True
         if len(line) >= ENTROPY_WINDOW and _entropy(line[:ENTROPY_WINDOW]) > ENTROPY_X:
             return True
     return False
+
+
+def _docstring_lines(tree) -> set:
+    """Line numbers of every module, class and function docstring (the first statement of the body, an Expr of a
+    str Constant)."""
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.body:
+            first = node.body[0]
+            if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                    and isinstance(first.value.value, str)):
+                out.update(range(first.lineno, (first.end_lineno or first.lineno) + 1))
+    return out
 
 
 @dataclass(frozen=True)
@@ -250,7 +270,8 @@ def _pth_facts(fd, lines, loc, added_lines, added_strs) -> FileFacts:
 
 def _file_facts(fd) -> FileFacts:
     added_strs = tuple(ln for h in fd.hunks for ln in h.added)
-    added_lines = {j + 1 for h in fd.hunks for j in range(h.new_range[0], h.new_range[1])}
+    added_nums = tuple(j + 1 for h in fd.hunks for j in range(h.new_range[0], h.new_range[1]))
+    added_lines = set(added_nums)
     lines = (fd.hunks[0].new_range[0] + 1, fd.hunks[-1].new_range[1])
     loc = classify_location(fd.path)
     if fd.new_text is not None and fd.path.endswith(".pth"):
@@ -258,14 +279,19 @@ def _file_facts(fd) -> FileFacts:
     if fd.new_text is None or not fd.path.lower().endswith((".py", ".pyx", ".pyi")):
         return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, False, added_strs)
     try:
-        tree = ast.parse(fd.new_text)
-    except (SyntaxError, RecursionError, MemoryError, ValueError):   # deep nesting crashes the parser itself
+        tree = ast.parse(fd.new_text.removeprefix("\ufeff"))    # Python accepts a BOM file; line numbers unchanged
+    except SyntaxError:
+        syn = not fd.path.lower().endswith(".pyx")              # Cython is not Python: its parse failure is no evidence
+        return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, syn, added_strs)
+    except (RecursionError, MemoryError, ValueError):   # deep nesting crashes the parser itself
         return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, True, added_strs)
     too_deep = _ast_too_deep(tree)   # additive flag only -- every walk below is iterative, so it never
                                       # excuses us from actually scanning a deep-but-otherwise-normal file
     try:
         table = _build_import_table(tree)
         importtime_ids = _importtime_call_ids(tree)
+        doc = _docstring_lines(tree)
+        prose = tuple(n in doc for n in added_nums)
         cats, autoexec_cats, names = set(), set(), set()
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
@@ -286,7 +312,7 @@ def _file_facts(fd) -> FileFacts:
     except (RecursionError, MemoryError):   # a parse that succeeds can still blow limits on post-parse walks
         return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, True, added_strs)
     return FileFacts(fd.path, lines, loc, frozenset(cats), frozenset(autoexec_cats), frozenset(names),
-                     frozenset(table.values()), _blob_present(added_strs), too_deep, added_strs)
+                     frozenset(table.values()), _blob_present(added_strs, prose), too_deep, added_strs)
 
 
 def _normalize_binaries(added_binaries):

@@ -261,3 +261,76 @@ def test_a_call_in_a_function_header_runs_at_import_time(full):
 def test_a_call_in_a_function_body_still_does_not_run_at_import_time():
     full = "import os\n\n@staticmethod\ndef f(x=1) -> int:\n    os.system('y')\n"
     assert "process" not in build_facts(_wholefile("pkg/__init__.py", full)).files[0].autoexec_categories
+
+
+# ---- PR D: false signals removed ----
+
+def test_conftest_follows_the_path_rules():
+    from pydiffwatch.facts import classify_location
+    assert classify_location("conftest.py") == 1.0
+    assert classify_location("tests/conftest.py") == 0.2
+    for p in ("pkg/__init__.py", "setup.py", "x.pth"):
+        assert classify_location(p) == 3.0
+
+
+def test_a_pyx_that_fails_to_parse_is_not_a_syntax_error():
+    assert build_facts(_wholefile("m.pyx", "cdef int x = 1\n")).files[0].syntax_error is False
+    assert build_facts(_wholefile("M.PYX", "cdef int x = 1\n")).files[0].syntax_error is False
+    assert build_facts(_wholefile("m.py", "cdef int x = 1\n")).files[0].syntax_error is True
+
+
+def test_a_pyx_that_parses_is_scanned():
+    f = build_facts(_wholefile("m.pyx", "import subprocess\nsubprocess.run(c)\n")).files[0]
+    assert "process" in f.bound_categories
+
+
+def test_a_bom_file_parses_and_is_scanned():
+    f = build_facts(_wholefile("m.py", "\ufeffimport os\nos.system(c)\n")).files[0]
+    assert f.syntax_error is False and "process" in f.bound_categories
+    assert build_facts(_wholefile("m.py", "\ufeffdef (:\n")).files[0].syntax_error is True
+
+
+def test_codecs_decode_binds_as_decode_and_bytes_decode_does_not():
+    assert "decode" in build_facts(_wholefile("m.py", 'import codecs\ncodecs.decode(s, "rot13")\n')).files[0].bound_categories
+    assert "decode" not in build_facts(_wholefile("m.py", "s.decode()\n")).files[0].bound_categories
+
+
+_PROSE = "- :mod:`open61850.goose`: GOOSE PDUs and frames (IEC 61850-8-1)."   # 64 chars, entropy 4.78
+
+
+def test_docstring_prose_is_not_a_blob():
+    assert build_facts(_wholefile("m.py", f'"""\n{_PROSE}\n"""\n')).files[0].blob_present is False
+    assert build_facts(_wholefile("m.py", f'x = """\n{_PROSE}\n"""\n')).files[0].blob_present is True
+    cls = f'class C:\n    """\n    {_PROSE}\n    """\n'
+    fn = f'def f():\n    """\n    {_PROSE}\n    """\n'
+    assert build_facts(_wholefile("m.py", cls)).files[0].blob_present is False
+    assert build_facts(_wholefile("m.py", fn)).files[0].blob_present is False
+
+
+def test_a_long_base64_run_in_a_docstring_is_still_a_blob():
+    assert build_facts(_wholefile("m.py", '"""\n' + "QABZ" * 40 + '\n"""\n')).files[0].blob_present is True
+
+
+def test_a_long_docstring_line_is_not_a_blob_but_a_long_code_line_is():
+    assert build_facts(_wholefile("m.py", '"""\n' + "word " * 101 + '\n"""\n')).files[0].blob_present is False
+    assert build_facts(_wholefile("m.py", "x = 1  # " + "word " * 101 + "\n")).files[0].blob_present is True
+
+
+def test_an_encoded_url_code_line_is_still_a_blob():
+    # spec §6: dately's hidden-URL line is code, not a docstring (64 chars, entropy 5.02)
+    line = 'url_unformatted = "aHR0cHM6Ly9leGFtcGxlLmludmFsaWQvZGF0YS5qc29u"'
+    assert build_facts(_codediff("pkg/_connect.py", [line])).files[0].blob_present is True
+
+
+def test_the_docstring_mask_follows_line_numbers_across_hunks():
+    # Review Focus 4: the file's added lines are in two hunks; the docstring is in the second one.
+    full = f'x = 1\ny = 2\ndef f():\n    """\n    {_PROSE}\n    """\n'
+    lines = full.splitlines()
+    fd = FileDiff("m.py", "modified", [Hunk((0, 0), (0, 1), lines[0:1], []),
+                                       Hunk((1, 1), (2, 6), lines[2:6], [])], full)
+    assert build_facts(Diff("p", "1.1", False, [fd], [])).files[0].blob_present is False
+    code = full.replace('    """\n', "    s = '''\n", 1).replace('    """\n', "    '''\n", 1)
+    lines = code.splitlines()
+    fd = FileDiff("m.py", "modified", [Hunk((0, 0), (0, 1), lines[0:1], []),
+                                       Hunk((1, 1), (2, 6), lines[2:6], [])], code)
+    assert build_facts(Diff("p", "1.1", False, [fd], [])).files[0].blob_present is True
