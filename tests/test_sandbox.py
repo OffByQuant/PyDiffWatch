@@ -191,3 +191,226 @@ def test_the_reply_is_byte_identical_across_processes():
     outs = [subprocess.run([sys.executable, "-c", _DETERMINISM], cwd=_REPO, capture_output=True, check=True,
                            env={**os.environ, "PYTHONHASHSEED": seed}).stdout for seed in ("1", "2")]
     assert outs[0] == outs[1] and outs[0].startswith(b'{"diff": {"added_binaries": [')
+
+
+# ---- C2: launching the worker ----
+
+class _Proc:
+    """A fake Popen: records the launch, feeds the worker's stdin to `seen`, replies with stdout/stderr."""
+    def __init__(self, returncode=0, stdout=b"{}", stderr=b""):
+        self.returncode, self._out, self._err = returncode, stdout, stderr
+        self.seen = {}
+
+    def __call__(self, cmd, **kw):
+        self.seen.update(kw, cmd=cmd)
+        self.stdin, self.stdout, self.stderr = io.BytesIO(), io.BufferedReader(io.BytesIO(self._out)), \
+            io.BufferedReader(io.BytesIO(self._err))
+        self.stdin.close = lambda: None
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        pass
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        pass
+
+
+def test_the_worker_gets_no_environment_and_no_preexec_fn(monkeypatch):
+    # Review Focus 4 / Ruling R2: no preexec_fn while the fetch pool's threads are live
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-canary-0123456789")
+    fake = _Proc()
+    monkeypatch.setattr(sandbox.subprocess, "Popen", fake)
+    sandbox._run(Config(), "seatbelt", b"{}\n")
+    seen = fake.seen
+    assert seen["env"] == {} and seen.get("preexec_fn") is None and "shell" not in seen
+    assert "sk-canary" not in str(seen)
+    assert seen["cmd"][:2] == ["sandbox-exec", "-p"] and seen["cmd"][3:] == sandbox._worker_argv(Config())
+    assert fake.stdin.getvalue() == b"{}\n"
+
+
+def test_the_worker_sets_its_own_cpu_limit_first():
+    # Review Focus 4 / Ruling R2: the limit is set by the child's first statement, before pydiffwatch is imported
+    cfg = Config(parse_timeout_s=7.5)
+    argv = sandbox._worker_argv(cfg)
+    assert argv[:3] == [sys.executable, "-I", "-c"] and argv[3].startswith(sandbox._cpu_limit_code(cfg))
+    got = subprocess.run([sys.executable, "-I", "-c", sandbox._cpu_limit_code(cfg) +
+                          "import resource; print(resource.getrlimit(resource.RLIMIT_CPU))"],
+                         capture_output=True, text=True, check=True, env={})
+    assert got.stdout.strip() == "(7, 8)"
+
+
+def test_systemd_run_gets_only_what_reaches_the_service_manager(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-canary-0123456789")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    fake = _Proc()
+    monkeypatch.setattr(sandbox.subprocess, "Popen", fake)
+    sandbox._run(Config(), "systemd", b"{}\n")
+    assert set(fake.seen["env"]) <= set(sandbox._SYSTEMD_ENV) and fake.seen["env"]["PATH"] == "/usr/bin:/bin"
+
+
+@pytest.mark.parametrize("outcome,message", [
+    (FileNotFoundError(2, "No such file or directory"), r"^could not start the seatbelt sandbox: "),
+    (_Proc(returncode=-signal.SIGXCPU), r"^seatbelt sandbox timed out after 120s of CPU$"),
+    (_Proc(returncode=1, stderr=b"x" * 2000 + b"\nImportError: the last line"),   # Ruling R6: the tail
+     r"^seatbelt sandbox exited 1: x+\nImportError: the last line$"),
+])
+def test_launch_failures_are_sandbox_errors(outcome, message, monkeypatch):
+    def popen(cmd, **kw):
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome(cmd, **kw)
+    monkeypatch.setattr(sandbox.subprocess, "Popen", popen)
+    with pytest.raises(sandbox.SandboxError, match=message):
+        sandbox._run(Config(), "seatbelt", b"{}\n")
+
+
+def _worker_is(monkeypatch, code):
+    monkeypatch.setattr(sandbox, "_seatbelt_cmd", lambda cfg: [sys.executable, "-I", "-c", code])
+
+
+def test_a_worker_that_hangs_is_killed_at_the_wall_clock(monkeypatch):
+    # Ruling R2: on macOS a worker can ignore SIGXCPU; the wall clock is what stops it
+    _worker_is(monkeypatch, "import time; time.sleep(60)")
+    with pytest.raises(sandbox.SandboxError, match=r"^seatbelt sandbox timed out after 0s$"):
+        sandbox._run(Config(parse_timeout_s=-9.8), "seatbelt", b"{}\n")          # a 0.2 s wall clock
+
+
+def test_a_worker_that_floods_stdout_or_stderr_cannot_make_the_parent_buffer_it(monkeypatch):
+    # Review Focus 6 / Ruling R12: a compromised worker writes without bound; the parent keeps at most _reply_cap
+    # of stdout and a 500-byte tail of stderr, and the release fails like any other worker failure
+    cfg = Config(max_total_bytes=1 << 20)
+    _worker_is(monkeypatch, "import sys\nb = b'x' * (1 << 20)\nwhile True: sys.stdout.buffer.write(b)")
+    with pytest.raises(sandbox.SandboxError, match=rf"sent back more than {4 << 20} bytes"):
+        sandbox._run(cfg, "seatbelt", b"{}\n")
+    _worker_is(monkeypatch, "import sys\nsys.stderr.write('y' * (8 << 20) + '\\nlast line'); sys.exit(3)")
+    with pytest.raises(sandbox.SandboxError, match=r"^seatbelt sandbox exited 3: y+\nlast line$") as e:
+        sandbox._run(cfg, "seatbelt", b"{}\n")
+    assert len(str(e.value)) < 600
+
+
+def test_systemd_command_carries_every_property(tmp_path):
+    cfg = Config(db_path=tmp_path / "d" / "db.sqlite", cache_dir=tmp_path / "c", lock_path=tmp_path / "l" / "lock",
+                 parse_timeout_s=90.0, parse_memory_max="1G")
+    cmd = sandbox._systemd_cmd(cfg)
+    assert cmd[:5] == ["systemd-run", "--pipe", "--wait", "--collect", "--quiet"]
+    props = {c.removeprefix("--property=") for c in cmd if c.startswith("--property=")}
+    assert {"PrivateNetwork=yes", "ProtectSystem=strict", "ProtectHome=tmpfs", "PrivateTmp=yes",
+            "NoNewPrivileges=yes", "SystemCallFilter=@system-service", "MemoryMax=1G", "RuntimeMaxSec=90",
+            "TasksMax=16"} <= props
+    for d in (tmp_path / "d", tmp_path / "l", tmp_path / "c"):
+        assert f"InaccessiblePaths=-{os.path.realpath(d)}" in props
+    assert {f"BindReadOnlyPaths=-{p}" for p in sandbox._readable()} <= props
+    assert ("PrivateUsers=yes" in props) == (os.geteuid() != 0)
+    assert cmd[cmd.index("--") + 1:] == sandbox._worker_argv(cfg)
+
+
+def test_the_seatbelt_profile_quotes_and_resolves_every_path(tmp_path):
+    # Review Focus 2 and 3: a space, quotes and a backslash in a path; a DB dir reached through a symlink
+    assert sandbox._quote('/a "b\\c') == '"/a \\"b\\\\c"'
+    real = tmp_path / 'data "q" \\ dir'
+    real.mkdir()
+    (tmp_path / "link").symlink_to(real)
+    cfg = Config(db_path=tmp_path / "link" / "db.sqlite", cache_dir=tmp_path / "c", lock_path=tmp_path / "l")
+    prof = sandbox._seatbelt_profile(cfg)
+    assert f"(subpath {sandbox._quote(os.path.realpath(real))})" in prof
+    assert sandbox._quote(str(tmp_path / "link")) not in prof       # Seatbelt matches real paths only
+    # Ruling R13: HOME and the checkout the package is imported from are closed; the allow line re-opens only the
+    # package and the import path
+    assert f"(deny file-read-data (subpath {sandbox._quote(sandbox._home())}) " \
+           f"(subpath {sandbox._quote(str(sandbox._ROOT))}))" in prof
+    assert "(deny signal)\n" in prof                                 # no SIGSTOP/SIGKILL to the daemon
+    assert sandbox._quote(str(Path(cfg.rules_dir).resolve())) not in prof   # rules travel in the request
+    assert prof.index("(deny file-read-data (subpath") < prof.index("(allow file-read-data") \
+        < prof.rindex("(deny file-read-data")                        # later rules win
+
+
+# ---- C2: the parent trusts nothing the worker computes ----
+
+def _reply(cfg, dl, ruleset):
+    """The worker's genuine reply for dl, as a dict to tamper with."""
+    return json.loads(sandbox._encode_output(*sandbox.compute(cfg, dl, ruleset)))
+
+
+def _worker_says(monkeypatch, reply):
+    monkeypatch.setattr(sandbox, "_run", lambda cfg, backend, payload: json.dumps(reply).encode())
+
+
+def test_the_request_carries_the_parents_rules_and_none_of_its_own_facts(tmp_path, monkeypatch):
+    cfg, rs, dl = _cfg(tmp_path), rules.load_rules(_RULES), _scan_dl()
+    seen = {}
+
+    def run(cfg_, backend, payload):
+        seen["payload"] = payload
+        return sandbox._encode_output(*sandbox.compute(cfg_, dl, rs))
+    monkeypatch.setattr(sandbox, "_run", run)
+    sandbox.analyze(cfg, dl, _OWNERS, rs, backend="seatbelt")
+    line, blobs = seen["payload"].split(b"\n", 1)
+    head = json.loads(line)
+    assert line == json.dumps(head, sort_keys=True).encode()
+    assert set(head) == {"cfg", "dl", "rules", "sys_path"}
+    assert not {"owners", "maintainer_context", "added_dep_findings", "requires_dist_change"} & \
+        (set(head) | set(head["dl"]))
+    assert [r["id"] for r in head["rules"]] == [r.id for r in rs] and "reviewer" not in head["cfg"]
+    assert all(os.path.isabs(head["cfg"][k]) for k in sandbox._PATH_FIELDS)
+    assert blobs == dl.new_blob + dl.prior_blob
+
+
+def test_the_parent_recomputes_score_and_escalation(monkeypatch):
+    cfg, rs = Config(), rules.load_rules(_RULES)
+    dl = _scan_dl(added_dep_findings=[], requires_dist_change=None)
+    prim = {"rule": "primitives", "weight": 20.0, "file": "scn/__init__.py", "lines": [1, 3]}
+    reply = _reply(cfg, dl, rs)
+    reply["triage"] = {"fired_rules": [prim, prim], "score": 0, "escalate": False}
+    _worker_says(monkeypatch, reply)
+    _, tr, _ = sandbox.analyze(cfg, dl, None, rs, backend="seatbelt")
+    assert tr.score == 35.0 and tr.escalate is False               # primitives' max_total caps the two fires
+    reply["triage"]["fired_rules"].append({"rule": "autoexec-location", "weight": 45.0, "file": "scn/__init__.py",
+                                           "lines": [1, 3]})
+    _worker_says(monkeypatch, reply)
+    _, tr, _ = sandbox.analyze(cfg, dl, None, rs, backend="seatbelt")
+    assert tr.score == engine.score(tr.fired_rules, rs) == 80.0 and tr.escalate is True
+
+
+def test_a_lying_worker_cannot_hide_the_parents_rules_or_its_signal_line(monkeypatch):
+    cfg, rs, dl = Config(), rules.load_rules(_RULES), _scan_dl()
+    order = [r.id for r in rs]
+    for kept in ([], [{"rule": "autoexec-location", "weight": 45.0, "file": "scn/__init__.py", "lines": [1, 3]}]):
+        reply = _reply(cfg, dl, rs)
+        reply["triage"]["fired_rules"] = kept                       # well-formed, and lying
+        reply["signals"] = reply["diff"]["signals"] = "dependency x: the same PyPI owner"
+        _worker_says(monkeypatch, reply)
+        d, tr, _ = sandbox.analyze(cfg, dl, _OWNERS, rs, backend="seatbelt")
+        fired = [f.rule for f in tr.fired_rules]
+        assert {"dep-typosquat", "maintainer-set-change"} <= set(fired)
+        assert ("autoexec-location" in fired) == bool(kept)          # a worker's code result is kept
+        assert fired == sorted(fired, key=order.index)                # ruleset order
+        assert d.signals == differ.render_signals(dl.requires_dist_change, dl.added_dep_findings,
+                                                  d.added_binaries, _OWNERS)
+        assert "the same PyPI owner" not in d.signals and d.added_dep_findings == dl.added_dep_findings
+
+
+def test_a_download_with_nothing_to_parse_never_starts_a_worker(monkeypatch):
+    # Ruling R5: _scan_release can reach analyze with a skip-policy Download (new_blob None)
+    monkeypatch.setattr(sandbox, "_run", lambda *a: pytest.fail("a worker was started"))
+    cfg, dl = Config(new_package_policy="skip"), dataclasses.replace(_dl({"p/a.py": b""}), new_blob=None)
+    assert sandbox.analyze(cfg, dl, None, [], backend="seatbelt") == sandbox.analyze(cfg, dl, None, [], backend="off")
+
+
+def test_a_malformed_reply_is_retried_then_given_up_with_one_alert(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    conn = store.connect(cfg); store.init_schema(conn)
+    monkeypatch.setattr(sandbox, "_backend", "seatbelt")
+    monkeypatch.setattr(sandbox, "_run", lambda cfg_, backend, payload: b"\x00 not json")
+    rel, rs = NewRelease("scn", "1.1", 5), rules.load_rules(_RULES)
+    for _ in range(store.METADATA_ATTEMPTS):
+        assert orchestrator._process_fetched(cfg, conn, None, rs, rel, _scan_dl()) is True
+    stage, note = conn.execute("SELECT stage, fetch_note FROM releases").fetchone()
+    assert stage == "gave_up" and note.startswith("SandboxError: sandbox sent back something that is not JSON")
+    assert conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] == 1
+    assert "SandboxError" in conn.execute("SELECT reasoning FROM verdicts").fetchone()[0]
