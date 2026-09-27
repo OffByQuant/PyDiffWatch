@@ -79,3 +79,15 @@ def scan_stub(monkeypatch):
 
     monkeypatch.setattr(fetcher, "extract_download", extract)
     return _Stub()
+
+
+@pytest.fixture(autouse=True)
+def _restore_pydiffwatch_logger():
+    """cli.main() configures the pydiffwatch logger (INFO, a stderr handler); put it back after every test, so no
+    test depends on whether an earlier one ran main()."""
+    import logging
+    log = logging.getLogger("pydiffwatch")
+    level, handlers = log.level, list(log.handlers)
+    yield
+    log.setLevel(level)
+    log.handlers[:] = handlers
