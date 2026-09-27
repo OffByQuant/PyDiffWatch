@@ -384,3 +384,29 @@ def test_a_huge_version_number_is_no_floor():
 def test_a_pyx_under_a_newer_floor_is_neither(monkeypatch):
     # Review Focus 5: Cython is not Python, so no syntax reading and no skew reading.
     assert _skew("pkg/m.pyx", ">=3.14", (3, 13), monkeypatch) == (False, False)
+
+
+# ---- PR D: encoded_url ----
+_URL_B64 = "aHR0cHM6Ly9leGFtcGxlLmludmFsaWQvZGF0YS5qc29u"             # https://example.invalid/data.json
+_URL_B64_URLSAFE = "aHR0cHM6Ly9leGFtcGxlLmludmFsaWQvP2E9fn5-Pj4-"      # https://example.invalid/?a=~~~>>>
+
+
+def _enc(line, path="pkg/_connect.py"):
+    return build_facts(_codediff(path, [line])).files[0].encoded_url
+
+
+def test_a_base64_url_literal_is_an_encoded_url():
+    assert _enc(f'url_unformatted = "{_URL_B64}"') is True
+    assert _enc(f"u = '{_URL_B64_URLSAFE}'") is True
+
+
+def test_what_is_not_an_encoded_url():
+    assert _enc('u = "aHR0cGZvbw=="') is False                                # decodes to "httpfoo"
+    assert _enc(f"u = {_URL_B64}") is False                                   # not quoted
+    assert _enc('u = "68747470733a2f2f6578616d706c652e696e76616c6964"') is False   # hex
+    assert _enc('u = "aHR0cHM6Ly9leG"') is False                              # 14 characters: under the minimum
+    assert _enc('u = "aHR0cHM6Ly9leGF"') is True                              # 15 characters: "https://exa"
+
+
+def test_encoded_url_is_set_on_a_file_that_does_not_parse():
+    assert _enc(f'u = "{_URL_B64}" def (:') is True

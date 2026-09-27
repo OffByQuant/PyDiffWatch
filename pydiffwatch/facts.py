@@ -6,6 +6,8 @@ The import-binding machinery (_build_import_table / _resolve_call / _PRIM_BINDIN
 detection precise: a call counts as a dangerous primitive only when its receiver resolves via the
 file's import table to an origin in the name's allowlist (so re.compile != exec, json.loads != decode)."""
 import ast
+import base64
+import binascii
 import math
 import posixpath
 import re
@@ -53,6 +55,27 @@ def requires_floor(spec) -> tuple | None:
             v = (int(m.group(1)), int(m.group(2) or 0))
             best = v if best is None or v > best else best
     return best
+
+
+# A quoted token that base64-decodes to an http(s) URL: base64 of "http" at offset 0 always starts "aHR0c".
+_ENC_URL = re.compile(r"""(["'])(aHR0c[A-Za-z0-9+/_-]{10,4090}={0,2})\1""")
+
+
+def _encoded_url(added_strs) -> bool:
+    """An added quoted literal is a base64-encoded http(s) URL (spec D §3.8). Decoded in memory, at most 4 KiB per
+    token, never resolved or fetched."""
+    for line in added_strs:
+        for m in _ENC_URL.finditer(line):
+            tok = m.group(2)
+            tok += "=" * (-len(tok) % 4)
+            for dec in (base64.b64decode, base64.urlsafe_b64decode):
+                try:
+                    raw = dec(tok)
+                except (binascii.Error, ValueError):
+                    continue
+                if raw[:8].lower().startswith((b"http://", b"https://")):
+                    return True
+    return False
 
 
 def classify_location(path: str) -> float:
@@ -231,6 +254,7 @@ class FileFacts:
     syntax_error: bool
     added_strs: tuple
     newer_syntax: bool = False       # fails to parse here, outside auto-exec files, under a newer Requires-Python floor
+    encoded_url: bool = False        # an added quoted literal base64-decodes to an http(s) URL (any text file)
 
 
 @dataclass(frozen=True)
@@ -284,11 +308,13 @@ def _pth_facts(fd, lines, loc, added_lines, added_strs) -> FileFacts:
         except (RecursionError, MemoryError):
             had_error = True
     return FileFacts(fd.path, lines, loc, frozenset(cats), frozenset(autoexec_cats), frozenset(names),
-                     frozenset(modules), _blob_present(added_strs), had_error, added_strs)
+                     frozenset(modules), _blob_present(added_strs), had_error, added_strs,
+                     encoded_url=_encoded_url(added_strs))
 
 
 def _file_facts(fd, floor=None) -> FileFacts:
     added_strs = tuple(ln for h in fd.hunks for ln in h.added)
+    enc = _encoded_url(added_strs)
     added_nums = tuple(j + 1 for h in fd.hunks for j in range(h.new_range[0], h.new_range[1]))
     added_lines = set(added_nums)
     lines = (fd.hunks[0].new_range[0] + 1, fd.hunks[-1].new_range[1])
@@ -296,7 +322,8 @@ def _file_facts(fd, floor=None) -> FileFacts:
     if fd.new_text is not None and fd.path.endswith(".pth"):
         return _pth_facts(fd, lines, loc, added_lines, added_strs)
     if fd.new_text is None or not fd.path.lower().endswith((".py", ".pyx", ".pyi")):
-        return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, False, added_strs)
+        return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, False, added_strs,
+                         encoded_url=enc)
     try:
         tree = ast.parse(fd.new_text.removeprefix("\ufeff"))    # Python accepts a BOM file; line numbers unchanged
     except SyntaxError:
@@ -305,9 +332,10 @@ def _file_facts(fd, floor=None) -> FileFacts:
             newer = loc < 3.0 and floor is not None and floor > RUNTIME   # decision 8: auto-exec files keep the flag
             syn = not newer
         return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, syn,
-                         added_strs, newer_syntax=newer)
+                         added_strs, newer_syntax=newer, encoded_url=enc)
     except (RecursionError, MemoryError, ValueError):   # deep nesting crashes the parser itself
-        return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, True, added_strs)
+        return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, True, added_strs,
+                         encoded_url=enc)
     too_deep = _ast_too_deep(tree)   # additive flag only -- every walk below is iterative, so it never
                                       # excuses us from actually scanning a deep-but-otherwise-normal file
     try:
@@ -333,9 +361,11 @@ def _file_facts(fd, floor=None) -> FileFacts:
                 f = node.func
                 names.add(f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", ""))
     except (RecursionError, MemoryError):   # a parse that succeeds can still blow limits on post-parse walks
-        return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, True, added_strs)
+        return FileFacts(fd.path, lines, loc, frozenset(), frozenset(), frozenset(), frozenset(), False, True, added_strs,
+                         encoded_url=enc)
     return FileFacts(fd.path, lines, loc, frozenset(cats), frozenset(autoexec_cats), frozenset(names),
-                     frozenset(table.values()), _blob_present(added_strs, prose), too_deep, added_strs)
+                     frozenset(table.values()), _blob_present(added_strs, prose), too_deep, added_strs,
+                     encoded_url=enc)
 
 
 def _normalize_binaries(added_binaries):
