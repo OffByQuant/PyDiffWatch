@@ -33,3 +33,49 @@ def tmp_cfg(tmp_path):
     # the reviewer path has its own unit tests (test_reviewer/test_orchestrator_reviewer) and the live eval.
     return Config(db_path=tmp_path / "db.sqlite", cache_dir=tmp_path / "cache",
                   lock_path=tmp_path / "lock", reviewer_enabled=False)
+
+
+@pytest.fixture
+def scan_stub(monkeypatch):
+    """C1 split fetch_artifacts into fetcher.download + fetcher.extract_download. Tests that hand the pipeline a
+    ready ArtifactSet (or a refusal) register it here instead of building real archives."""
+    import dataclasses, inspect
+    from pydiffwatch import fetcher
+    from pydiffwatch.models import ArtifactSet, Download
+    arts = {}
+
+    def extract(cfg, dl):
+        got = arts[(dl.package, dl.version)]
+        if isinstance(got, BaseException):
+            raise got
+        if dl.prior_version is None and got.prior_version is not None:   # the caller dropped the prior
+            got = dataclasses.replace(got, prior_files={}, prior_version=None, prior_error=None)
+        return got
+
+    class _Stub:
+        def dl(self, got, package=None, version=None):
+            assert isinstance(got, (ArtifactSet, BaseException)), f"scan_stub.dl takes an ArtifactSet or an exception, not {got!r}"
+            if isinstance(got, ArtifactSet):
+                package, version = got.package, got.version
+                arts[(package, version)] = got
+                return Download(got.package, got.version, got.prior_version, got.is_new_package, b"", None, None,
+                                got.maintainer_metadata, list(got.added_dep_findings), got.requires_dist_change,
+                                got.description)
+            arts[(package, version)] = got
+            # Registered exceptions are raised by extraction; refusals are mapped before anything is recorded.
+            return Download(package, version, None, False, b"", None, None, None, [], None, None)
+
+        def fetch(self, fn):
+            takes_attempt = any(p.name == "attempt" or p.kind is p.VAR_KEYWORD
+                                for p in inspect.signature(fn).parameters.values())
+
+            def download(cfg, rel, attempt=1):
+                try:
+                    got = fn(cfg, rel, attempt=attempt) if takes_attempt else fn(cfg, rel)
+                except fetcher.RefusedToExtract as e:
+                    return self.dl(e, rel.package, rel.version)
+                return got if got is None or isinstance(got, fetcher.NoSdist) else self.dl(got)
+            monkeypatch.setattr(fetcher, "download", download)
+
+    monkeypatch.setattr(fetcher, "extract_download", extract)
+    return _Stub()

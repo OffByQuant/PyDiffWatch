@@ -13,9 +13,9 @@ import json
 import urllib.error
 from pathlib import Path
 
-from pydiffwatch import fetcher, ingest, orchestrator, reviewer, store
+from pydiffwatch import ingest, orchestrator, reviewer, store
 from pydiffwatch.config import Config
-from pydiffwatch.models import Diff, FileDiff, FiredRule, Hunk, NewRelease, TriageResult
+from pydiffwatch.models import ArtifactSet, Diff, FileDiff, FiredRule, Hunk, NewRelease, TriageResult
 
 _OK = ('{"classification":"benign","confidence":0.9,"urgent":false,"recommended_action":"monitor",'
        '"attack_type":"none","cited_hunk":"","reasoning":"looked at it"}')
@@ -130,16 +130,15 @@ def test_auto_drain_leaves_too_large_for_manual_review_with_bigger_cap(tmp_path)
     assert len(be.calls) == 1 and _pending(conn) == {}
 
 
-def test_unreachable_model_does_not_pin_the_cursor(tmp_path, monkeypatch):
+def test_unreachable_model_does_not_pin_the_cursor(tmp_path, monkeypatch, scan_stub):
     cfg = _cfg(tmp_path)
     conn = store.connect(cfg); store.init_schema(conn); store.set_last_serial(conn, 5000); conn.close()
     rel = NewRelease("pkg", "1.0.0", 5050)
     monkeypatch.setattr(ingest, "changes_since", lambda *a, **k: [rel])
-    from types import SimpleNamespace
-    art = SimpleNamespace(prior_version="0.9.0", is_new_package=False, maintainer_metadata=None, prior_error=None)
-    monkeypatch.setattr(fetcher, "fetch_artifacts", lambda cfg, rel, **k: art)
-    monkeypatch.setattr(orchestrator.differ, "build_diff", lambda art, *_: _diff())
-    monkeypatch.setattr(orchestrator.engine, "triage", lambda *a, **k: _T)
+    art = ArtifactSet("pkg", "1.0.0", "0.9.0", "sdist", {}, {}, {})
+    scan_stub.fetch(lambda cfg, rel, **k: art)
+    monkeypatch.setattr(orchestrator.sandbox, "analyze",
+                        lambda cfg, dl, owners, ruleset, backend=None: (_diff(), _T, None))
     monkeypatch.setattr(orchestrator, "_probe_reviewer", lambda cfg: (False, "127.0.0.1:9"))
     orchestrator.run_once(cfg, seed_if_fresh=False)
     conn = store.connect(cfg)

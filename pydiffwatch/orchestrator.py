@@ -1,6 +1,6 @@
 import dataclasses, datetime, fcntl, http.client, json, logging, math, os, sqlite3, time, urllib.error
 from concurrent.futures import ThreadPoolExecutor
-from . import ingest, fetcher, differ, engine, rules, notifier, store, reviewer, egress, dashboard, quarantine
+from . import ingest, fetcher, rules, notifier, store, reviewer, egress, dashboard, quarantine, sandbox
 from . import guard as guard_mod
 from .config import Config
 from .models import Verdict, NewRelease, FiredRule
@@ -364,6 +364,25 @@ def _pypi_unreachable(e) -> bool:
     return isinstance(c, (urllib.error.URLError, ConnectionError, http.client.HTTPException))
 
 
+def _scan_release(cfg, rel, ruleset, *, attempt=1, conn=None, as_first_release=False):
+    """Download and scan one release again, off the tick: the drain's rebuild, `pending`, `capture-evidence`.
+    `conn`: triage sees the owner change, as the tick's scan does. `as_first_release`: diffed against nothing, as
+    a release first scanned with no predecessor was (the whole tree, R1). Returns (Diff, TriageResult), or None
+    when PyPI has no sdist for it."""
+    dl = fetcher.download(cfg, rel, attempt=attempt)
+    if dl is None or isinstance(dl, fetcher.NoSdist):
+        return None
+    if as_first_release:
+        dl = dataclasses.replace(dl, prior_blob=None, prior_version=None, prior_error=None)
+    owners = None
+    if conn is not None:
+        owners = {"current": dl.maintainer_metadata,
+                  "prior": store.get_release_metadata(conn, rel.package, dl.prior_version) if dl.prior_version
+                  else None}
+    d, tr, _ = sandbox.analyze(cfg, dl, owners, ruleset)
+    return d, tr
+
+
 def _rebuild_review_input(cfg, conn, rvw, row, ruleset, cap):
     """Download and scan a queued release again, for the review input its reviewer_disabled park did not store
     (spec §3.3), with the current rules. Returns (triage, text); "cleared" (the current rules do not escalate it:
@@ -371,7 +390,7 @@ def _rebuild_review_input(cfg, conn, rvw, row, ruleset, cap):
     attempt, or an input over `cap`, re-parked as too_large); "timeout" (a definitive failure caused by a
     TimeoutError: counted like "failed", and the drain rebuilds nothing more, as for a stalling PyPI); or
     "unreachable" (PyPI is down: re-parked under its reason, no attempt spent). Attempt k downloads with k times
-    the deadlines (fetcher.fetch_artifacts), as the scan's retry sweep does, so a later attempt can hold a tick
+    the deadlines (fetcher.download), as the scan's retry sweep does, so a later attempt can hold a tick
     longer."""
     rid, pkg, ver = row["release_id"], row["package"], row["version"]
 
@@ -380,14 +399,11 @@ def _rebuild_review_input(cfg, conn, rvw, row, ruleset, cap):
                        f"{_REBUILD_FAILED} to review ({why})")
         return "failed"
     try:
-        art = fetcher.fetch_artifacts(cfg, NewRelease(pkg, ver, row["serial"]),
-                                      attempt=row["review_attempts"] + 1)
-        if art is None or isinstance(art, fetcher.NoSdist):
+        got = _scan_release(cfg, NewRelease(pkg, ver, row["serial"]), ruleset,
+                            attempt=row["review_attempts"] + 1, conn=conn)
+        if got is None:
             return failed("no sdist on PyPI")
-        prior_meta = store.get_release_metadata(conn, pkg, art.prior_version) if art.prior_version else None
-        owners = {"current": art.maintainer_metadata, "prior": prior_meta}
-        d = differ.build_diff(art, owners)
-        tr = engine.triage(d, cfg, ruleset, owners)
+        d, tr = got
     except Exception as e:
         if _pypi_unreachable(e):
             store.set_pending_reason(conn, rid, row["pending_reason"], f"could not reach PyPI to download it "
@@ -414,14 +430,14 @@ def _rebuild_review_input(cfg, conn, rvw, row, ruleset, cap):
 
 
 def _fetch_one(cfg, rel, attempt=1):
-    """Worker half of the pipeline — runs OFF the main thread. Does NO sqlite and NO notifier work
-    (sqlite is single-threaded), only network + in-memory extraction (incl. PyPI-baseline resolution).
-    Attempt k (a retry of a failed release) gets k times the package-JSON and sdist deadlines (see
-    fetcher.fetch_artifacts), as review retries get timeout x attempt; attempt 1 keeps them as configured.
-    Returns the ArtifactSet, a NoSdist, or the Exception it caught, for the main thread to map."""
+    """Worker half of the pipeline — runs OFF the main thread. Does NO sqlite, NO notifier work and NO archive
+    parsing (the main thread's sandbox.analyze does that): only the network — the package JSON, both sdists as
+    bytes, the dependency screening. Attempt k (a retry of a failed release) gets k times the package-JSON and
+    sdist deadlines (see fetcher.download), as review retries get timeout x attempt; attempt 1 keeps them as
+    configured. Returns the Download, a NoSdist, or the Exception it caught, for the main thread to map."""
     try:
-        return fetcher.fetch_artifacts(cfg, rel, attempt=attempt)
-    except Exception as e:        # incl. RefusedToFetch/RefusedToExtract — mapped on the main thread
+        return fetcher.download(cfg, rel, attempt=attempt)
+    except Exception as e:        # incl. RefusedToFetch — mapped on the main thread
         return e
 
 
@@ -463,9 +479,23 @@ def _alert_unscanned(cfg, conn, rid, package, version, note, *, stage, score=0.0
                          dedupe_suffix=f"unscanned:{stage}")
 
 
+def _record_download(conn, rid, dl):
+    """What the download alone establishes, written before any scan result: the PyPI baseline and this
+    release's owners (the next release's maintainer baseline)."""
+    store.set_baseline(conn, rid, dl.prior_version, dl.is_new_package)
+    if dl.maintainer_metadata is not None:
+        store.update_release_metadata(conn, rid, json.dumps(dl.maintainer_metadata))
+
+
+def _refused_to_extract(cfg, conn, rid, rel, e):
+    store.update_stage(conn, rid, "refused_to_extract")
+    _alert_unscanned(cfg, conn, rid, rel.package, rel.version, _refusal_note("unpack its sdist", str(e)),
+                     stage="refused_to_extract")
+
+
 def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=None) -> bool:
-    """Main-thread half: record the release, map a completed fetch `result` (ArtifactSet | NoSdist |
-    Exception; None is read as NoSdist) to a stage, diff/triage/review, emit alerts. ALL sqlite + notifier
+    """Main-thread half: record the release, map a completed fetch `result` (Download | NoSdist | Exception;
+    None is read as NoSdist) to a stage, scan it (sandbox.analyze), review, emit alerts. ALL sqlite + notifier
     work happens here.
     Returns True iff the release reached a terminal stage; a failure is queued for retry (_retry_later),
     which is terminal for the cursor."""
@@ -485,11 +515,6 @@ def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=
             note = _refusal_note("download it", str(result))
         _alert_unscanned(cfg, conn, rid, rel.package, rel.version, note, stage="refused_to_fetch")
         return True   # deterministic refusal (over-size, quarantine) — terminal
-    if isinstance(result, fetcher.RefusedToExtract):
-        store.update_stage(conn, rid, "refused_to_extract")
-        _alert_unscanned(cfg, conn, rid, rel.package, rel.version, _refusal_note("unpack its sdist", str(result)),
-                         stage="refused_to_extract")
-        return True   # terminal: permanent suspicious decision recorded
     if isinstance(result, fetcher.MetadataGone):
         # PyPI pulls malware fast; a release gone before we read it is worth knowing about, and never a cursor
         # pin. Not queued: with the files gone, a person can't review it either.
@@ -526,20 +551,34 @@ def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=
                              f"this one ships only wheels, which pydiffwatch does not scan. Not scanned. Needs "
                              f"manual review.", stage="no_sdist")
         return True
-    store.set_baseline(conn, rid, result.prior_version, result.is_new_package)
-    store.set_fetch_note(conn, rid, result.prior_error)   # None clears an earlier failure's note (D2)
-    if result.maintainer_metadata is not None:
-        store.update_release_metadata(conn, rid, json.dumps(result.maintainer_metadata))
-    if result.is_new_package and cfg.new_package_policy == "skip":
+    skip = result.is_new_package and cfg.new_package_policy == "skip"
+    scanned = None
+    if not skip:
+        # R2: scan before recording the baseline, so a refusal records exactly what it did before the split
+        try:
+            prior_meta = (store.get_release_metadata(conn, rel.package, result.prior_version)
+                          if result.prior_version else None)
+            owners = {"current": result.maintainer_metadata, "prior": prior_meta}
+            t0 = time.monotonic()
+            scanned = sandbox.analyze(cfg, result, owners, ruleset)   # unpack, diff, triage; the owner change too
+            logger.info("scanned %s==%s in %d ms (extract, diff, triage)", rel.package, rel.version,
+                        round((time.monotonic() - t0) * 1000))
+        except fetcher.RefusedToExtract as e:
+            _refused_to_extract(cfg, conn, rid, rel, e)
+            return True   # terminal: permanent suspicious decision recorded
+        except Exception as e:
+            logger.exception("processing failed for %s==%s", rel.package, rel.version)
+            _record_download(conn, rid, result)   # as before the split: known before the scan (plan review C1)
+            return _retry_later(cfg, conn, rid, rel, e)
+    prior_error = scanned[2] if scanned else result.prior_error
+    _record_download(conn, rid, result)
+    store.set_fetch_note(conn, rid, prior_error)   # None clears an earlier failure's note (D2)
+    if skip:
         store.update_stage(conn, rid, "new_package_skipped")
         return True   # terminal: new packages are ignored under the skip policy
+    d, tr, _ = scanned
     try:
-        prior_meta = (store.get_release_metadata(conn, rel.package, result.prior_version)
-                      if result.prior_version else None)
-        owners = {"current": result.maintainer_metadata, "prior": prior_meta}
-        d = differ.build_diff(result, owners)       # the reviewer is shown the owner change triage scores
         store.update_stage(conn, rid, "diffed")
-        tr = engine.triage(d, cfg, ruleset, owners)
         store.update_stage(conn, rid, "triaged", tr.score,
                            json.dumps([r.__dict__ for r in tr.fired_rules]))
         # Persist the flagged payload code itself (not just file:line metadata) so the DB is a
@@ -558,7 +597,7 @@ def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=
                                f"{type(e).__name__}: {e}")
         # Only now, with evidence and review handled, do earlier failures stop counting: a crash in any step
         # above (they parse package content) must still reach gave_up.
-        store.clear_fetch_failures(conn, rid, result.prior_error)
+        store.clear_fetch_failures(conn, rid, prior_error)
         return True   # terminal: an unfinished LLM review is parked in the pending-review queue
     except Exception as e:
         logger.exception("processing failed for %s==%s", rel.package, rel.version)
@@ -813,10 +852,9 @@ def list_pending(cfg: Config):
             err = "never scanned (see reason); inspect it by hand"
         elif not stored:                                  # older row with no captured payload -> re-fetch
             try:
-                art = fetcher.fetch_artifacts(cfg, NewRelease(row["package"], row["version"], row["serial"]))
-                if art is not None and not isinstance(art, fetcher.NoSdist):
-                    d = differ.build_diff(art)
-                    tr = engine.triage(d, cfg, ruleset)
+                got = _scan_release(cfg, NewRelease(row["package"], row["version"], row["serial"]), ruleset)
+                if got is not None:
+                    d, tr = got
                     diff_text = reviewer.build_review_input(d, tr, max_chars=cfg.reviewer.max_input_chars)
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
@@ -850,16 +888,14 @@ def backfill_evidence(cfg: Config, release_id: int | None = None, all_flagged: b
         for row in store.releases_needing_evidence(conn, release_id, all_flagged):
             pkg, ver = row["package"], row["version"]
             try:
-                art = fetcher.fetch_artifacts(cfg, NewRelease(pkg, ver, row["serial"]))
-                if art is None or isinstance(art, fetcher.NoSdist):
+                # A row detected as a first release was whole-package scanned (no baseline then). If a
+                # predecessor exists today, reproduce the detection-time scan: diff against nothing.
+                got = _scan_release(cfg, NewRelease(pkg, ver, row["serial"]), ruleset,
+                                    as_first_release=bool(row["is_first_release"]))
+                if got is None:
                     results.append({"package": pkg, "version": ver, "captured": False, "error": "no sdist"})
                     continue
-                # A row detected as a first release was whole-package scanned (no baseline then). If a
-                # predecessor exists today, reproduce the detection-time scan: treat every file as added.
-                if row["is_first_release"]:
-                    art = dataclasses.replace(art, prior_files={}, prior_version=None, is_new_package=True)
-                d = differ.build_diff(art)
-                tr = engine.triage(d, cfg, ruleset)
+                d, tr = got
                 ev = reviewer.build_evidence(d, tr, max_chars=cfg.evidence_max_chars)
                 if not ev:
                     results.append({"package": pkg, "version": ver, "captured": False,

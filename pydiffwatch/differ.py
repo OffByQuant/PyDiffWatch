@@ -33,22 +33,23 @@ _DEP_REASONS = {"nonexistent": "not on PyPI (dependency confusion)", "brand-new"
                 "not-screened-cap": "not screened (lookup cap reached)"}
 
 
-def _signals(a: ArtifactSet, maintainer_context) -> str:
+def render_signals(requires_dist_change, added_dep_findings, added_binaries, maintainer_context) -> str:
     """The dependency / binary / ownership signals triage scored, one line each, for the reviewer (spec B2).
-    Every author-written value (names, specifiers, paths, owners) is escaped to one line here."""
+    Rendered by the parent from its own data (parse-sandbox spec decision 5). Every author-written value (names,
+    specifiers, paths, owners) is escaped to one line here."""
     out = []
     for key in ("added", "removed"):
-        if items := (a.requires_dist_change or {}).get(key):
+        if items := (requires_dist_change or {}).get(key):
             out.append(f"requires-dist {key}: {_list(items)}")
     deps = []
-    for f in a.added_dep_findings:
+    for f in added_dep_findings:
         why = ((f"typosquat of {_esc(f['target'])} (a popular package)" if f.get("target") else "typosquat")
                if f.get("reason") == "typosquat" else _DEP_REASONS.get(f.get("reason")) or _esc(f.get("reason")))
         deps.append(f"dependency {_esc(f.get('name'))}: {why}")
     out += _capped("dependency", deps)
     bins = []
     # unscored oversized files last: the shared cap must never cut a scored line for one
-    for b in sorted(facts._normalize_binaries(a.added_binaries), key=lambda b: b["reason"] == "file-too-large"):
+    for b in sorted(facts._normalize_binaries(added_binaries), key=lambda b: b["reason"] == "file-too-large"):
         reason = _esc(b.get("reason") or "unknown") + (f" ({_esc(b['ext'])})" if b.get("ext") else "")
         bins.append(f"added file {_esc(b.get('path'))}: {_esc(b.get('size'))} bytes, {reason}")
     out += _capped("added file", bins)
@@ -57,7 +58,7 @@ def _signals(a: ArtifactSet, maintainer_context) -> str:
     return "\n".join(out)
 
 
-def build_diff(a: ArtifactSet, maintainer_context=None) -> Diff:
+def build_diff(a: ArtifactSet) -> Diff:
     changed: list[FileDiff] = []
     for path in sorted(set(a.new_files) | set(a.prior_files)):
         new, prior = a.new_files.get(path), a.prior_files.get(path)
@@ -77,4 +78,4 @@ def build_diff(a: ArtifactSet, maintainer_context=None) -> Diff:
                 list(a.added_binaries), list(a.added_dep_findings), _description(a.description),
                 execctx.build(a.new_files, a.too_large),
                 a.prior_version if a.prior_error and a.prior_version else "", a.surface_omitted,
-                _signals(a, maintainer_context))
+                "")

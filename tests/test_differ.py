@@ -32,7 +32,7 @@ def test_unscored_file_too_large_lines_sort_after_scored_ones_under_the_cap():
     bins.append({"path": "p/lib.so", "size": 10, "sha256": "b"})
     a = ArtifactSet("p", "1.1", "1.0", "sdist", {}, {}, {}, added_binaries=bins, is_new_package=False,
                     maintainer_metadata=None, added_dep_findings=[])
-    lines = differ._signals(a, None).splitlines()
+    lines = differ.render_signals(a.requires_dist_change, a.added_dep_findings, a.added_binaries, None).splitlines()
     added = [l for l in lines if l.startswith("added file")]
     assert added[0].startswith("added file p/big.py") and added[1].startswith("added file p/lib.so")
     assert "added file: … (+7 more)" in lines

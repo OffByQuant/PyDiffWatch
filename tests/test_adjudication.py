@@ -1,7 +1,7 @@
 """§8.1 verdict routing + agent adjudication queue. Running inside a Claude Code session, a model
 `suspicious` verdict is queued (not alerted) for the agent to review and label; benign is saved
 silently; malicious alerts immediately."""
-from pydiffwatch import orchestrator, store, fetcher
+from pydiffwatch import orchestrator, store
 from pydiffwatch.config import Config
 from pydiffwatch.models import Verdict, Diff, TriageResult, FiredRule
 
@@ -75,11 +75,11 @@ def test_adjudicate_benign_clears_without_alert(tmp_path):
     assert store.pending_adjudication(conn) == []
 
 
-def test_list_pending_surfaces_queue(tmp_path, monkeypatch):
+def test_list_pending_surfaces_queue(tmp_path, monkeypatch, scan_stub):
     cfg, conn, rid, d, tr, v = _setup(tmp_path, "suspicious")
     orchestrator._review_escalated(cfg, conn, _FakeRvw(v), d, tr, rid)
     conn.close()
-    monkeypatch.setattr(fetcher, "fetch_artifacts", lambda cfg, rel: None)   # diff unavailable path
+    scan_stub.fetch(lambda cfg, rel: None)   # diff unavailable path
     items = orchestrator.list_pending(cfg)
     assert len(items) == 1
     assert items[0]["package"] == "p" and items[0]["classification"] == "suspicious"

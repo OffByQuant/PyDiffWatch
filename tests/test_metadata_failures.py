@@ -294,7 +294,7 @@ def test_entering_the_wheel_only_wait_resets_the_failure_count(tmp_cfg):
     assert store.get_stage(conn, "sw", "1.1") == "no_sdist"
 
 
-def test_each_retry_gets_a_longer_deadline_and_logs_its_attempt(tmp_cfg, monkeypatch, caplog):
+def test_each_retry_gets_a_longer_deadline_and_logs_its_attempt(tmp_cfg, monkeypatch, caplog, scan_stub):
     # (i), npm #26: attempt k is passed to the fetcher, which gives the package JSON and sdist downloads k times
     # their deadlines (test_fetch_deadlines checks which requests scale; attempt 1 is x1, so the first try is as
     # strict as ever), and the log line names the error and the attempt.
@@ -305,7 +305,7 @@ def test_each_retry_gets_a_longer_deadline_and_logs_its_attempt(tmp_cfg, monkeyp
     def fetch(cfg, rel, attempt=1):
         seen.append(attempt)
         raise TimeoutError("download took too long")
-    monkeypatch.setattr(fetcher, "fetch_artifacts", fetch)
+    scan_stub.fetch(fetch)
     with caplog.at_level(logging.WARNING, logger="pydiffwatch.orchestrator"):
         for _ in range(store.METADATA_ATTEMPTS):
             orchestrator.run_once(tmp_cfg, seed_if_fresh=False)

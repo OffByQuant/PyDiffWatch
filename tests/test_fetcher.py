@@ -414,3 +414,69 @@ def test_a_first_flit_release_keeps_its_top_level_entry_points_txt(monkeypatch):
     art = fetcher.fetch_artifacts(Config(), NewRelease("brandnew", "1.0", 5))   # default policy=surface
     assert "entry_points.txt" in art.new_files
     assert "pytest11: p -> evil:hook" in differ.build_diff(art).exec_context
+
+
+# ---- C1: download / extract_download ----
+
+def test_download_parses_no_archive_and_carries_the_blobs(monkeypatch):
+    monkeypatch.setattr(fetcher, "_package_json", lambda p, cfg: _meta("acme", [
+        ("1.0", "2026-01-01T00:00:00Z"), ("1.1", "2026-02-01T00:00:00Z")]))
+    blobs = {"mock://acme/1.0": b"PRIOR", "mock://acme/1.1": b"NEW"}      # not tarballs: never opened
+    monkeypatch.setattr(fetcher, "_download", lambda url, cfg: blobs[url])
+    monkeypatch.setattr(fetcher, "_screen_added_deps", lambda *a, **k: [{"name": "x", "reason": "brand-new"}])
+    monkeypatch.setattr(fetcher, "extract_sdist", lambda *a: (_ for _ in ()).throw(AssertionError("parsed")))
+    dl = fetcher.download(Config(), NewRelease("acme", "1.1", 5))
+    assert (dl.new_blob, dl.prior_blob, dl.prior_version, dl.is_new_package) == (b"NEW", b"PRIOR", "1.0", False)
+    assert dl.added_dep_findings == [{"name": "x", "reason": "brand-new"}] and dl.prior_error is None
+
+
+def test_download_under_skip_downloads_nothing(monkeypatch):
+    monkeypatch.setattr(fetcher, "_package_json", lambda p, cfg: _meta("brandnew", [("1.0", "2026-01-01T00:00:00Z")]))
+    monkeypatch.setattr(fetcher, "_download", lambda url, cfg: (_ for _ in ()).throw(AssertionError("downloaded")))
+    dl = fetcher.download(Config(new_package_policy="skip"), NewRelease("brandnew", "1.0", 5))
+    assert dl.new_blob is None and dl.is_new_package is True
+    art = fetcher.extract_download(Config(new_package_policy="skip"), dl)
+    assert art.new_files == {} and art.is_new_package is True
+
+
+def test_a_prior_download_failure_is_a_download_field(monkeypatch):
+    monkeypatch.setattr(fetcher, "_package_json", lambda p, cfg: _meta("acme", [
+        ("1.0", "2026-01-01T00:00:00Z"), ("1.1", "2026-02-01T00:00:00Z")]))
+
+    def dl_(url, cfg):
+        if url.endswith("/1.0"):
+            raise TimeoutError("hung")
+        return make_sdist({"acme/__init__.py": b"x = 2\n"})
+    monkeypatch.setattr(fetcher, "_download", dl_)
+    monkeypatch.setattr(fetcher, "_screen_added_deps", lambda *a, **k: [])
+    dl = fetcher.download(Config(), NewRelease("acme", "1.1", 5))
+    assert dl.prior_blob is None
+    assert dl.prior_error == "prior 1.0 sdist unavailable (TimeoutError: hung); diffed against nothing"
+    assert fetcher.extract_download(Config(), dl).prior_error == dl.prior_error
+
+
+def test_a_prior_that_is_itself_a_bomb_is_a_prior_error_not_a_refusal(monkeypatch):
+    # Review Focus 2: only the NEW sdist's refusal refuses the release
+    monkeypatch.setattr(fetcher, "_package_json", lambda p, cfg: _meta("acme", [
+        ("1.0", "2026-01-01T00:00:00Z"), ("1.1", "2026-02-01T00:00:00Z")]))
+    many = {f"acme/m{i}.py": b"" for i in range(5)}
+    blobs = {"mock://acme/1.0": make_sdist(many), "mock://acme/1.1": make_sdist({"acme/__init__.py": b"x = 2\n"})}
+    monkeypatch.setattr(fetcher, "_download", lambda url, cfg: blobs[url])
+    monkeypatch.setattr(fetcher, "_screen_added_deps", lambda *a, **k: [])
+    cfg = Config(max_members=3)
+    art = fetcher.extract_download(cfg, fetcher.download(cfg, NewRelease("acme", "1.1", 5)))
+    assert art.prior_error == "prior 1.0 sdist unavailable (RefusedToExtract: members); diffed against nothing"
+    assert art.prior_files == {} and "acme/__init__.py" in art.new_files
+
+
+def test_a_refusing_new_sdist_raises_from_extract_download_not_download(monkeypatch):
+    monkeypatch.setattr(fetcher, "_package_json", lambda p, cfg: _meta("acme", [
+        ("1.0", "2026-01-01T00:00:00Z"), ("1.1", "2026-02-01T00:00:00Z")]))
+    many = {f"acme/m{i}.py": b"" for i in range(5)}
+    blobs = {"mock://acme/1.0": make_sdist({"acme/__init__.py": b"x = 1\n"}), "mock://acme/1.1": make_sdist(many)}
+    monkeypatch.setattr(fetcher, "_download", lambda url, cfg: blobs[url])
+    monkeypatch.setattr(fetcher, "_screen_added_deps", lambda *a, **k: [])
+    cfg = Config(max_members=3)
+    dl = fetcher.download(cfg, NewRelease("acme", "1.1", 5))         # no refusal here
+    with pytest.raises(fetcher.RefusedToExtract, match="members"):
+        fetcher.extract_download(cfg, dl)
