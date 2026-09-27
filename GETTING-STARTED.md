@@ -723,7 +723,8 @@ PyDiffWatch's database, cache and lock directories, and gets none of PyDiffWatch
 On macOS it also cannot start programs, fork or signal other processes. PyDiffWatch itself keeps the network, the
 database, the reviewer and the alerts. It checks every field the worker sends back and recomputes the score. The
 dependency and ownership rules, and the signal line the reviewer sees, are always computed outside the worker.
-Before the first scan of every `run` and every `watch` tick, a probe checks all of these restrictions.
+Before the first scan of every scanning command (each `run` and `watch` tick, `pending`, `review-pending` and
+`capture-evidence`), a probe checks all of these restrictions.
 
 ```toml
 parse_sandbox = "auto"     # "auto" | "on" | "off"

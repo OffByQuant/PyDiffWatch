@@ -91,8 +91,8 @@ per-process memory limit, so the size caps bound its memory.
 The Python install and the package are bound read-only, and the database, cache and lock directories are made
 inaccessible. The unit inherits none of PyDiffWatch's environment.
 
-**The probe.** Before the first scan of every `run` and every `watch` tick, PyDiffWatch starts the worker once in
-probe mode. The worker tries to:
+**The probe.** Before the first scan of every scanning command (each `run` and `watch` tick, `pending`,
+`review-pending` and `capture-evidence`), PyDiffWatch starts the worker once in probe mode. The worker tries to:
 - open a network connection;
 - write a file next to the database;
 - read a file there, and one in your home directory;

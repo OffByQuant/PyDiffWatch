@@ -140,7 +140,8 @@ outbound network restricted to PyPI, your model endpoint, and your webhook — *
 holds credentials or data you care about.** A built-in default-deny egress allowlist enforces this
 in-process; an OS-level boundary is what holds if the process itself is ever compromised. On macOS and Linux the
 parsers that read package bytes also run in a separate sandboxed process per release by default, with no network,
-no file writes and no read access to your home directory's files ([details](docs/hardening/parse-sandbox.md)).
+no file writes and no read access to your home directory's files beyond the Python install and the package
+([details](docs/hardening/parse-sandbox.md)).
 
 → Concrete isolation recipes: [`docs/hardening/`](docs/hardening/).
 

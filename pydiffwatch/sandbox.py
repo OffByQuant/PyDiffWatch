@@ -77,20 +77,27 @@ def _home() -> str:
 
 def _import_paths() -> list[str]:
     """Where the worker imports from: the parent's own import path (so it runs exactly the parent's code), real
-    paths only, minus HOME and its ancestors, which would open up the whole home directory."""
+    paths only, and only the entries it needs: the directory pydiffwatch is imported from, the Python install, and
+    a directory holding a module the worker imports (pydiffwatch, yaml). Every entry becomes readable to the worker,
+    so anything else on sys.path (the daemon's cwd under `python -m`, a PYTHONPATH directory) stays closed. HOME and
+    its ancestors never qualify: they would open up the whole home directory."""
     home = _home()
+    prefixes = {os.path.realpath(sys.prefix), os.path.realpath(sys.base_prefix)}
     out = []
     for p in [str(_ROOT)] + sys.path:
         rp = os.path.realpath(p or os.getcwd())
-        if os.path.isdir(rp) and not (home == rp or home.startswith(rp.rstrip("/") + "/")) and rp not in out:
+        needed = (rp == str(_ROOT) or any(rp == x or rp.startswith(x.rstrip("/") + "/") for x in prefixes)
+                  or any(os.path.exists(os.path.join(rp, m)) for m in ("pydiffwatch", "yaml", "yaml.py")))
+        if needed and os.path.isdir(rp) and not (home == rp or home.startswith(rp.rstrip("/") + "/")) \
+                and rp not in out:
             out.append(rp)
     return out
 
 
 def _cfg_to_dict(cfg) -> dict:
-    """Every Config field but the reviewer's; the four paths resolved here, since the worker must never resolve a
+    """Every Config field but the reviewer's and the webhook URL (credentials the worker never needs); the four paths resolved here, since the worker must never resolve a
     relative path against a directory of its own."""
-    d = {f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg) if f.name != "reviewer"}
+    d = {f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg) if f.name not in ("reviewer", "webhook_url")}
     for k in _PATH_FIELDS:
         d[k] = str(Path(d[k]).resolve())
     return d
@@ -354,14 +361,19 @@ def _run(cfg, backend: str, payload: bytes) -> bytes:
         threads = [threading.Thread(target=feed, daemon=True), threading.Thread(target=drain_stderr, daemon=True)]
         for t in threads:
             t.start()
-        for chunk in iter(lambda: proc.stdout.read1(1 << 20), b""):
-            out += chunk
-            if len(out) > cap:
-                over = True
+        try:
+            for chunk in iter(lambda: proc.stdout.read1(1 << 20), b""):
+                out += chunk
+                if len(out) > cap:
+                    over = True
+                    proc.kill()
+                    break
+            proc.wait()
+        finally:        # an interrupted parent (Ctrl-C, SIGINT) kills its worker and leaves no armed Timer behind
+            timer.cancel()
+            if proc.poll() is None:
                 proc.kill()
-                break
-        proc.wait()
-        timer.cancel()
+                proc.wait()
         for t in threads:
             t.join()
     if timed_out.is_set():

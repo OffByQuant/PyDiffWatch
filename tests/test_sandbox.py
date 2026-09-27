@@ -217,6 +217,9 @@ class _Proc:
     def wait(self, timeout=None):
         return self.returncode
 
+    def poll(self):                  # the fake has already exited
+        return self.returncode
+
     def kill(self):
         pass
 
@@ -749,3 +752,61 @@ def test_the_docs_quote_the_sandbox_messages_exactly(capsys):
     assert f"pydiffwatch: {_REFUSED}".startswith('pydiffwatch: parse_sandbox = "on" but ')
     assert 'pydiffwatch: parse_sandbox = "on" but …' in guide and 'pydiffwatch: parse_sandbox = "on" but …' in hardening
     assert "python3 -m pytest -q -m seatbelt tests/test_sandbox.py" in hardening
+
+
+# ---- C2 final review fixes ----
+
+def test_the_daemons_cwd_is_never_opened_to_the_worker(tmp_path, monkeypatch):
+    # final review I1: `python -m pydiffwatch` puts the cwd at sys.path[0]; a deploy dir under HOME (the config TOML
+    # next to it) must not become readable to the worker just because it is on the import path
+    cwd = Path(os.path.expanduser("~")) / ".pydw-test-cwd"
+    cwd.mkdir(exist_ok=True)
+    try:
+        monkeypatch.chdir(cwd)
+        monkeypatch.setattr(sys, "path", [str(cwd), ""] + sys.path)
+        assert str(cwd.resolve()) not in sandbox._readable()
+        assert f"(subpath {sandbox._quote(str(cwd.resolve()))})" not in sandbox._seatbelt_profile(_cfg(tmp_path))
+    finally:
+        cwd.rmdir()
+
+
+@seatbelt
+def test_a_file_in_the_daemons_cwd_is_unreadable_to_the_worker(tmp_path, monkeypatch):
+    cwd = Path(os.path.expanduser("~")) / ".pydw-test-cwd-sb"
+    cwd.mkdir(exist_ok=True)
+    secret = cwd / "secret.txt"
+    try:
+        secret.write_text("SECRET-IN-CWD")
+        monkeypatch.chdir(cwd)
+        monkeypatch.setattr(sys, "path", [str(cwd)] + sys.path)
+        got = subprocess.run(["sandbox-exec", "-p", sandbox._seatbelt_profile(_cfg(tmp_path)), sys.executable, "-I",
+                              "-c", "import sys\ntry:\n    print(open(sys.argv[1]).read())\nexcept OSError:\n"
+                              "    print('blocked')\n", str(secret.resolve())],
+                             capture_output=True, text=True, check=True, env={})
+        assert got.stdout.strip() == "blocked"
+    finally:
+        secret.unlink(missing_ok=True)
+        cwd.rmdir()
+
+
+def test_an_interrupted_parent_kills_its_worker_and_leaves_no_timer(monkeypatch):
+    # final review I2: Ctrl-C (or a service manager's SIGINT) during a scan must not wait for the worker or leave
+    # the wall-clock Timer holding the interpreter for parse_timeout_s + 10 s
+    import threading, time
+    _worker_is(monkeypatch, "import time; time.sleep(30)")
+    threading.Timer(0.3, lambda: signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)).start()
+    before = time.monotonic()
+    with pytest.raises(KeyboardInterrupt):
+        sandbox._run(Config(parse_timeout_s=20), "seatbelt", b"{}\n")
+    assert time.monotonic() - before < 2                                # not the worker's 30 s, not the wall
+    assert not [t for t in threading.enumerate() if isinstance(t, threading.Timer) and t.is_alive()]
+
+
+def test_the_webhook_url_never_reaches_the_worker():
+    # final review I3: a Slack/Discord webhook URL is a bearer credential; the worker needs no network config
+    cfg = Config(webhook_url="https://hooks.example/T/B/SECRETTOKEN")
+    line = sandbox._encode_input(cfg, _scan_dl(), []).split(b"\n", 1)[0]
+    head = json.loads(line)
+    assert b"SECRETTOKEN" not in line and "webhook_url" not in head["cfg"]
+    got_cfg, _, _ = sandbox._decode_input(head, io.BytesIO(sandbox._encode_input(cfg, _scan_dl(), []).split(b"\n", 1)[1]))
+    assert got_cfg.webhook_url is None
