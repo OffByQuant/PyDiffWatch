@@ -2,7 +2,7 @@ import argparse
 import dataclasses
 import logging
 import sys
-from . import egress, store
+from . import egress, sandbox, store
 from .config import Config, load_config
 from .orchestrator import (run_once, seed_now, list_pending, adjudicate, get_evidence,
                            backfill_evidence, export_dashboard, watch, review_pending,
@@ -139,6 +139,13 @@ def main():
     # xmlrpc.client is defused at import in ingest.py (covers library importers too). The egress guard
     # mutates global socket state, so it stays a CLI-entry concern (see egress.py docstring).
     egress.install_guard(cfg)   # default-deny host allowlist for the whole process (see egress.py)
+    try:
+        _dispatch(args, cfg)
+    except sandbox.SandboxError as e:     # parse_sandbox = "on" and the sandbox does not hold (decision 4)
+        raise SystemExit(f"pydiffwatch: {e}")
+
+
+def _dispatch(args, cfg):
     if args.cmd == "run":
         n = run_once(cfg, seed_if_fresh=not args.backfill, recent=args.recent)
         print(f"[pydiffwatch] processed {n} releases")

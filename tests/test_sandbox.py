@@ -710,3 +710,30 @@ def test_watch_stops_on_the_tick_where_the_sandbox_starts_failing(tmp_path, monk
     with pytest.raises(sandbox.SandboxError):
         orchestrator.watch(_cfg(tmp_path, parse_sandbox="on"), iterations=3, sleep_fn=lambda s: None)
     assert len(ticks) == 2                                             # no tick 3
+
+
+# ---- C2: the CLI surfaces a refusal as one line, no traceback ----
+
+def _cli_on(tmp_path, monkeypatch, argv):
+    cfg = _cfg(tmp_path, parse_sandbox="on")
+    conn = store.connect(cfg); store.init_schema(conn); store.set_last_serial(conn, 5); conn.close()
+    monkeypatch.setattr(cli, "_cfg", lambda args: cfg)
+    monkeypatch.setattr(cli.egress, "install_guard", lambda c: None)
+    monkeypatch.setattr(cli, "export_dashboard", lambda c, **k: c.db_path.parent / "dashboard.html")
+    monkeypatch.setattr(sys, "argv", ["pydiffwatch"] + argv)
+    with pytest.raises(SystemExit) as e:
+        cli.main()
+    return str(e.value.code)
+
+
+@pytest.mark.parametrize("cmd", ["run", "watch"])
+def test_run_and_watch_exit_with_the_sandbox_message(cmd, tmp_path, monkeypatch):
+    monkeypatch.setattr(sandbox, "choose", _refuse)                  # the real run_once / watch reach it
+    assert _cli_on(tmp_path, monkeypatch, [cmd]) == f"pydiffwatch: {_REFUSED}"
+
+
+@pytest.mark.parametrize("cmd,entry", [("review-pending", "review_pending"), ("pending", "list_pending"),
+                                       ("capture-evidence", "backfill_evidence")])
+def test_the_other_scanning_commands_exit_with_the_sandbox_message(cmd, entry, tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, entry, lambda *a, **k: _refuse(None))
+    assert _cli_on(tmp_path, monkeypatch, [cmd]).startswith('pydiffwatch: parse_sandbox = "on" but')
