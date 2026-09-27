@@ -8,6 +8,9 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "live_local: test makes real calls to the local Qwen endpoint (skips hermetic network block)")
+    config.addinivalue_line(
+        "markers",
+        "seatbelt: test runs the real macOS Seatbelt sandbox (sandbox-exec); skipped elsewhere")
 
 
 @pytest.fixture(autouse=True)

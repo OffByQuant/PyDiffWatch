@@ -294,3 +294,16 @@ def test_only_the_sandbox_and_its_worker_can_start_a_process():
     offenders = [p.name for p in sorted(_DIFFWATCH.glob("*.py"))
                  if p.name not in ("sandbox.py", "_parse_worker.py") and {"subprocess", "pty"} & _imports(p.read_text())]
     assert offenders == [], f"only sandbox.py and _parse_worker.py may start a process; found: {offenders}"
+
+
+# _parse_worker.py reads the request and runs the same scan code as the parent (fetcher/differ/engine, banned above).
+# Its own imports: no fetch, no exec/install/unpickle. socket and subprocess are there for the probe only (Task 6).
+_WORKER_FORBIDDEN = (_EXEC_INSTALL_UNPICKLE - {"subprocess"}) | (_NETWORK - {"socket"})
+
+
+def test_the_parse_worker_never_fetches_or_runs_package_content():
+    src = (_DIFFWATCH / "_parse_worker.py").read_text()
+    bad = _violations(src, _WORKER_FORBIDDEN)
+    assert not bad, f"_parse_worker.py must never fetch, exec, install or unpickle (§6); found: {bad}"
+    attrs = {n.attr for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Attribute)}
+    assert "expanduser" not in attrs, "every path reaches the worker absolute; inside the sandbox '~' is unresolvable"

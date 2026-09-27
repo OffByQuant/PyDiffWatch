@@ -414,3 +414,109 @@ def test_a_malformed_reply_is_retried_then_given_up_with_one_alert(tmp_path, mon
     assert stage == "gave_up" and note.startswith("SandboxError: sandbox sent back something that is not JSON")
     assert conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] == 1
     assert "SandboxError" in conn.execute("SELECT reasoning FROM verdicts").fetchone()[0]
+
+
+# ---- C2: the worker ----
+
+_HAS_SEATBELT = sys.platform == "darwin" and shutil.which("sandbox-exec") is not None
+
+
+def seatbelt(fn):
+    """Runs the real macOS sandbox (sandbox-exec); skipped elsewhere. `pytest -m seatbelt` selects these."""
+    return pytest.mark.seatbelt(pytest.mark.skipif(not _HAS_SEATBELT, reason="needs macOS sandbox-exec")(fn))
+
+
+def _no_sandbox(monkeypatch):
+    """Run the real worker process without sandbox-exec, on any OS: the pipe protocol end to end."""
+    monkeypatch.setattr(sandbox, "_seatbelt_cmd", lambda cfg: sandbox._worker_argv(cfg))
+
+
+def test_the_worker_round_trip_matches_the_in_process_scan_without_a_sandbox(monkeypatch):
+    _no_sandbox(monkeypatch)
+    cfg, rs = Config(), rules.load_rules(_RULES)
+    assert sandbox.analyze(cfg, _scan_dl(), _OWNERS, rs, backend="seatbelt") == \
+        sandbox.analyze(cfg, _scan_dl(), _OWNERS, rs, backend="off")
+
+
+def test_a_refusal_in_the_worker_is_a_refusal(monkeypatch):
+    _no_sandbox(monkeypatch)
+    with pytest.raises(fetcher.RefusedToExtract, match="^members$"):
+        sandbox.analyze(Config(max_members=1), _scan_dl(), None, [], backend="seatbelt")
+
+
+def test_a_crash_in_the_worker_is_a_sandbox_error(monkeypatch):
+    _no_sandbox(monkeypatch)
+    with pytest.raises(sandbox.SandboxError, match="^sandbox worker failed: BadGzipFile"):
+        sandbox.analyze(Config(), _scan_dl(new_blob=b"not a gzip"), None, [], backend="seatbelt")
+
+
+@seatbelt
+def test_the_sandboxed_scan_equals_the_in_process_scan_and_escalates(tmp_path):
+    cfg, rs = _cfg(tmp_path), rules.load_rules(_RULES)
+    for dl in (_scan_dl(), _scan_dl(prior_blob=b"not a tarball")):    # the second's prior_error crosses too
+        got = sandbox.analyze(cfg, dl, _OWNERS, rs, backend="seatbelt")
+        assert got == sandbox.analyze(cfg, dl, _OWNERS, rs, backend="off")   # Diff incl. signals, triage, prior_error
+        assert got[1].escalate
+    assert got[2].startswith("prior 1.0 sdist unavailable (")
+
+
+@seatbelt
+def test_a_refused_sdist_is_reported_as_refused_not_as_a_crash(tmp_path):
+    with pytest.raises(fetcher.RefusedToExtract, match="^members$"):
+        sandbox.analyze(_cfg(tmp_path, max_members=1), _scan_dl(), None, rules.load_rules(_RULES), backend="seatbelt")
+
+
+@seatbelt
+def test_the_worker_uses_the_rules_the_parent_loaded_not_the_files_on_disk(tmp_path):
+    only = rules.validate_rule({"id": "parent-only-rule", "applies_to": "code", "weight": 7,
+                                "match": {"bound_call": {"category": "process"}}})
+    _, tr, _ = sandbox.analyze(_cfg(tmp_path), _scan_dl(), None, [only], backend="seatbelt")
+    assert [f.rule for f in tr.fired_rules] == ["parent-only-rule"]
+
+
+@seatbelt
+def test_the_pipeline_stores_a_sandboxed_scan(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(sandbox, "_backend", "seatbelt")
+    conn = store.connect(cfg); store.init_schema(conn)
+    assert orchestrator._process_fetched(cfg, conn, None, rules.load_rules(_RULES), NewRelease("scn", "1.1", 5),
+                                         _scan_dl()) is True
+    stage, score = conn.execute("SELECT stage, triage_score FROM releases").fetchone()
+    assert stage in ("triaged", "pending_review") and score >= cfg.threshold_t
+
+
+@seatbelt
+def test_a_multi_megabyte_reply_crosses_the_pipe_intact(tmp_path):
+    # far over the 64 KiB pipe buffer: 200 changed files of about 7 KiB each. It takes ≈4 s, almost all of it the
+    # two difflib passes over 200 × 900-line files (in-process and in the worker), not the pipe.
+    new = {f"big/m{i}.py": (f"x_{i} = 1\n" * 900).encode() for i in range(200)}
+    old = {f"big/m{i}.py": (f"x_{i} = 0\n" * 900).encode() for i in range(200)}
+    cfg, rs, dl = _cfg(tmp_path), rules.load_rules(_RULES), _dl(new, old, package="big")
+    assert sandbox.analyze(cfg, dl, None, rs, backend="seatbelt") == sandbox.analyze(cfg, dl, None, rs, backend="off")
+
+
+_BOUNDARY = ("import os, sys\n"
+             "def tried(fn):\n"
+             "    try:\n"
+             "        fn()\n"
+             "    except OSError:\n"
+             "        return 'blocked'\n"
+             "    return 'open'\n"
+             "root, pkg = sys.argv[1], sys.argv[2]\n"
+             "print(tried(lambda: open(os.path.join(root, 'pyproject.toml'), 'rb').read(1)),\n"
+             "      tried(lambda: os.listdir(root)),\n"
+             "      tried(lambda: open(os.path.join(pkg, 'sandbox.py'), 'rb').read(1)),\n"
+             "      tried(lambda: os.kill(os.getppid(), 0)),\n"
+             "      tried(lambda: os.kill(os.getpid(), 0)))\n")
+
+
+@seatbelt
+def test_the_profile_closes_the_checkout_and_other_processes_but_not_the_package(tmp_path):
+    # Review Focus 7 / Ruling R13: outside HOME, only (deny file-read-data (subpath _ROOT)) keeps the checkout's
+    # other files closed (pyproject.toml here; .diffwatch-conf/, pydiffwatch.toml, internal/ in a real checkout);
+    # the root stays listable and the package readable, or the import fails. (deny signal): a hijacked worker
+    # cannot stop the daemon with SIGSTOP/SIGKILL, yet may still signal itself.
+    got = subprocess.run(["sandbox-exec", "-p", sandbox._seatbelt_profile(_cfg(tmp_path)), sys.executable, "-I",
+                          "-c", _BOUNDARY, str(sandbox._ROOT), str(sandbox._PKG)],
+                         capture_output=True, text=True, check=True, env={})
+    assert got.stdout.split() == ["blocked", "open", "open", "blocked", "open"]
