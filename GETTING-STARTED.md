@@ -708,6 +708,8 @@ Persist `.diffwatch/` and you can move PyDiffWatch between machines without losi
 The download/extraction caps (`max_download_bytes`, `max_member_bytes`, `max_total_bytes`,
 `max_decompressed_bytes`, …) bound how much of any sdist is ever read into memory; the package is never
 installed, built, imported, or executed — see the [README invariant](README.md#the-one-hard-invariant-no-execution).
+`max_members` caps the file entries in one sdist (default 10,000); an sdist over it is refused and listed as
+not scanned.
 
 **One oversized file does not refuse the sdist.** A member over `max_member_bytes` is skipped and fingerprinted
 (its hash is streamed; it is never read whole), and the rest of the sdist is scanned:

@@ -17,7 +17,7 @@ def test_default_reviewer_is_openai_compatible():
 def test_containment_caps_preserved():
     c = Config()
     assert c.max_download_bytes == 50 * 1024 * 1024
-    assert c.max_members == 2000 and c.fetch_concurrency == 4
+    assert c.max_members == 10000 and c.fetch_concurrency == 4   # 2000 refused the median large sdist (3,247 files)
     assert c.threshold_t == 40.0
 
 

@@ -53,7 +53,7 @@ class Config:
     lock_path: Path = Path(".diffwatch/diffwatch.lock")
     # containment caps
     max_download_bytes: int = 50 * 1024 * 1024
-    max_members: int = 2000
+    max_members: int = 10000              # file entries per sdist; the byte caps bound memory, this bounds entry floods
     max_member_bytes: int = 10 * 1024 * 1024
     max_total_bytes: int = 100 * 1024 * 1024
     max_source_file_bytes: int = 1 * 1024 * 1024
