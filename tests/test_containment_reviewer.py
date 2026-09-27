@@ -8,8 +8,13 @@ reviewer path and must never execute, install, unpickle, or socket-fetch analyze
     URL embedded in package content can never become the egress target is proven behaviorally in
     test_backends.py (test_local_egress_url_is_config_endpoint_not_package_content).
 
-These AST guards fail the suite if a future change introduces a forbidden primitive into either
-module."""
+  * sandbox.py and _parse_worker.py are the only modules that start a process, and each launch site is pinned
+    below: sandbox._run starts the parse worker (one subprocess.Popen of sandbox-exec or systemd-run, never a
+    shell, its stdout read up to a cap), and the worker's probe runs ["/usr/bin/true"] once, in _probe's
+    run_program, to prove the sandbox denies it.
+
+These AST guards fail the suite if a future change introduces a forbidden primitive into any of these
+modules."""
 import ast
 import pathlib
 

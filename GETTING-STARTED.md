@@ -714,12 +714,50 @@ installed, built, imported, or executed — see the [README invariant](README.md
 An unchanged oversized file (same path and hash as in the previous release) is not a signal. A zip-format sdist
 is refused as `zip-sdist`; a corrupt or truncated archive is retried like a failed download.
 
+**Parse sandbox.** Everything that reads the bytes a package author wrote runs in a short-lived worker process,
+one per release: unpacking the sdist (`gzip`, `tarfile`), diffing it, and running the `code` and `binary` rules
+(`ast.parse`, `tomllib`, `configparser`, `email.parser`, the rules' regular expressions). On macOS the worker runs
+under Seatbelt (`sandbox-exec`), and on Linux under `systemd-run`. The worker has no network, cannot write files,
+cannot read the files in your home directory (other than the Python install and the `pydiffwatch/` package) or
+PyDiffWatch's database, cache and lock directories, and gets none of PyDiffWatch's environment (so no API keys).
+On macOS it also cannot start programs, fork or signal other processes. PyDiffWatch itself keeps the network, the
+database, the reviewer and the alerts. It checks every field the worker sends back and recomputes the score. The
+dependency and ownership rules, and the signal line the reviewer sees, are always computed outside the worker.
+Before the first scan of every `run` and every `watch` tick, a probe checks all of these restrictions.
+
+```toml
+parse_sandbox = "auto"     # "auto" | "on" | "off"
+parse_timeout_s = 120.0    # the worker's CPU limit per release; its wall-clock limit is this plus 10 seconds
+parse_memory_max = "2G"    # the worker's memory limit (Linux only; on macOS the size caps above bound it)
+```
+
+- `auto` (the default) uses the sandbox. If the sandbox is missing, or the probe finds a check that does not
+  hold, PyDiffWatch prints and logs this line and scans in-process:
+
+  ```
+  [pydiffwatch] WARNING: scanning WITHOUT a sandbox (<why>). Package files are unpacked and parsed inside this process. Set parse_sandbox = "on" to refuse to scan instead.
+  ```
+
+- `on` refuses to scan without a working sandbox. `run`, `pending`, `review-pending` and `capture-evidence` exit
+  with `pydiffwatch: parse_sandbox = "on" but …`. `watch` exits the same way, either at startup or on the tick
+  where the sandbox starts failing.
+- `off` scans in-process, with no probe and no warning.
+
+A worker that crashes, runs out of time, or sends back something malformed or too large fails that one
+release's scan. The
+release is retried like a failed download: it waits in the retry queue and is given up on, with one UNREVIEWED
+alert, after 3 attempts. An sdist that breaks a size limit inside the worker is still refused as before.
+
+The worker imports PyDiffWatch from a venv or a system install; a `pip install --user` layout cannot be
+sandboxed. Keep `db_path`, `cache_dir` and `lock_path` outside the Python install and outside the `pydiffwatch/`
+package directory (the default `.diffwatch/` is fine).
+
 **Hardening (defense-in-depth).** PyDiffWatch installs a process-wide default-deny egress allowlist
 (`pydiffwatch/egress.py`) so it can only contact PyPI, the configured reviewer endpoint, and an optional
 webhook. For production deployments, two guides under [`docs/hardening/`](docs/hardening/) cover the
 authoritative OS-level boundaries: [`egress-allowlist.md`](docs/hardening/egress-allowlist.md) (domain-aware
 proxy / `systemd` IP allowlist / `nftables`) and [`parse-sandbox.md`](docs/hardening/parse-sandbox.md)
-(running the byte-parsing stage under a container/gVisor or a no-network sandboxed subprocess).
+(what the built-in parse sandbox does, and running the whole process under a container/gVisor).
 
 ---
 

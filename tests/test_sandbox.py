@@ -737,3 +737,15 @@ def test_run_and_watch_exit_with_the_sandbox_message(cmd, tmp_path, monkeypatch)
 def test_the_other_scanning_commands_exit_with_the_sandbox_message(cmd, entry, tmp_path, monkeypatch):
     monkeypatch.setattr(cli, entry, lambda *a, **k: _refuse(None))
     assert _cli_on(tmp_path, monkeypatch, [cmd]).startswith('pydiffwatch: parse_sandbox = "on" but')
+
+
+def test_the_docs_quote_the_sandbox_messages_exactly(capsys):
+    why = "no sandbox-exec (macOS) or systemd-run (Linux) on this machine"
+    sandbox.choose(Config(), which=lambda b: None, probe=None, platform="linux")
+    warning = capsys.readouterr().out.strip()
+    guide = (_REPO / "GETTING-STARTED.md").read_text()
+    hardening = (_REPO / "docs" / "hardening" / "parse-sandbox.md").read_text()
+    assert why in warning and warning.replace(why, "<why>") in guide
+    assert f"pydiffwatch: {_REFUSED}".startswith('pydiffwatch: parse_sandbox = "on" but ')
+    assert 'pydiffwatch: parse_sandbox = "on" but …' in guide and 'pydiffwatch: parse_sandbox = "on" but …' in hardening
+    assert "python3 -m pytest -q -m seatbelt tests/test_sandbox.py" in hardening

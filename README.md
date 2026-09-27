@@ -138,7 +138,9 @@ PyDiffWatch ingests untrusted bytes from PyPI and runs community-authored rules.
 is the primary safeguard, but treat it as one layer: run it in a container, VM, or unprivileged user with
 outbound network restricted to PyPI, your model endpoint, and your webhook — **not on a workstation that
 holds credentials or data you care about.** A built-in default-deny egress allowlist enforces this
-in-process; an OS-level boundary is what holds if the process itself is ever compromised.
+in-process; an OS-level boundary is what holds if the process itself is ever compromised. On macOS and Linux the
+parsers that read package bytes also run in a separate sandboxed process per release by default, with no network,
+no file writes and no read access to your home directory's files ([details](docs/hardening/parse-sandbox.md)).
 
 → Concrete isolation recipes: [`docs/hardening/`](docs/hardening/).
 
