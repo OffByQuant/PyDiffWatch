@@ -57,8 +57,9 @@ def requires_floor(spec) -> tuple | None:
     return best
 
 
-# A quoted token that base64-decodes to an http(s) URL: base64 of "http" at offset 0 always starts "aHR0c".
-_ENC_URL = re.compile(r"""(["'])(aHR0c[A-Za-z0-9+/_-]{10,4090}={0,2})\1""")
+# A quoted token that base64-decodes to an http(s) URL. Base64 of "htt" in any letter case starts [aS][HF]R[0U]
+# ("aHR0" for lowercase); the decoded scheme is then checked case-insensitively.
+_ENC_URL = re.compile(r"""(["'])([aS][HF]R[0U][A-Za-z0-9+/_-]{11,4090}={0,2})\1""")
 
 
 def _encoded_url(added_strs) -> bool:

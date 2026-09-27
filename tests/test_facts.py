@@ -410,3 +410,10 @@ def test_what_is_not_an_encoded_url():
 
 def test_encoded_url_is_set_on_a_file_that_does_not_parse():
     assert _enc(f'u = "{_URL_B64}" def (:') is True
+
+
+def test_an_uppercase_scheme_is_still_an_encoded_url():
+    # Final review (re-graded Important): the spec's decode check is case-insensitive, and urllib and requests
+    # accept HTTPS://; an uppercase scheme must not slip past the literal's prefix anchor.
+    assert _enc('u = "SFRUUFM6Ly9leGFtcGxlLmludmFsaWQvZGF0YS5qc29u"') is True      # HTTPS://example.invalid/data.json
+    assert _enc('u = "SHR0cHM6Ly9leGFtcGxlLmludmFsaWQveA=="') is True              # Https://example.invalid/x
