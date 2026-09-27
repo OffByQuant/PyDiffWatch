@@ -651,3 +651,62 @@ def test_a_database_dir_with_a_space_quotes_and_a_backslash_is_unreadable(tmp_pa
     odd = sandbox._PKG / '.diffwatch probe "q" \\ dir'
     odd.mkdir(exist_ok=True)
     assert _probe_db_in(tmp_path, odd) == "blocked"
+
+
+# ---- C2 wiring: every entry point that scans proves the sandbox; "on" stops the daemon ----
+
+def _count_choose(monkeypatch, result="seatbelt"):
+    calls = []
+    monkeypatch.setattr(sandbox, "choose", lambda cfg, **k: calls.append(cfg) or result)
+    return calls
+
+
+def test_every_scanning_entry_point_proves_the_sandbox_once(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    conn = store.connect(cfg); store.init_schema(conn); store.set_last_serial(conn, 5); conn.close()
+    monkeypatch.setattr(orchestrator.ingest, "changes_since", lambda c, since: [])
+    for entry in (orchestrator.run_once, orchestrator.list_pending, orchestrator.backfill_evidence):
+        monkeypatch.setattr(sandbox, "_backend", "off")
+        calls = _count_choose(monkeypatch)
+        entry(cfg)
+        assert len(calls) == 1 and sandbox._backend == "seatbelt", entry.__name__
+    monkeypatch.setattr(orchestrator, "_build_reviewer", lambda c: SimpleNamespace(backend=None))
+    monkeypatch.setattr(orchestrator.guard_mod, "ReviewerGuard",
+                        lambda c, backend, conn: SimpleNamespace(begin_batch=lambda: None))
+    monkeypatch.setattr(orchestrator, "drain_pending", lambda *a, **k: 0)
+    calls = _count_choose(monkeypatch)
+    orchestrator.review_pending(cfg)
+    assert len(calls) == 1
+
+
+_REFUSED = 'parse_sandbox = "on" but no sandbox-exec (macOS) or systemd-run (Linux) on this machine'
+
+
+def _refuse(cfg, **k):
+    raise sandbox.SandboxError(_REFUSED)
+
+
+def test_watch_under_on_stops_at_startup_when_the_sandbox_does_not_hold(tmp_path, monkeypatch):
+    # decision 4: even on a fresh cursor, where run_once would return before it ever calls choose
+    monkeypatch.setattr(sandbox, "choose", _refuse)
+    ticks = []
+    monkeypatch.setattr(orchestrator, "run_once", lambda c, **k: ticks.append(1))
+    with pytest.raises(sandbox.SandboxError, match='^parse_sandbox = "on" but'):
+        orchestrator.watch(_cfg(tmp_path, parse_sandbox="on"), iterations=3, sleep_fn=lambda s: None)
+    assert ticks == []
+
+
+def test_watch_stops_on_the_tick_where_the_sandbox_starts_failing(tmp_path, monkeypatch):
+    monkeypatch.setattr(sandbox, "choose", lambda c, **k: "seatbelt")
+    monkeypatch.setattr(orchestrator, "export_dashboard", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator, "_behind", lambda *a: False)
+    ticks = []
+
+    def run(c, **k):
+        ticks.append(1)
+        if len(ticks) == 2:
+            raise sandbox.SandboxError('parse_sandbox = "on" but the seatbelt sandbox could not run: gone')
+    monkeypatch.setattr(orchestrator, "run_once", run)
+    with pytest.raises(sandbox.SandboxError):
+        orchestrator.watch(_cfg(tmp_path, parse_sandbox="on"), iterations=3, sleep_fn=lambda s: None)
+    assert len(ticks) == 2                                             # no tick 3
