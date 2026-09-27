@@ -32,7 +32,7 @@ A rule with `max_total` adds at most that much to one release's total, however o
 | `max_total` | no | cap on this rule's summed contribution to one release's score (positive number); default: no cap |
 
 **Evaluation scope** decides what each rule runs against:
-- `code` — evaluated once per changed `.py`/`.pyx`/`.pyi` file.
+- `code` — evaluated once per changed text file (`.py`/`.pyx`/`.pyi` are parsed; other files such as `setup.cfg` and `.pth` expose only their added lines to `regex`, `path_in` and `encoded_url`).
 - `binary` — once per added non-source / oversized / foreign member.
 - `dep` — once per newly-added dependency finding.
 - `maintainer` — once per release.
@@ -69,9 +69,12 @@ using a predicate outside its scope makes the rule invalid (and dropped).
 | `bound_call: {name: <fn>}` | code | a bound/builtin call with that exact function name (e.g. `system`, `b64decode`) is on an added line |
 | `import_present: {module: <m>}` | code | module `m` is imported in the file |
 | `regex: {pattern: <re>}` | code | any added line matches the regular expression |
-| `blob_present: true` | code | the file has an added line that looks like an encoded blob (long base64 run, very long line, or high-entropy window) |
-| `syntax_error: true` | code | a complete `.py` file fails to parse |
-| `location_at_least: <n>` | code | the file's location weight ≥ `n` (3.0 = auto-exec/auto-import: `setup.py`/`setup.cfg`/`pyproject.toml`/`__init__.py`/`conftest.py`/`sitecustomize.py`/`.pth`; 1.0 = normal; 0.2 = tests/docs/examples) |
+| `blob_present: true` | code | the file has an added line that looks like an encoded blob (long base64 run, very long line, or high-entropy window); docstring lines count only toward the long-base64-run test |
+| `syntax_error: true` | code | a complete `.py`/`.pyi` file fails to parse (a Cython `.pyx` never counts; outside auto-exec locations, syntax newer than the running interpreter under a higher Requires-Python floor sets `newer_syntax` instead) |
+| `newer_syntax: true` | code | a complete `.py`/`.pyi` file outside auto-exec locations fails to parse on the running interpreter while the package's Requires-Python floor is newer |
+| `encoded_url: true` | code | an added quoted literal is a base64-encoded http(s) URL |
+| `path_in: [<entry>, ...]` | code | the file's basename equals an entry, or ends with `.<ext>` for an entry `*.<ext>` (1–100 entries, no `/`, `*` only as a leading `*.`) |
+| `location_at_least: <n>` | code | the file's location weight ≥ `n` (3.0 = auto-exec/auto-import: `setup.py`/`setup.cfg`/`pyproject.toml`/`__init__.py`/`sitecustomize.py`/`.pth`; 1.0 = normal; 0.2 = tests/docs/examples). `conftest.py` follows the path rules: it runs only under pytest |
 | `binary_reason: <r>` | binary | the binary's reason is `r`. `r ∈ source-too-large, foreign-language-source, new-binary, file-too-large` |
 | `dep_reason: <r>` | dep | the dependency finding's reason is `r`. `r ∈ typosquat, nonexistent, brand-new` |
 | `maintainer_changed: true` | maintainer | the owner set changed vs. the prior stored release |
@@ -80,7 +83,7 @@ using a predicate outside its scope makes the rule invalid (and dropped).
 
 `bound_call` only counts a call when its receiver resolves, through the file's imports, to a dangerous
 origin. `os.system(...)` counts as `process`; `re.compile(...)` does **not** count as `exec`;
-`pickle.loads(...)` counts as `decode` but `json.loads(...)` does not. This binding is what keeps rules
+`pickle.loads(...)` and `codecs.decode(...)` count as `decode` but `json.loads(...)` and `bytes.decode()` do not. This binding is what keeps rules
 precise — you can write `bound_call: {category: exec}` without it firing on every `.compile()` in the
 ecosystem.
 
@@ -144,6 +147,17 @@ ecosystem.
     any:
       - bound_call: {category: [decode, exec, process, network, credential]}
       - blob_present: true
+```
+
+**6. Install-time strings in build files only** (`path_in` scopes a regex to named files):
+```yaml
+- id: py-install-code-dangerous
+  applies_to: code
+  weight: 60
+  match:
+    all:
+      - path_in: ["setup.py", "setup.cfg", "hatch_build.py", "*.pth"]
+      - regex: {pattern: "(?i)\\|\\s*(ba)?sh\\b|/dev/(tcp|udp)/"}
 ```
 
 ## Testing your rule
