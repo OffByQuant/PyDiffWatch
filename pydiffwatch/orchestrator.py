@@ -1,6 +1,7 @@
 import dataclasses, datetime, fcntl, http.client, json, logging, math, os, sqlite3, time, urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from . import ingest, fetcher, rules, notifier, store, reviewer, egress, dashboard, quarantine, sandbox
+from . import differ, facts
 from . import guard as guard_mod
 from .config import Config
 from .models import Verdict, NewRelease, FiredRule
@@ -577,6 +578,11 @@ def _process_fetched(cfg, conn, rvw, ruleset, rel, result, offline=False, guard=
         store.update_stage(conn, rid, "new_package_skipped")
         return True   # terminal: new packages are ignored under the skip policy
     d, tr, _ = scanned
+    skew = sum(1 for f in tr.fired_rules if f.rule == "syntax-newer-than-runtime")
+    if skew:        # spec D §3.3: the blind spot is logged, once per release, so it is measured, not assumed
+        logger.warning("%s==%s: %d file(s) use syntax newer than Python %d.%d (Requires-Python %s); not parsed, "
+                       "not scanned — run pydiffwatch on a newer Python", rel.package, rel.version, skew,
+                       *facts.RUNTIME, differ._esc(d.requires_python))
     try:
         store.update_stage(conn, rid, "diffed")
         store.update_stage(conn, rid, "triaged", tr.score,
