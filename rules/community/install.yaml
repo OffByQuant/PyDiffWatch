@@ -1,0 +1,11 @@
+# Install-time strings in build files and .pth lines (npm #28 analogue). pyproject.toml is not a build file here:
+# TOML never executes, and its task tables run only when a developer types a command (spec D decision 7).
+- id: py-install-code-dangerous
+  description: A build file or .pth adds a shell pipe, raw socket, base64 decode, cloud-metadata or OAST string.
+  applies_to: code
+  weight: 60
+  attack_type: install-hook
+  match:
+    all:
+      - path_in: ["setup.py", "setup.cfg", "hatch_build.py", "*.pth"]
+      - regex: {pattern: "(?i)\\|\\s*(ba)?sh\\b|/dev/(tcp|udp)/|base64\\s+(-d|--decode)|169\\.254\\.169\\.254|100\\.100\\.100\\.200|169\\.254\\.0\\.23|metadata\\.google\\.internal|metadata\\.tencentyun\\.com|nslookup |\\.oast\\.|oastify|burpcollaborator|interact\\.sh|dnslog"}
