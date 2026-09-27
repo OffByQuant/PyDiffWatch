@@ -340,3 +340,13 @@ def test_the_retry_backlog_leaves_the_last_poll_age_alone():
     out = dashboard.render_dashboard([], status={"last_poll_age": "2 minutes ago", "retry": {
         "retrying": 1, "gave_up": 0, "oldest_retrying_age": "3 hours ago"}})
     assert "last poll: 2 minutes ago" in out and "1 scan(s) retrying (oldest first seen 3 hours ago)" in out
+
+
+def test_reasoning_has_no_angle_brackets_so_it_pastes_into_pypis_report_form():
+    # PyPI's malware-report form rejects text that looks like an HTML tag, and model reasoning quotes
+    # paths like "/proc/<pid>/cmdline". The shown reasoning swaps < > for look-alike ‹ › so it pastes as is.
+    out = dashboard.render_dashboard([{"package": "evilpkg", "version": "1.0.0",
+                                       "classification": "malicious", "model": "qwen",
+                                       "reasoning": "reads /proc/<pid>/cmdline and a <b>tag</b> & more"}])
+    reason = re.search(r'<div class="reason">(.*?)</div>', out).group(1)
+    assert reason == "reads /proc/‹pid›/cmdline and a ‹b›tag‹/b› &amp; more"

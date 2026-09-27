@@ -112,7 +112,10 @@ def _card(row: dict) -> str:
                        f'target="_blank" rel="noopener noreferrer">Report malware on PyPI ↗</a>')
     reasoning = row.get("reasoning") or ""
     cited = row.get("cited_hunk") or ""
-    reason_html = f'<div class="reason">{e(reasoning)}</div>' if reasoning else ""
+    # PyPI's report form rejects anything tag-like ("/proc/<pid>/cmdline"), so < > show as look-alike ‹ ›
+    # and the reasoning pastes into it as is.
+    shown = reasoning.replace("<", "‹").replace(">", "›")
+    reason_html = f'<div class="reason">{e(shown)}</div>' if reasoning else ""
     cited_html = (f'<div class="cited"><span class="k">cited</span> {e(cited)}</div>'
                   if cited else "")
     human_html = ""
