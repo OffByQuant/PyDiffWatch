@@ -65,18 +65,30 @@ def test_package_metadata_has_a_size_cap(monkeypatch):
         fetcher._package_json("x", dataclasses.replace(Config(), max_metadata_bytes=1_000_000))
 
 
-def test_xmlrpc_calls_have_a_socket_timeout(monkeypatch):
-    seen = {}
+def test_index_requests_carry_the_socket_timeout(monkeypatch):
+    seen = []
 
-    class Proxy:
-        def __init__(self, url, transport=None, **k):
-            seen["timeout"] = getattr(transport, "timeout", None)
+    class _Resp:
+        status = 200
+        headers = {"X-PyPI-Last-Serial": "5"}
 
-        def changelog_since_serial(self, s):
-            return []
-    monkeypatch.setattr(ingest.xmlrpc.client, "ServerProxy", Proxy)
-    ingest.changes_since(dataclasses.replace(Config(), fetch_timeout_s=30.0), 1)
-    assert seen["timeout"] == 30.0
+        def read1(self, n=-1):
+            return b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def urlopen(req, timeout=None):
+        seen.append(timeout)
+        return _Resp()
+    monkeypatch.setattr(ingest.urllib.request, "urlopen", urlopen)
+    cfg = dataclasses.replace(Config(), fetch_timeout_s=17.0)
+    ingest._get(cfg, "https://pypi.org/simple/", {}, 1000, 30.0)
+    ingest._head_serial(cfg)
+    assert seen == [17.0, 17.0]
 
 
 def test_a_failed_changelog_call_is_logged_and_keeps_the_cursor(monkeypatch, caplog):
