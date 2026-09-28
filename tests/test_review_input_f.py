@@ -221,7 +221,7 @@ def test_shown_holds_the_rendered_lines_with_positions_and_scopes():
                                 TriageResult(40.0, [FiredRule("r", 40.0, "pkg/a.py", (4, 5))], True),
                                 max_chars=10_000, shown=shown)
     assert shown == {"pkg/a.py": {"cls": "runtime-call", "lines": {4: "    k = os.urandom(8)", 5: "    exec(k)"},
-                                  "scopes": {4: "run@3", 5: "run@3"}}}
+                                  "scopes": {4: "run@3", 5: "run@3"}, "strings": []}}
     assert reviewer.shown_from_json(reviewer.shown_to_json(shown)) == shown
 
 

@@ -525,15 +525,19 @@ def _endpoints(diff) -> list[str]:
     return out
 
 
-def _scopes(text) -> dict | None:
-    """{line: innermost enclosing def/class as "name@line", else "module"} from the new file's AST; None when it
-    does not parse (Connected then uses shared names only; R2-8)."""
+def _parse(text):
+    """The new file's AST, or None when it does not parse (text is None or a SyntaxError etc.)."""
     if text is None:
         return None
     try:
-        tree = ast.parse(text)
+        return ast.parse(text)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return None
+
+
+def _scopes(tree) -> dict:
+    """{line: innermost enclosing def/class as "name@line", else "module"} from the parsed AST (Connected then
+    uses shared names only when there is no tree; R2-8)."""
     out: dict[int, str] = {}
     stack = [tree]
     spans = []
@@ -549,17 +553,39 @@ def _scopes(text) -> dict | None:
     return out
 
 
+def _is_str(node) -> bool:
+    return isinstance(node, ast.JoinedStr) or (isinstance(node, ast.Constant) and isinstance(node.value, str))
+
+
+def _string_lines(tree) -> list:
+    """1-based line numbers lying inside a string constant (fix I3b): every line of a bare-string expression
+    statement (a docstring, a bare string, a doctest) in full, plus the interior lines (lineno+1..end_lineno) of
+    any other string constant that spans more than one line — its own first line still carries real code."""
+    out: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Expr) and _is_str(node.value):
+            v = node.value
+            out.update(range(v.lineno, (v.end_lineno or v.lineno) + 1))
+        elif _is_str(node) and (node.end_lineno or node.lineno) > node.lineno:
+            out.update(range(node.lineno + 1, node.end_lineno + 1))
+    return sorted(out)
+
+
 def _shown_entry(fd, cls, whole) -> dict:
     """The lines a rendered file put in front of the model (added lines, or every line of a whole-file render),
-    by new-file line number, with each line's scope when the file parses (spec F §3.2 `shown`)."""
+    by new-file line number, with each line's scope and whether it lies inside a string constant, when the file
+    parses (spec F §3.2 `shown`)."""
     if whole:
         lines = dict(enumerate(fd.new_text.splitlines(), 1))
     else:
         lines = {h.new_range[0] + 1 + k: t for h in fd.hunks for k, t in enumerate(h.added)}
     entry = {"cls": cls, "lines": lines}
-    scopes = _scopes(fd.new_text)
-    if scopes is not None:
+    tree = _parse(fd.new_text)
+    if tree is not None:
+        scopes = _scopes(tree)
         entry["scopes"] = {n: scopes.get(n, "module") for n in lines}
+        strings = set(_string_lines(tree))
+        entry["strings"] = sorted(n for n in lines if n in strings)
     return entry
 
 

@@ -9,8 +9,12 @@ QUOTE_MAX = 2_000
 
 _MODULE_SPAN = 50
 _PREFIX = re.compile(r"^(?:[+-](?=\s|$)|L?\d+:)")
+_AT_MARKER = re.compile(r"^@@[^@]*@@\s*")            # a sandwiched marker: strip it, keep any code after it (m8)
+_IMPORT_LINE = re.compile(r"^\s*(?:import\s|from\s+\S+\s+import\b)")
 _NOISE = {tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT, tokenize.ENDMARKER, tokenize.COMMENT}
 _NOT_NAMES = set(keyword.kwlist) | set(getattr(keyword, "softkwlist", [])) | set(dir(builtins))
+_FSTRING_START = getattr(tokenize, "FSTRING_START", None)
+_FSTRING_END = getattr(tokenize, "FSTRING_END", None)
 
 
 def _norm(s: str) -> str:
@@ -19,12 +23,20 @@ def _norm(s: str) -> str:
 
 def clean(quote) -> list:
     """A quote as (raw, prefix-stripped) normalised line pairs: blank lines, `...`, `@@` position lines and copied
-    file headings dropped (spec F §3.3 check 2). Both forms are tried, so a real `12: 'x'` line still matches."""
+    file headings dropped (spec F §3.3 check 2); a `@@ ... @@` marker sandwiched in front of real code has just the
+    marker stripped, not the whole line (fix m8). Both forms are tried, so a real `12: 'x'` line still matches."""
     out = []
     for ln in (quote if isinstance(quote, str) else "").split("\n"):
         s = ln.strip()
-        if not s or s in ("...", "…") or s.startswith(("@@", "--- file:")):
+        if not s or s in ("...", "…") or s.startswith("--- file:"):
             continue
+        if s.startswith("@@"):
+            m = _AT_MARKER.match(s)
+            if not m:
+                continue
+            s = s[m.end():].strip()
+            if not s:
+                continue
         out.append((_norm(s), _norm(_PREFIX.sub("", s, count=1))))
     return [pair for pair in out if pair[1]]
 
@@ -47,15 +59,35 @@ def _tokens(text: str) -> list:
     return [t for t in out if t.type not in _NOISE]
 
 
+def _collapse_fstrings(toks: list) -> list:
+    """Each FSTRING_START..FSTRING_END span collapsed to one synthetic STRING token (fix I3a): a line that is only
+    an f-string reads as only a string for `_live`, on Python 3.12+ where f-strings tokenize into parts. `_names`
+    does not use this — it still sees the real tokens, so names inside `{}` replacement fields still count."""
+    if _FSTRING_START is None:
+        return toks
+    out, depth = [], 0
+    for t in toks:
+        if t.type == _FSTRING_START:
+            if depth == 0:
+                out.append(t._replace(type=tokenize.STRING))
+            depth += 1
+        elif t.type == _FSTRING_END:
+            depth -= 1
+        elif depth == 0:
+            out.append(t)
+    return out
+
+
 def _live(text: str) -> bool:
     """Code, not only a comment or a string literal (check 3)."""
-    toks = _tokens(text)
+    toks = _collapse_fstrings(_tokens(text))
     return bool(toks) and not all(t.type == tokenize.STRING or t.string in (",", "(", ")") for t in toks)
 
 
 def _names(text: str) -> set:
     """Identifiers a line binds or reads (Ruling F3): keywords and builtins out; a name used only as a dotted
-    receiver (`os` in `os.getenv(...)`) out; names a `for` on the line binds out."""
+    receiver (`os` in `os.getenv(...)`) out; names a `for` on the line binds out; a keyword-argument NAME
+    (`timeout` in `f(timeout=5)`) out — its value still counts (fix I2)."""
     toks = _tokens(text)
     loop, bound = set(), False
     for t in toks:
@@ -66,13 +98,20 @@ def _names(text: str) -> set:
         elif bound and t.type == tokenize.NAME:
             loop.add(t.string)
     free: set = set()
+    depth = 0
     for i, t in enumerate(toks):
+        if t.string in ("(", "[", "{"):
+            depth += 1
+        elif t.string in (")", "]", "}"):
+            depth -= 1
         if t.type != tokenize.NAME or t.string in _NOT_NAMES or t.string in loop:
             continue
         if i and toks[i - 1].string == ".":
             continue                                          # an attribute, not a variable
         if i + 1 < len(toks) and toks[i + 1].string == ".":
             continue                                          # only a receiver here
+        if depth > 0 and i + 1 < len(toks) and toks[i + 1].string == "=":
+            continue                                          # a keyword-argument name, not a read
         free.add(t.string)
     return free
 
@@ -84,11 +123,12 @@ def _index(entry) -> dict:
     return idx
 
 
-def _hits(idx, pairs) -> list | None:
-    """Line numbers of every quoted line in one file, or None when some quoted line is not there."""
+def _hits(idx, pairs, strings) -> list | None:
+    """Line numbers of every quoted line in one file, or None when some quoted line is not there. A matched
+    occurrence whose line number lies inside a string constant does not count (fix I3b)."""
     out = []
     for raw, stripped in pairs:
-        found = idx.get(raw) or idx.get(stripped)
+        found = [n for n in (idx.get(raw) or idx.get(stripped) or []) if n not in strings]
         if not found:
             return None
         out.append(found)
@@ -96,16 +136,20 @@ def _hits(idx, pairs) -> list | None:
 
 
 def _bound(text: str) -> set:
-    """Names a line binds (plan review I6): targets before a top-level `=` / `:=` (not `==`, `<=`, ...), names
-    between `for` and `in`, and the name after `as`. Never a keyword, a builtin, or a dotted part."""
+    """Names a line binds (plan review I6): targets before a top-level `=` (not `==`, `<=`, ...), a `:=` at any
+    depth (fix m6 — a parenthesised walrus like `if (k := f()):` still binds `k`), names between `for` and `in`,
+    and the name after `as`. Never a keyword, a builtin, or a dotted part."""
     toks = _tokens(text)
     out, depth, eq = set(), 0, None
     for i, t in enumerate(toks):
-        if t.string in "([{":
+        if t.string in ("(", "[", "{"):
             depth += 1
-        elif t.string in ")]}":
+        elif t.string in (")", "]", "}"):
             depth -= 1
-        elif depth == 0 and t.type == tokenize.OP and t.string in ("=", ":="):
+        elif t.type == tokenize.OP and t.string == ":=":
+            eq = i
+            break
+        elif depth == 0 and t.type == tokenize.OP and t.string == "=":
             eq = i
             break
     names = lambda seq: {t.string for k, t in seq if t.type == tokenize.NAME and t.string not in _NOT_NAMES
@@ -130,13 +174,28 @@ def _near(a, b, scopes) -> bool:
     return sa is not None and sa == sb and (sa != "module" or abs(a - b) <= _MODULE_SPAN)
 
 
+def _anchors(hits, lines) -> list:
+    """Matched lines that can support Connected — its names and its position both (fix I1): live, not a bare
+    `import`/`from ... import` line, and carrying at least one name after `_names`'s exclusions. A quoted padding
+    line (`pass`, a lone `)`, a copied import line) adds neither a name nor a position."""
+    out = []
+    for n in {m for ns in hits for m in ns}:
+        text = lines.get(n, "")
+        if _live(text) and not _IMPORT_LINE.match(text) and _names(text):
+            out.append(n)
+    return out
+
+
 def _connected(src_hits, snk_hits, entry) -> bool:
     """Spec F §3.3 check 4 (user choice G1, plan review I6): (a) the ends share an identifier; or (b) a source line
     and a sink line are near (_near); or (c) ONE hop: a name bound on a source line is read on a shown, live line R
-    of the same file, and R is near some sink line (R may be the sink line). No hop without scopes; never two."""
+    of the same file, and R is near some sink line (R may be the sink line). No hop without scopes; never two.
+    Only anchor lines (fix I1) supply names or positions for (a)/(b); the hop's hit end is likewise anchor-only."""
     lines = entry.get("lines") or {}
-    src = [n for ns in src_hits for n in ns]
-    snk = [n for ns in snk_hits for n in ns]
+    src = _anchors(src_hits, lines)
+    snk = _anchors(snk_hits, lines)
+    if not src or not snk:
+        return False
     if set().union(*(_names(lines[n]) for n in src)) & set().union(*(_names(lines[n]) for n in snk)):
         return True
     scopes = entry.get("scopes")
@@ -151,27 +210,13 @@ def _connected(src_hits, snk_hits, entry) -> bool:
     return any(r == b or _near(r, b, scopes) for r in readers for b in snk)
 
 
-def gate(verdict, shown) -> str:
-    """Why a malicious verdict's chain does not stand, or "" when it does (spec F §3.3). Checks in order, the first
-    failure is the reason: Present, Found (one file), Live, Connected, Kind, Pair."""
-    if not cited(verdict):
-        return "no chain quoted (source and sink)"
-    src, snk = clean(verdict.chain_source), clean(verdict.chain_sink)
-    files = [(p, e, _index(e)) for p, e in (shown or {}).items() if isinstance(e, dict)]
-    src_in = [(p, e, idx, h) for p, e, idx in files if (h := _hits(idx, src)) is not None]
-    snk_in = {p: h for p, e, idx in files if (h := _hits(idx, snk)) is not None}
-    if not src_in:
-        return "source not found in the shown code"
-    if not snk_in:
-        return "sink not found in the shown code"
-    both = [(p, e, h) for p, e, _idx, h in src_in if p in snk_in]
-    if not both:
-        return "source and sink are in different files"
-    path, entry, src_hits = both[0]
-    snk_hits = snk_in[path]
+def _gate_file(verdict, path, entry, src_hits, snk_hits) -> str:
+    """Checks 3-6 for one candidate file (Live, Connected, Kind, Pair); "" when this file makes the chain stand."""
     cls = entry.get("cls")
     if cls == "not-shipped":
         return f"chain is in not-shipped code ({path})"
+    if cls == "inert":
+        return f"chain is in inert code ({path})"                # fix I4
     if cls in (None, "unknown"):
         return f"chain is in unclassified code ({path})"
     lines = entry.get("lines") or {}
@@ -183,6 +228,35 @@ def gate(verdict, shown) -> str:
         return "no dataflow shown between source and sink"
     return _kinds(verdict, [lines[n] for ns in src_hits for n in ns], [lines[n] for ns in snk_hits for n in ns],
                   lines)
+
+
+def gate(verdict, shown) -> str:
+    """Why a malicious verdict's chain does not stand, or "" when it does (spec F §3.3). Checks in order, the first
+    failure is the reason: Present, Found (one file), Live, Connected, Kind, Pair. Every candidate file (both ends
+    found there) is gated; the chain stands if any of them passes, else the first candidate's reason is returned
+    (fix I5)."""
+    if not cited(verdict):
+        return "no chain quoted (source and sink)"
+    src, snk = clean(verdict.chain_source), clean(verdict.chain_sink)
+    files = [(p, e, _index(e), set(e.get("strings") or [])) for p, e in (shown or {}).items()
+             if isinstance(e, dict)]
+    src_in = [(p, e, h) for p, e, idx, strings in files if (h := _hits(idx, src, strings)) is not None]
+    snk_in = {p: h for p, e, idx, strings in files if (h := _hits(idx, snk, strings)) is not None}
+    if not src_in:
+        return "source not found in the shown code"
+    if not snk_in:
+        return "sink not found in the shown code"
+    both = [(p, e, h) for p, e, h in src_in if p in snk_in]
+    if not both:
+        return "source and sink are in different files"
+    first_reason = None
+    for path, entry, src_hits in both:
+        reason = _gate_file(verdict, path, entry, src_hits, snk_in[path])
+        if reason == "":
+            return ""
+        if first_reason is None:
+            first_reason = reason
+    return first_reason
 
 
 def _kinds(verdict, src_lines, snk_lines, lines) -> str:
