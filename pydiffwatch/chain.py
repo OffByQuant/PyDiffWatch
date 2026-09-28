@@ -95,7 +95,8 @@ def _names(text: str) -> set:
     continuation line reads as depth 0 even when it is really inside a call opened on an earlier line; a NAME
     followed by `=` there is still a kwarg name when the line's own bracket balance is negative (it closes more
     than it opens — e.g. a lone `timeout=5)`), or when the NAME is the line's first token and the line ends with
-    `,` (e.g. a black-formatted `data=token,`) (fix R1)."""
+    `,` (e.g. a black-formatted `data=token,`) (fix R1) — but only when the line opens no bracket or the `=`
+    touches the NAME (kwarg spacing), so the binding `token = os.environ.get("K",` keeps `token` (fix F1)."""
     toks = _tokens(text)
     loop, bound = set(), False
     for t in toks:
@@ -120,7 +121,8 @@ def _names(text: str) -> set:
             continue                                          # an attribute, not a variable
         if i + 1 < len(toks) and toks[i + 1].string == ".":
             continue                                          # only a receiver here
-        if i + 1 < len(toks) and toks[i + 1].string == "=" and (depth > 0 or net < 0 or (ends_comma and i == 0)):
+        if i + 1 < len(toks) and toks[i + 1].string == "=" and (
+                depth > 0 or net < 0 or (ends_comma and i == 0 and (net <= 0 or toks[i + 1].start == t.end))):
             continue                                          # a keyword-argument name, not a read
         free.add(t.string)
     return free
@@ -213,7 +215,8 @@ def _anchors(hits, lines, tails) -> list:
 def _connected(src_hits, snk_hits, entry) -> bool:
     """Spec F §3.3 check 4 (user choice G1, plan review I6): (a) the ends share an identifier; or (b) a source line
     and a sink line are near (_near); or (c) ONE hop: a name bound on a source line is read on a shown, live line R
-    of the same file, and R is near some sink line (R may be the sink line). No hop without scopes; never two.
+    of the same file and not inside a string (fix F3), and R is near some sink line (R may be the sink line). No
+    hop without scopes; never two.
     Only anchor lines (fix I1) supply names or positions for (a)/(b); the hop's hit end is likewise anchor-only."""
     lines = entry.get("lines") or {}
     tails = entry.get("tails") or {}
@@ -232,7 +235,8 @@ def _connected(src_hits, snk_hits, entry) -> bool:
     bound = set().union(*(_bound(_text_at(n, lines, tails)) for n in src))
     if not bound:
         return False
-    readers = [r for r in lines if r not in src and _live(_text_at(r, lines, tails))
+    strings = set(entry.get("strings") or [])
+    readers = [r for r in lines if r not in src and r not in strings and _live(_text_at(r, lines, tails))
                and bound & _names(_text_at(r, lines, tails))]
     return any(r == b or _near(r, b, scopes) for r in readers for b in snk)
 

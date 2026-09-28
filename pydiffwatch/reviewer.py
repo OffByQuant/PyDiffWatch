@@ -4,6 +4,7 @@ pluggable backend (local Qwen by default, Claude optionally — see backends.py)
 forced structured-output contract. This module owns the prompt/schema/parsing only; all model I/O
 and network egress live in the backend, keeping the diff-handling code network-free (containment)."""
 import ast
+import bisect
 import json
 import logging
 import math
@@ -554,69 +555,94 @@ def _scopes(tree) -> dict:
 
 
 def _is_str(node) -> bool:
-    return isinstance(node, ast.JoinedStr) or (isinstance(node, ast.Constant) and isinstance(node.value, str))
+    return isinstance(node, ast.JoinedStr) or (isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)))
 
 
-def _byte_to_char(line: str, i: int) -> int:
-    """`i`, an ast column offset (UTF-8 BYTES), converted back to a character index into `line` (fix R2)."""
-    return len(line.encode("utf-8")[:i].decode("utf-8"))
+_AST_BREAK = re.compile(r"\r\n|\r|\n")      # the tokenizer's line breaks; str.splitlines also splits on \x0c etc.
 
 
-def _blank_outside(line: str, start_byte, end_byte) -> bool:
-    """True when the parts of `line` before `start_byte` and/or after `end_byte` hold nothing but whitespace or a
-    trailing `#` comment (fix R2). `None` skips that side's check (it is inside the string by construction)."""
-    def blank(s):
-        s = s.strip()
-        return not s or s.startswith("#")
+class _Positions:
+    """Maps between ast positions and the shown lines (fix F2). The shown lines — the differ's hunks, the whole-file
+    render and `lines` — are numbered by str.splitlines(), which also breaks on \x0b, \x0c, \x1c-\x1e, \x85,
+    \u2028 and \u2029; ast numbers lines by \r\n, \r and \n only. Both are reduced to absolute character offsets
+    into the text, so an ast position lands on the right shown line. Never raises on package-controlled text."""
 
-    left = line[:_byte_to_char(line, start_byte)] if start_byte is not None else ""
-    right = line[_byte_to_char(line, end_byte):] if end_byte is not None else ""
-    return blank(left) and blank(right)
+    def __init__(self, text: str):
+        self.text = text
+        self.ast_starts = [0] + [m.end() for m in _AST_BREAK.finditer(text)]
+        self.spans, pos = [], 0                          # (start, end) of each shown line, terminator excluded
+        for piece in text.splitlines(keepends=True):
+            self.spans.append((pos, pos + len(piece.splitlines()[0])))
+            pos += len(piece)
+        self.starts = [st for st, _ in self.spans]
+
+    def offset(self, lineno: int, byte_col: int) -> int:
+        """An ast (line, UTF-8 byte column) as an absolute character offset; a cut multibyte char is dropped."""
+        i = min(max(lineno, 1), len(self.ast_starts)) - 1
+        start = self.ast_starts[i]
+        end = self.ast_starts[i + 1] if i + 1 < len(self.ast_starts) else len(self.text)
+        return start + len(self.text[start:end].encode("utf-8")[:max(byte_col, 0)].decode("utf-8", errors="ignore"))
+
+    def shown_line(self, offset: int) -> int:
+        """The 1-based shown line holding `offset`."""
+        return max(bisect.bisect_right(self.starts, offset), 1)
+
+    def ast_line(self, n: int) -> int:
+        """The ast line on which shown line `n` starts."""
+        return bisect.bisect_right(self.ast_starts, self.spans[n - 1][0])
 
 
-def _string_lines(tree, source_lines) -> list:
-    """1-based line numbers whose every non-whitespace, non-comment character lies inside a string constant (fix
-    I3b, precision fix R2): the full span of a bare-string expression statement (a docstring, a bare string, a
-    doctest), the always-covered interior lines of any string spanning more than one line, and that span's first
-    (bare only) / last line only when nothing but the string (and maybe a comment) shares that physical line —
-    a line that also holds real code outside the string's span is dropped, even at a span's edge."""
+def _blank(s: str) -> bool:
+    s = s.strip()
+    return not s or s.startswith("#")
+
+
+def _string_nodes(tree):
+    """(node, bare) for each str/bytes constant or f-string that is not a part of an f-string (fix F3: on 3.12+
+    an f-string's inner constants carry real positions, and a string nested in a replacement field ends inside
+    the f-string); `bare` when it is a whole expression statement (a docstring, a bare string, a doctest)."""
+    nested = {id(c) for n in ast.walk(tree) if isinstance(n, ast.JoinedStr) for c in ast.walk(n) if c is not n}
+    bare = {id(n.value) for n in ast.walk(tree) if isinstance(n, ast.Expr) and _is_str(n.value)}
+    return [(n, id(n) in bare) for n in ast.walk(tree) if _is_str(n) and id(n) not in nested and n.end_lineno]
+
+
+def _string_lines(tree, pos) -> list:
+    """1-based shown line numbers whose every non-whitespace, non-comment character lies inside a string constant
+    (fix I3b, precision fix R2): the full span of a bare-string expression statement, the always-covered interior
+    lines of any string spanning more than one shown line, and that span's first (bare only) / last line only when
+    nothing but the string (and maybe a comment) shares that line — a line that also holds real code outside the
+    string's span is dropped, even at a span's edge."""
     out: set[int] = set()
-
-    def add_span(lineno, col, end_lineno, end_col, bare):
-        if lineno == end_lineno:
-            if bare and _blank_outside(source_lines[lineno - 1], col, end_col):
-                out.add(lineno)
-            return
-        if bare and _blank_outside(source_lines[lineno - 1], col, None):
-            out.add(lineno)
-        out.update(range(lineno + 1, end_lineno))            # interior lines: always fully inside the string
-        if _blank_outside(source_lines[end_lineno - 1], None, end_col):
-            out.add(end_lineno)
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Expr) and _is_str(node.value):
-            v = node.value
-            add_span(v.lineno, v.col_offset, v.end_lineno or v.lineno, v.end_col_offset, bare=True)
-        elif _is_str(node) and (node.end_lineno or node.lineno) > node.lineno:
-            add_span(node.lineno, node.col_offset, node.end_lineno, node.end_col_offset, bare=False)
+    text = pos.text
+    for node, bare in _string_nodes(tree):
+        o1, o2 = pos.offset(node.lineno, node.col_offset), pos.offset(node.end_lineno, node.end_col_offset)
+        first, last = pos.shown_line(o1), pos.shown_line(o2)
+        (s1, _), (_, e2) = pos.spans[first - 1], pos.spans[last - 1]
+        if first == last:
+            if bare and _blank(text[s1:o1]) and _blank(text[o2:e2]):
+                out.add(first)
+            continue
+        if bare and _blank(text[s1:o1]):
+            out.add(first)
+        out.update(range(first + 1, last))              # interior lines: always fully inside the string
+        if _blank(text[o2:e2]):
+            out.add(last)
     return sorted(out)
 
 
-def _string_tails(tree, source_lines) -> dict:
-    """{line: character column just after a multi-line string's end} for each line on which a multi-line str
-    Constant/JoinedStr ends AND real code (non-whitespace, non-comment) follows it (fix R3): chain.py tokenizes
-    only from that column on such a line, instead of the whole line, which in isolation reads as the tail of an
-    unterminated string (e.g. a closing `\"\"\"` followed by real code) and mis-tokenizes or loses tokens. When
-    more than one qualifying span ends on the same line, the rightmost (last-closing) one wins."""
+def _string_tails(tree, pos) -> dict:
+    """{shown line: character column just after a multi-line string's end} for each line on which a string
+    spanning more than one shown line ends AND real code (non-whitespace, non-comment) follows it (fix R3):
+    chain.py tokenizes only from that column on such a line, instead of the whole line, which in isolation reads
+    as the tail of an unterminated string (e.g. a closing `\"\"\"` followed by real code) and mis-tokenizes or
+    loses tokens. When more than one qualifying span ends on the same line, the rightmost (last-closing) one wins."""
     out: dict[int, int] = {}
-    for node in ast.walk(tree):
-        if not (_is_str(node) and node.end_lineno and node.end_lineno > node.lineno):
-            continue
-        line = source_lines[node.end_lineno - 1]
-        col = _byte_to_char(line, node.end_col_offset)
-        tail = line[col:].strip()
-        if tail and not tail.startswith("#"):
-            out[node.end_lineno] = max(col, out.get(node.end_lineno, -1))
+    for node, _ in _string_nodes(tree):
+        o1, o2 = pos.offset(node.lineno, node.col_offset), pos.offset(node.end_lineno, node.end_col_offset)
+        last = pos.shown_line(o2)
+        start, end = pos.spans[last - 1]
+        if last > pos.shown_line(o1) and not _blank(pos.text[o2:end]):
+            out[last] = max(o2 - start, out.get(last, -1))
     return out
 
 
@@ -624,7 +650,8 @@ def _shown_entry(fd, cls, whole) -> dict:
     """The lines a rendered file put in front of the model (added lines, or every line of a whole-file render),
     by new-file line number, with each line's scope, whether it lies inside a string constant, and (fix R3) a
     string-tail column for a line where a multi-line string ends mid-line with real code after it — when the
-    file parses (spec F §3.2 `shown`)."""
+    file parses (spec F §3.2 `shown`). Line numbers are the differ's str.splitlines() numbering throughout; ast
+    positions are mapped onto it (fix F2)."""
     if whole:
         lines = dict(enumerate(fd.new_text.splitlines(), 1))
     else:
@@ -632,12 +659,13 @@ def _shown_entry(fd, cls, whole) -> dict:
     entry = {"cls": cls, "lines": lines}
     tree = _parse(fd.new_text)
     if tree is not None:
-        source_lines = fd.new_text.splitlines()
+        pos = _Positions(fd.new_text)
         scopes = _scopes(tree)
-        entry["scopes"] = {n: scopes.get(n, "module") for n in lines}
-        strings = set(_string_lines(tree, source_lines))
+        entry["scopes"] = {n: scopes.get(pos.ast_line(n), "module") if n <= len(pos.spans) else "module"
+                           for n in lines}
+        strings = set(_string_lines(tree, pos))
         entry["strings"] = sorted(n for n in lines if n in strings)
-        tails = {n: c for n, c in _string_tails(tree, source_lines).items() if n in lines}
+        tails = {n: c for n, c in _string_tails(tree, pos).items() if n in lines}
         if tails:
             entry["tails"] = tails
     return entry
