@@ -1234,7 +1234,7 @@ def test_t1_a_multi_line_comprehension_filter_still_reads_the_outer_name():
 def test_t1_complocal_is_recorded_for_multi_line_comprehensions_and_round_trips():
     text = "def f(raw, ks):\n    out = [\n        t.strip()\n        for t in raw\n    ]\n    one = [k for k in ks]\n"
     entry = reviewer._shown_entry(FileDiff("a.py", "modified", [], text), "runtime-call", whole=True)
-    assert entry["complocal"] == {2: ["t"], 3: ["t"], 4: ["t"], 5: ["t"]}
+    assert entry["complocal"] == {3: ["t"], 4: ["t"]}      # only lines that write the target (N1)
     shown = {"a.py": entry}
     assert reviewer.shown_from_json(reviewer.shown_to_json(shown)) == shown
     bad = reviewer._shown_entry(FileDiff("a.py", "modified", [], "def (:\n" + text), "runtime-call", whole=True)
@@ -1280,3 +1280,28 @@ def test_t2_nested_spans_are_not_rescanned(line):
 def test_t3_t5_reads(line, read, not_read):
     got = chain._reads(line)
     assert read <= got and not (got & not_read), got
+
+
+# ---- Controller fix after Task 8 round 5 (breaker; rulings N1-N2) ----
+
+def test_complocal_is_linear_in_a_comprehension_with_thousands_of_targets():
+    # N1: every spanned line used to get every target name (K x L): 12k targets took 6 GB.
+    k = 12_000
+    text = "r = [0 for (\n" + "".join(f" a{i},\n" for i in range(k)) + ") in y]\n"
+    t0 = time.perf_counter()
+    entry = reviewer._shown_entry(FileDiff("a.py", "modified", [], text), "runtime-call", whole=True)
+    assert time.perf_counter() - t0 < 3.0
+    assert sum(len(v) for v in entry["complocal"].values()) <= 2 * k
+
+
+def test_complocal_keeps_only_target_names_that_occur_on_the_line():
+    text = "out = [\n    token.strip()\n    for token in raw\n    if keep\n]\n"
+    entry = reviewer._shown_entry(FileDiff("a.py", "modified", [], text), "runtime-call", whole=True)
+    assert entry["complocal"] == {2: ["token"], 3: ["token"]}
+
+
+@pytest.mark.parametrize("line", ["mk = lambda token: lambda b: token(b)",
+                                  "f = lambda token: token if token else lambda: token"])
+def test_a_nested_lambda_colon_does_not_end_the_outer_lambda(line):
+    # N2
+    assert "token" not in chain._reads(line)

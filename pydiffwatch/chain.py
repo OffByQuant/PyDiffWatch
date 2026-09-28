@@ -406,7 +406,8 @@ def _stmt_reads(line, a, b, cont, out) -> None:
             o, w, d = ops[i], nm[i], depths[i]
             while stack and (
                     (stack[-1][0] == "lam" and (d < stack[-1][2] or (d == stack[-1][2] and (
-                        o in (",", ":", ";") or w in ("for", "async")))))
+                        o in (",", ";") or (o == ":" and i not in lams)   # a nested lambda's `:` is not ours (N2)
+                        or w in ("for", "async")))))
                     or (stack[-1][0] == "comp" and stack[-1][2] <= i)):
                 pop()
             if i in first_in and first_in[i] in by_opener:

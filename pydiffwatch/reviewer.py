@@ -693,21 +693,33 @@ def _field_code(tree, pos) -> dict:
     return {n: " ".join(seg for _, seg in sorted(segs)) for n, segs in out.items()}
 
 
-def _comp_locals(tree, pos) -> dict:
-    """{shown line: the names a comprehension's own `for` targets bind} for every shown line a ListComp, SetComp,
-    DictComp or GeneratorExp spanning more than one shown line covers (T1): a black-formatted element line such as
-    `token.strip()` reads the comprehension's `token`, not an outer one. A one-line comprehension is left to
-    chain's position-aware lexical reading."""
+_IDENT = re.compile(r"[^\W\d]\w*")
+
+
+def _comp_locals(tree, pos, lines) -> dict:
+    """{shown line: the names a comprehension's own `for` targets bind that occur on that line} for every line in
+    `lines` a ListComp, SetComp, DictComp or GeneratorExp spanning more than one shown line covers (T1): a
+    black-formatted element line such as `token.strip()` reads the comprehension's `token`, not an outer one. A
+    one-line comprehension is left to chain's position-aware lexical reading. Each line keeps only the target
+    names written on it, so the result is bounded by the lines' own length, never targets x lines (fix N1: a
+    12k-target comprehension used to take 6 GB)."""
     out: dict = {}
+    idents: dict = {}
     for node in ast.walk(tree):
         if not isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)) or not node.end_lineno:
             continue
-        names = {t.id for g in node.generators for t in ast.walk(g.target) if isinstance(t, ast.Name)}
         first = pos.shown_line(pos.offset(node.lineno, node.col_offset))
         last = pos.shown_line(pos.offset(node.end_lineno, node.end_col_offset))
-        if names and last > first:
-            for n in range(first, last + 1):
-                out.setdefault(n, set()).update(names)
+        if last <= first:
+            continue
+        names = {t.id for g in node.generators for t in ast.walk(g.target) if isinstance(t, ast.Name)}
+        for n in range(first, last + 1):
+            if n not in lines:
+                continue
+            if n not in idents:
+                idents[n] = set(_IDENT.findall(lines[n]))
+            if hit := idents[n] & names:
+                out.setdefault(n, set()).update(hit)
     return out
 
 
@@ -736,7 +748,7 @@ def _shown_entry(fd, cls, whole) -> dict:
         tails = {n: c for n, c in _string_tails(tree, pos).items() if n in lines}
         if tails:
             entry["tails"] = tails
-        if local := {n: sorted(v) for n, v in _comp_locals(tree, pos).items() if n in lines}:
+        if local := {n: sorted(v) for n, v in _comp_locals(tree, pos, lines).items()}:
             entry["complocal"] = local                  # names local to a multi-line comprehension (T1)
     return entry
 
