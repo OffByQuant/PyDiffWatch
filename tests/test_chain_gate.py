@@ -1305,3 +1305,8 @@ def test_complocal_keeps_only_target_names_that_occur_on_the_line():
 def test_a_nested_lambda_colon_does_not_end_the_outer_lambda(line):
     # N2
     assert "token" not in chain._reads(line)
+
+
+def test_tokens_never_raises_on_a_line_the_c_tokenizer_cannot_decode():
+    # Task 10 fix J1: a "\r" before a U+2028 made tokenize raise UnicodeDecodeError out of the gate
+    chain._tokens(")\r f'{x")

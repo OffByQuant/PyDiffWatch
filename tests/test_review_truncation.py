@@ -42,7 +42,7 @@ def _partial_review_alert_count(conn):
     return conn.execute("SELECT COUNT(*) FROM alerts WHERE dedupe_key LIKE '%|partial-review'").fetchone()[0]
 
 
-def test_truncated_input_with_dropped_weighted_file_goes_to_adjudication(tmp_path):
+def test_truncated_input_with_dropped_weighted_file_is_reviewed_partially(tmp_path):
     small = FileDiff("setup.py", "modified", [Hunk((0, 0), (0, 1), ["os.system('id')"], [])])
     big = FileDiff("big.py", "modified", [Hunk((0, 0), (0, 1), ["X" * 3000], [])])
     d = Diff("p", "1.0", False, [small, big], [])
@@ -112,7 +112,7 @@ def _cfg_like(tmp_path, other_cfg, max_input_chars):
                  reviewer=ReviewerConfig(max_input_chars=max_input_chars))
 
 
-def test_offline_park_then_auto_drain_still_adjudicates_partial_review(tmp_path):
+def test_offline_park_then_auto_drain_still_records_a_partial_review(tmp_path):
     small = FileDiff("setup.py", "modified", [Hunk((0, 0), (0, 1), ["os.system('id')"], [])])
     big = FileDiff("big.py", "modified", [Hunk((0, 0), (0, 1), ["X" * 3000], [])])
     d = Diff("p", "1.0", False, [small, big], [])
@@ -139,7 +139,7 @@ def test_offline_park_then_auto_drain_still_adjudicates_partial_review(tmp_path)
     assert _alert_count(conn) == 0
 
 
-def test_too_large_park_then_review_pending_still_adjudicates_partial_review(tmp_path):
+def test_too_large_park_then_review_pending_still_records_a_partial_review(tmp_path):
     # big.py (top-ranked by weight) alone exceeds the cap -> InputTooLarge -> parked "too_large" with
     # stored text built just wide enough for big.py; setup.py never made it in.
     small = FileDiff("setup.py", "modified", [Hunk((0, 0), (0, 1), ["Y" * 300], [])])
@@ -208,7 +208,7 @@ def test_drain_path_does_not_flag_non_file_rules_as_dropped(tmp_path):
     be2 = _FakeBackend([_benign_json()])
     orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=be2), auto=True)
 
-    assert store.get_stage(conn, "p", "1.0") == "reviewed"     # not needs_adjudication
+    assert store.get_stage(conn, "p", "1.0") == "reviewed"     # not reviewed_partial
     row = conn.execute("SELECT reasoning FROM verdicts WHERE release_id=?", (rid,)).fetchone()
     assert "reviewed partially" not in (row["reasoning"] or "")
 

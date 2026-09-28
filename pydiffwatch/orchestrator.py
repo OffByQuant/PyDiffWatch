@@ -98,7 +98,12 @@ def _record(cfg, conn, rid, verdict, score, dropped=(), *, unreadable=(), shown=
         store.update_stage(conn, rid, "reviewed_partial", score, None)    # -> `pydiffwatch pending`, no alert
         return
     if verdict.classification == "malicious":
-        weak = chain.gate(verdict, shown) or _weak_malicious(cfg, verdict)
+        try:
+            weak = chain.gate(verdict, shown)
+        except Exception as e:   # a gate bug downgrades; it never loses the model's verdict or the stored input
+            logger.exception("chain gate raised for %s==%s", verdict.package, verdict.version)
+            weak = f"gate error ({type(e).__name__})"
+        weak = weak or _weak_malicious(cfg, verdict)
         verdict = dataclasses.replace(verdict, gate=weak)
         if weak:
             # spec decision 2 / F decision 10: weak evidence never alerts as malicious. It is recorded and alerted as
@@ -146,9 +151,10 @@ def _attempt_review(cfg, conn, rvw, rid, package, version, score, fired_rules, t
                     dropped=(), unreadable=(), shown=None) -> bool:
     """One review attempt; on failure the release is (re)parked with the reason. Returns False when no more
     reviews should be sent now (endpoint unreachable, guard deferring, or the guard's breaker just opened),
-    so a drain stops instead of hammering the server. `dropped`: weighted files this text's cap dropped
-    (spec U2), carried through to _record — from `rvw.dropped_files` on a fresh review, or recovered
-    from the stored text via reviewer.dropped_from_text() when drain_pending re-drives a parked row."""
+    so a drain stops instead of hammering the server. `dropped` (selected files this text did not show),
+    `unreadable` (changed files that could not be shown as text) and `shown` (the lines the model saw, for the
+    chain gate) are carried through to _record (spec U2, F §3.4) — from the reviewer on a fresh review, or from
+    the stored input (review_shown, not_seen_from_text; dropped_from_text for a pre-F input) on a drain."""
     if guard is not None:
         why = guard.admit()
         if why:

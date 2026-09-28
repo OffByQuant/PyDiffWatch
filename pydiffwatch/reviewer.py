@@ -808,13 +808,18 @@ def not_seen_from_text(text: str):
     def block(heading, split):
         if heading not in lines:
             return []
-        out = []
+        out, clipped = [], False
         for ln in lines[lines.index(heading) + 1:]:
             if not ln.startswith("  "):
                 break
             if not ln.startswith("  … (+") and not ln.startswith("  not readable: … (+"):
-                out.append(ln[2:].rsplit(split, 1)[0])
-        return out
+                name = ln[2:].rsplit(split, 1)[0]
+                if name.endswith("…"):      # cut by the block cap: not a path (Task 10 fix J2)
+                    clipped = True
+                else:
+                    out.append(name)
+        # every name cut: the block still says files went unseen, so a benign verdict stays partial
+        return out or (["(file names clipped)"] if clipped else [])
     return block(_NOT_SHOWN_HEADING, " ("), block(_UNREADABLE_HEADING, ": ")
 
 

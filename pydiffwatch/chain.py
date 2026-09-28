@@ -59,8 +59,8 @@ def _tokens(text: str) -> list:
     try:
         for t in tokenize.generate_tokens(io.StringIO(text.strip() + "\n").readline):
             out.append(t)
-    except (tokenize.TokenError, IndentationError, SyntaxError):
-        pass
+    except (tokenize.TokenError, IndentationError, SyntaxError, UnicodeDecodeError, ValueError):
+        pass   # UnicodeDecodeError: e.g. a "\r" before a U+2028 (Task 10 fix J1)
     return [t for t in out if t.type not in _NOISE]
 
 

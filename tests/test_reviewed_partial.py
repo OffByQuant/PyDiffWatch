@@ -234,3 +234,61 @@ def test_pending_lists_a_partial_review(tmp_path, monkeypatch, capsys):
     store.update_evidence(conn, rid, "package: p\n+ exec(x)")          # stored evidence: list_pending fetches nothing
     [item] = orchestrator.list_pending(_cfg(tmp_path))
     assert item["partial"] is True and item["not_scanned"] is None
+
+
+# ---- Task 10 fix round 1 ----
+
+def _gate_raises(monkeypatch):
+    def boom(v, s):
+        raise RuntimeError("bug")
+    monkeypatch.setattr(orchestrator.chain, "gate", boom)
+
+
+def _downgraded_by_the_error(conn):
+    assert [r[0] for r in conn.execute("SELECT dedupe_key FROM alerts")] == ["p|1|suspicious|downgraded"]
+    assert tuple(conn.execute("SELECT classification, gate, chain_sink FROM verdicts").fetchone()) == (
+        "suspicious", "gate error (RuntimeError)", chains.SINK)
+    assert _stage(conn) == "needs_adjudication" and store.pending_reviews(conn) == []
+
+
+def test_a_gate_error_on_the_review_path_downgrades(tmp_path, monkeypatch):
+    # J1: a raising gate never loses the model's verdict or the stored input
+    conn = _conn(tmp_path)
+    rid = _rid(conn)
+    _gate_raises(monkeypatch)
+    tr = TriageResult(40.0, [FiredRule("r", 40.0, "setup.py", (3, 4))], True)
+    cfg = _cfg(tmp_path)
+    orchestrator._review_escalated(cfg, conn, reviewer.Reviewer(cfg, backend=_Backend([_json("malicious", **chains.JSON_FIELDS)])),
+                                   Diff("p", "1", False, [chains.FILE], []), tr, rid)
+    _downgraded_by_the_error(conn)
+
+
+def test_a_gate_error_on_the_drain_downgrades_and_leaves_the_queue(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    rid = _rid(conn)
+    tr = TriageResult(40.0, [FiredRule("r", 40.0, "setup.py", (3, 4))], True)
+    store.update_stage(conn, rid, "triaged", tr.score, json.dumps([r.__dict__ for r in tr.fired_rules]))
+    cfg = _cfg(tmp_path)
+    orchestrator._review_escalated(cfg, conn, reviewer.Reviewer(cfg, backend=_Backend([])),
+                                   Diff("p", "1", False, [chains.FILE], []), tr, rid, offline=True)
+    _gate_raises(monkeypatch)
+    for _ in range(3):      # later drains find nothing queued, and never raise on a wiped row
+        orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(
+            cfg, backend=_Backend([_json("malicious", **chains.JSON_FIELDS)])), auto=True)
+    _downgraded_by_the_error(conn)
+
+
+def test_a_clipped_not_shown_block_yields_only_full_names():
+    # J2: a name cut by the block cap ('…') is not a path
+    paths = ["a.py"] + [f"pkg/very/long/module_name_{i:03d}.py" for i in range(39)]
+    block = reviewer._render_block(reviewer._NOT_SHOWN_HEADING, "\n".join(p + " (runtime)" for p in paths), 1_200)
+    names, _ = reviewer.not_seen_from_text(block)
+    assert "a.py" in names and not any(n.endswith("…") for n in names)
+
+
+def test_a_block_whose_every_name_is_clipped_still_says_files_were_not_shown():
+    # J2 guard: dropping clipped names must never make a drained benign verdict look fully seen
+    paths = [f"pkg/very/long/module_name_{i:03d}.py" for i in range(40)]
+    block = reviewer._render_block(reviewer._NOT_SHOWN_HEADING, "\n".join(p + " (runtime)" for p in paths), 1_200)
+    names, _ = reviewer.not_seen_from_text(block)
+    assert names == ["(file names clipped)"]
