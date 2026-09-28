@@ -11,6 +11,7 @@ from pydiffwatch import dashboard, execctx, orchestrator, reviewer, store
 from pydiffwatch.backends import ReviewUnavailable, validate_verdict
 from pydiffwatch.config import Config, ReviewerConfig, load_config
 from pydiffwatch.models import Diff, FileDiff, FiredRule, Hunk, TriageResult, Verdict
+from tests.fixtures import chains
 
 RUNS_WHEN = ["build", "startup", "import", "user-command", "plugin-host", "runtime-call", "not-shipped", "unknown"]
 
@@ -34,6 +35,12 @@ def _diff():
 
 def _triage():
     return TriageResult(60.0, [FiredRule("combo:fetch+exec", 45.0, "setup.py", (1, 3))], True)
+
+
+def _chain_diff():
+    """The diff and triage of a chain the gate passes (spec F §3.3), for a malicious verdict that must stand."""
+    return (Diff("evilpkg", "1.3.0", False, [chains.FILE], []),
+            TriageResult(60.0, [FiredRule("combo:fetch+exec", 45.0, "setup.py", (3, 4))], True))
 
 
 def _review(d):
@@ -133,7 +140,8 @@ def _setup(tmp_path, **rv):
 def _verdict(runs_when="build", confidence=0.95):
     return Verdict("evilpkg", "1.3.0", "malicious", 60.0, [FiredRule("combo", 45.0, "setup.py", (1, 3))], True,
                    confidence=confidence, attack_type="install-hook-rce", reasoning="fetch+exec in setup.py",
-                   cited_hunk="setup.py:1-3", recommended_action="report-to-pypi", model="m", runs_when=runs_when)
+                   cited_hunk="setup.py:1-3", recommended_action="report-to-pypi", model="m",
+                   **dict(chains.FIELDS, runs_when=runs_when))
 
 
 def _alerts(conn):
@@ -145,11 +153,10 @@ def _row(conn, rid):
                         (rid,)).fetchone()
 
 
-@pytest.mark.parametrize("runs_when, confidence", [("build", 0.95), ("unknown", 0.95), ("import", 0.8),
-                                                   ("startup", 1.0)])
+@pytest.mark.parametrize("runs_when, confidence", [("build", 0.95), ("import", 0.8), ("startup", 1.0)])
 def test_a_strong_malicious_alerts_as_malicious(tmp_path, runs_when, confidence):
     cfg, conn, rid = _setup(tmp_path)
-    orchestrator._record(cfg, conn, rid, _verdict(runs_when, confidence), 60.0)
+    orchestrator._record(cfg, conn, rid, _verdict(runs_when, confidence), 60.0, shown=chains.SHOWN)
     assert [a["classification"] for a in _alerts(conn)] == ["malicious"]
     assert _row(conn, rid)["classification"] == "malicious"
     assert store.get_stage(conn, "evilpkg", "1.3.0") == "reviewed"
@@ -159,11 +166,12 @@ def test_a_strong_malicious_alerts_as_malicious(tmp_path, runs_when, confidence)
     ("user-command", 0.95, "runs_when=user-command"),
     ("not-shipped", 1.0, "runs_when=not-shipped"),
     ("build", 0.79, "confidence 0.79 < 0.8"),
-    ("unknown", None, "no confidence"),
+    ("build", None, "no confidence"),
+    ("unknown", 0.95, "runs_when=unknown"),              # spec F decision 9: unknown is weak
 ])
 def test_a_weak_malicious_is_downgraded_to_suspicious_for_manual_review(tmp_path, runs_when, confidence, why):
     cfg, conn, rid = _setup(tmp_path)
-    orchestrator._record(cfg, conn, rid, _verdict(runs_when, confidence), 60.0)
+    orchestrator._record(cfg, conn, rid, _verdict(runs_when, confidence), 60.0, shown=chains.SHOWN)
     alerts = _alerts(conn)
     assert [a["classification"] for a in alerts] == ["suspicious"]           # never alerts as malicious
     row = _row(conn, rid)
@@ -212,7 +220,7 @@ def test_prune_keeps_a_downgraded_verdict_and_its_evidence(tmp_path):
 
 def test_the_threshold_is_configurable(tmp_path):
     cfg, conn, rid = _setup(tmp_path, malicious_min_confidence=0.5)
-    orchestrator._record(cfg, conn, rid, _verdict("build", 0.6), 60.0)
+    orchestrator._record(cfg, conn, rid, _verdict("build", 0.6), 60.0, shown=chains.SHOWN)
     assert [a["classification"] for a in _alerts(conn)] == ["malicious"]
 
 
@@ -297,9 +305,9 @@ def test_a_list_or_dict_value_falls_back_to_the_default(key, bad):
 
 def test_a_non_string_value_on_a_malicious_verdict_still_alerts(tmp_path):
     cfg, conn, rid = _setup(tmp_path)
-    d = _full(attack_type=["dropper"], recommended_action={"x": 1})
+    d = _full(attack_type=["dropper"], recommended_action={"x": 1}, **chains.JSON_FIELDS)
     rvw = reviewer.Reviewer(cfg, backend=_FakeBackend([json.dumps(d)]))
-    orchestrator._review_escalated(cfg, conn, rvw, _diff(), _triage(), rid)
+    orchestrator._review_escalated(cfg, conn, rvw, *_chain_diff(), rid)
     assert [a["classification"] for a in _alerts(conn)] == ["malicious"]
 
 
@@ -335,8 +343,8 @@ def test_an_explicit_null_takes_the_default(key):
 
 def test_a_malicious_verdict_with_null_reasoning_alerts_with_the_model_lines(tmp_path, capsys):
     cfg, conn, rid = _setup(tmp_path)
-    rvw = reviewer.Reviewer(cfg, backend=_FakeBackend([json.dumps(_full(reasoning=None))]))
-    orchestrator._review_escalated(cfg, conn, rvw, _diff(), _triage(), rid)
+    rvw = reviewer.Reviewer(cfg, backend=_FakeBackend([json.dumps(_full(reasoning=None, **chains.JSON_FIELDS))]))
+    orchestrator._review_escalated(cfg, conn, rvw, *_chain_diff(), rid)
     out = capsys.readouterr().out
     assert "[DIFFWATCH] malicious" in out and "attack=install-hook-rce" in out and "model=m" in out
 

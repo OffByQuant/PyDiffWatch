@@ -1,7 +1,7 @@
-"""spec U2: a benign verdict on truncated review input is not final. If the input cap dropped a file
-that carried fired-rule weight, the model never saw it — the release goes to needs_adjudication with
-"reviewed partially: <files> not shown" instead of being saved silently. It sends no alert: it waits in `pending`
-for a person (spec B §3.1)."""
+"""spec U2, F §3.4: a benign verdict on truncated review input is not final. If the input cap dropped a file
+that carried fired-rule weight, the model never saw it — the release goes to reviewed_partial with
+"reviewed partially: <files> not shown or unreadable" instead of being saved silently. It sends no alert: it waits
+in `pending` for a person (spec B §3.1)."""
 import json
 from pydiffwatch.config import Config, ReviewerConfig
 from pydiffwatch import store, orchestrator, reviewer
@@ -53,7 +53,7 @@ def test_truncated_input_with_dropped_weighted_file_goes_to_adjudication(tmp_pat
 
     orchestrator._review_escalated(cfg, conn, rvw, d, tr, rid)
 
-    assert store.get_stage(conn, "p", "1.0") == "needs_adjudication"
+    assert store.get_stage(conn, "p", "1.0") == "reviewed_partial"
     row = conn.execute("SELECT classification, reasoning FROM verdicts WHERE release_id=?", (rid,)).fetchone()
     assert row["classification"] == "benign"                 # the model's actual verdict is kept
     assert "reviewed partially" in row["reasoning"] and "big.py" in row["reasoning"]
@@ -102,7 +102,7 @@ def test_second_record_of_same_release_does_not_re_alert(tmp_path):
     assert _alert_count(conn) == 0
     orchestrator._record(cfg, conn, rid, v, 50.0, dropped=["big.py"])   # e.g. a re-drain of the same row
     assert _alert_count(conn) == 0
-    assert store.get_stage(conn, "p", "1.0") == "needs_adjudication"
+    assert store.get_stage(conn, "p", "1.0") == "reviewed_partial"
 
 
 # --- drain-path recovery: the dropped-weighted-files info survives a park/re-drain round trip ---
@@ -129,7 +129,7 @@ def test_offline_park_then_auto_drain_still_adjudicates_partial_review(tmp_path)
     be2 = _FakeBackend([_benign_json()])
     orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=be2), auto=True)
 
-    assert store.get_stage(conn, "p", "1.0") == "needs_adjudication"
+    assert store.get_stage(conn, "p", "1.0") == "reviewed_partial"
     row = conn.execute("SELECT classification, reasoning FROM verdicts WHERE release_id=?", (rid,)).fetchone()
     assert row["classification"] == "benign"
     assert "reviewed partially" in row["reasoning"] and "big.py" in row["reasoning"]
@@ -159,7 +159,7 @@ def test_too_large_park_then_review_pending_still_adjudicates_partial_review(tmp
     be2 = _FakeBackend([_benign_json()])
     orchestrator.drain_pending(bigger, conn, reviewer.Reviewer(bigger, backend=be2), auto=False)
 
-    assert store.get_stage(conn, "p", "1.0") == "needs_adjudication"
+    assert store.get_stage(conn, "p", "1.0") == "reviewed_partial"
     row = conn.execute("SELECT classification, reasoning FROM verdicts WHERE release_id=?", (rid,)).fetchone()
     assert row["classification"] == "benign"
     assert "reviewed partially" in row["reasoning"] and "setup.py" in row["reasoning"]

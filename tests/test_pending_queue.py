@@ -16,6 +16,7 @@ from pathlib import Path
 from pydiffwatch import ingest, orchestrator, reviewer, store
 from pydiffwatch.config import Config
 from pydiffwatch.models import ArtifactSet, Diff, FileDiff, FiredRule, Hunk, NewRelease, TriageResult
+from tests.fixtures import chains
 
 _OK = ('{"classification":"benign","confidence":0.9,"urgent":false,"recommended_action":"monitor",'
        '"attack_type":"none","cited_hunk":"","reasoning":"looked at it"}')
@@ -248,15 +249,18 @@ def test_the_auto_drain_neither_selects_exhausted_rows_nor_loads_input_it_does_n
 
 def test_a_weak_malicious_verdict_from_the_review_queue_is_downgraded_with_one_alert(tmp_path):
     cfg, conn, rid, rvw = _setup(tmp_path, _Backend())
+    # a chain the gate passes (spec F §3.3), so the downgrade is the weak runs_when alone
+    t = TriageResult(score=60.0, escalate=True, fired_rules=[FiredRule("primitives", 60.0, "setup.py", (3, 4))])
+    d = dataclasses.replace(_diff(), changed=[chains.FILE])
     # as process_release does before a review
-    store.update_stage(conn, rid, "triaged", _T.score, json.dumps([r.__dict__ for r in _T.fired_rules]))
-    orchestrator._review_escalated(cfg, conn, rvw, _diff(), _T, rid, offline=True)
+    store.update_stage(conn, rid, "triaged", t.score, json.dumps([r.__dict__ for r in t.fired_rules]))
+    orchestrator._review_escalated(cfg, conn, rvw, d, t, rid, offline=True)
     parked = conn.execute("SELECT count(*) FROM alerts").fetchone()[0]         # a park sends no alert
     assert parked == 0
     be = _Backend()
-    be.complete = lambda **kw: be.calls.append(kw) or (
-        '{"runs_when":"user-command","classification":"malicious","confidence":0.95,"urgent":true,'
-        '"recommended_action":"report-to-pypi","attack_type":"x","cited_hunk":"pkg/a.py:1-1","reasoning":"r"}')
+    be.complete = lambda **kw: be.calls.append(kw) or json.dumps(dict(
+        chains.JSON_FIELDS, runs_when="user-command", classification="malicious", confidence=0.95, urgent=True,
+        recommended_action="report-to-pypi", attack_type="x", cited_hunk="setup.py:3-4", reasoning="r"))
     orchestrator.drain_pending(cfg, conn, reviewer.Reviewer(cfg, backend=be), auto=True)
     assert len(be.calls) == 1 and _pending(conn) == {}
     assert store.get_stage(conn, "pkg", "1.0.0") == "needs_adjudication"

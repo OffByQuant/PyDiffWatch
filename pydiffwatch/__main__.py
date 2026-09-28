@@ -186,7 +186,8 @@ def _dispatch(args, cfg):
         print(f"[pydiffwatch] {len(items)} release(s) awaiting adjudication:\n")
         for it in items:
             why = (f"not scanned: {it['not_scanned']}" if it["not_scanned"] else
-                   f"model: {it['classification']} conf={it['confidence']} attack={it['attack_type']}")
+                   ("reviewed partially; " if it.get("partial") else "")
+                   + f"model: {it['classification']} conf={it['confidence']} attack={it['attack_type']}")
             print(f"=== release_id={it['release_id']}  {it['package']}=={it['version']}  ({why}) ===")
             print(f"  {'reason' if it['not_scanned'] else 'model reason'}: {it['reasoning']}")
             print(f"  cited_hunk: {it['cited_hunk']}")

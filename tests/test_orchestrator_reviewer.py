@@ -3,6 +3,7 @@ import pytest
 from pydiffwatch.config import Config, ReviewerConfig
 from pydiffwatch import store, orchestrator, reviewer
 from pydiffwatch.models import Diff, FileDiff, Hunk, FiredRule, TriageResult, Verdict, ArtifactSet, NewRelease
+from tests.fixtures import chains
 
 _HAS_ANTHROPIC = importlib.util.find_spec("anthropic") is not None
 
@@ -19,7 +20,7 @@ def _triage_obj():
 def _malicious_verdict(model="claude-sonnet-4-6"):
     return Verdict("p", "1.0", "malicious", 80.0, [], True, confidence=0.95,
                    attack_type="install-hook-rce", reasoning="r", cited_hunk="setup.py:1-3",
-                   recommended_action="report-to-pypi", model=model)
+                   recommended_action="report-to-pypi", model=model, **chains.FIELDS)
 
 
 def test_escalate_success_persists_verdict_and_marks_reviewed(tmp_path):
@@ -28,6 +29,7 @@ def test_escalate_success_persists_verdict_and_marks_reviewed(tmp_path):
     rid = store.record_release(conn, "p", "1.0", 1, False, "0.9", "sdist")
 
     class _R:
+        shown = chains.SHOWN      # the lines prepare() showed the model: the gate checks the quoted chain in them
         def prepare(self, diff, triage, cap=None): return ""
         def review_text(self, *a, **kw): return _malicious_verdict()
     orchestrator._review_escalated(cfg, conn, _R(), _diff_obj(), _triage_obj(), rid)
