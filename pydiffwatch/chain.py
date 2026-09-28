@@ -186,6 +186,40 @@ def _bound(text: str) -> set:
     return out
 
 
+def _reads(text: str) -> set:
+    """Names a line really reads (Q1): a name counts only when it occurs more often than it occurs as an assignment
+    target -- before a top-level `=`, directly before `:=`, between `for` and `in`, or after `as`. So `x = x + 1`
+    reads x, `x += 1` reads x, and `data = json.dumps(c)` does not read data. A dotted receiver or a called name is a
+    read; an attribute, a keyword, a builtin, and a keyword-argument name (a NAME before `=` inside brackets) are not.
+    A target is a bare NAME at depth 0 (not `x[i]` or `x.attr`, which read x)."""
+    toks = _tokens(text)
+    occ: dict = {}
+    targets: dict = {}
+    depths, depth, last_eq = [], 0, None
+    for i, t in enumerate(toks):
+        if t.string in (")", "]", "}"):
+            depth -= 1
+        depths.append(depth)
+        if t.string in ("(", "[", "{"):
+            depth += 1
+        if depth == 0 and t.type == tokenize.OP and t.string == "=":
+            last_eq = i
+    loop = False
+    for i, t in enumerate(toks):
+        if t.type == tokenize.NAME and t.string in ("for", "in"):
+            loop = t.string == "for"
+        if t.type != tokenize.NAME or t.string in _NOT_NAMES or (i and toks[i - 1].string == "."):
+            continue
+        nxt = toks[i + 1].string if i + 1 < len(toks) else ""
+        if nxt == "=" and depths[i] > 0:
+            continue                                          # a keyword-argument name
+        occ[t.string] = occ.get(t.string, 0) + 1
+        if (loop or nxt == ":=" or (i and toks[i - 1].string == "as")
+                or (last_eq is not None and i < last_eq and depths[i] == 0 and nxt not in (".", "[", "("))):
+            targets[t.string] = targets.get(t.string, 0) + 1
+    return {n for n, c in occ.items() if c > targets.get(n, 0)}
+
+
 def _cuts(entry) -> dict:
     """{line: string-tail column (int) or f-string field code (str)} for `_text_at`; a tail wins (fix G1)."""
     return {**(entry.get("fields") or {}), **(entry.get("tails") or {})}
@@ -222,7 +256,8 @@ class _File:
     def __init__(self, entry):
         self.lines = entry.get("lines") or {}
         self.cuts = _cuts(entry)
-        self.scopes = entry.get("scopes") or {}
+        scopes = entry.get("scopes")
+        self.scopes = scopes if isinstance(scopes, dict) else {}
         self.strings = set(entry.get("strings") or [])
         self.unreadable = self.strings - set(entry.get("fields") or {})   # field code may read (N1)
         self._memo: dict = {}
@@ -244,6 +279,20 @@ class _File:
 
     def bound(self, n) -> set:
         return self._fact(_bound, n)
+
+    def reads(self, n) -> set:
+        return self._fact(_reads, n)
+
+    def reaches(self, binders, n) -> bool:
+        """Q1/Q2: line n really reads a name some binder line binds, in a compatible scope -- `binders` holds
+        (name, binder scope); a module-level binder reaches any scope, a function binder only its own scope."""
+        s = self.scopes.get(n)
+        return s is not None and any((m, "module") in binders or (s != "module" and (m, s) in binders)
+                                     for m in self.reads(n))
+
+    def binds(self, lines) -> set:
+        """(name, scope) for every name the given lines bind; a line without a scope binds nothing here."""
+        return {(m, self.scopes[n]) for n in lines if self.scopes.get(n) is not None for m in self.bound(n)}
 
     def depth(self, n) -> tuple:
         return (0, 0) if n in self.strings and n not in self.cuts else self._fact(_depth, n)
@@ -276,9 +325,10 @@ def _connected(src, snk, f) -> bool:
     """Spec F §3.3 check 4 (user choice G1, plan review I6) between the lines of each end's evidence-bearing groups
     (P2): (a) the ends share an identifier; or (b) a source line and a sink line are near (same scope other than
     module, or both module-level within _MODULE_SPAN lines); or (c) ONE hop: a name bound on a source line is read
-    on a shown, live line R of the same file and not inside a string (fix F3), and R is near some sink line (R may
-    be the sink line). No hop without scopes; never two. Only anchor lines (fix I1) supply names or positions for
-    (a)/(b); the hop's hit end is likewise anchor-only."""
+    on a shown, live line R of the same file and not inside a string (fix F3) -- really read (`_reads`), in a scope
+    the binder reaches (Q2: the binder is module-level, or R shares its function scope) -- and R is near some sink
+    line (R may be the sink line). No hop without scopes; never two. Only anchor lines (fix I1) supply names or
+    positions for (a)/(b); the hop's hit end is likewise anchor-only."""
     src = [n for n in src if f.anchor(n)]
     snk = [n for n in snk if f.anchor(n)]
     if not src or not snk:
@@ -290,12 +340,12 @@ def _connected(src, snk, f) -> bool:
     near = _near_any(snk, f.scopes)
     if any(near(a) for a in src):
         return True
-    bound = set().union(*map(f.bound, src))
-    if not bound:
+    binders = f.binds(src)
+    if not binders:
         return False
     src_set, snk_set = set(src), set(snk)
     return any(r in snk_set or near(r) for r in f.lines
-               if r not in src_set and r not in f.unreadable and f.live(r) and bound & f.names(r))
+               if r not in src_set and r not in f.unreadable and f.live(r) and f.reaches(binders, r))
 
 
 _BRIDGE = 3              # P4: a group bridges at most this many consecutive blank/comment lines
@@ -330,7 +380,9 @@ def _merged(groups, f) -> list:
     end's next group when every shown line between them keeps the brackets open -- the same statement. A statement
     that closes first, or a line not shown, stops the merge, so an open line near the sink cannot pull in a far,
     unrelated quoted line. Repeats while still open.
-    (b) A later group that reads (`_names`) a name an earlier group binds (`_bound`) joins that group."""
+    (b) A later group joins an earlier group when one of its lines really reads (`_reads`) a name a line of the
+    earlier group binds (`_bound`), in a compatible scope: the binder is module-level, or both lines share one
+    function scope (Q1). Without scopes there is no name-merge; an assignment target alone is never a read."""
     runs: list = []                     # [lines, open brackets after its last line]
     for g in groups:
         bal = 0
@@ -355,13 +407,18 @@ def _merged(groups, f) -> list:
             parent[i] = parent[parent[i]]
             i = parent[i]
         return i
-    owner: dict = {}
+    owner: dict = {}                    # (name, binder scope) -> the run that binds it
     for i, (g, _) in enumerate(runs):
-        for name in set().union(*map(f.names, g)):
-            if name in owner and root(owner[name]) != i:
-                parent[root(owner[name])] = i
-        for name in set().union(*map(f.bound, g)):
-            owner[name] = i
+        for n in g:
+            s = f.scopes.get(n)
+            if s is None:
+                continue
+            for m in f.reads(n):
+                for key in ((m, "module"), (m, s)):
+                    if key in owner and root(owner[key]) != root(i):
+                        parent[root(owner[key])] = root(i)
+        for key in f.binds(g):
+            owner[key] = i
     out: dict = {}
     for i, (g, _) in enumerate(runs):
         out.setdefault(root(i), []).extend(g)

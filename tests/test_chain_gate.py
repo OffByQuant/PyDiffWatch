@@ -968,3 +968,103 @@ def test_p5_network_primitives(sink, ok):
     text = f"import os, ftplib, io, urllib.request\ndef f(H):\n    k = os.environ['K']\n    {sink}\n"
     got = _one("pkg/a.py", text, "k = os.environ['K']", sink, "secret-read", "send")
     assert (got == "") is ok, (sink, got)
+
+
+# ---- Task 8 fix round 3 (rulings Q1-Q2): merges and hops need a real read in a compatible scope ----
+
+_PAD3 = "".join(f"def pad{i}():\n    return {i}\n" for i in range(40))
+
+
+def test_q1_reads_counts_a_name_only_beyond_its_assignment_targets():
+    # a dotted receiver and a called name are reads too; attributes, keywords and keyword-argument names are not
+    assert chain._reads("data = json.dumps(c)") == {"json", "c"}
+    assert chain._reads("x = x + 1") == {"x"}
+    assert chain._reads("x += 1") == {"x"}
+    assert chain._reads("x = 1") == set()
+    assert chain._reads("a = b = 1") == set()
+    assert chain._reads("if (k := f(v)):") == {"f", "v"}
+    assert chain._reads("for a in items: use(a)") == {"items", "use", "a"}
+    assert chain._reads("with open(p) as fh:") == {"p"}
+    assert chain._reads("token.strip()") == {"token"}
+    assert chain._reads("requests.post(U, data=body)") == {"requests", "U", "body"}
+    assert chain._reads("x[i] = v") == {"x", "i", "v"}
+    assert chain._reads("data=token,") == {"token"}
+
+
+@pytest.mark.parametrize("nm", ["data", "config", "result", "value"])
+def test_q1_a_bound_name_read_in_an_unrelated_function_does_not_merge(nm):
+    # stitch.py S2: env bind in load(), json.dumps(<same name>) in render(), sink in upload()
+    text = (f"import os, json, requests\ndef load():\n    {nm} = os.environ.get('XDG_CONFIG_HOME')\n    return {nm}\n"
+            + _PAD3 + f"def render(ctx):\n    body = json.dumps({nm})\n    return body\n" + _PAD3
+            + "def upload(body):\n    requests.post(URL, data=body)\n")
+    got = _one("pkg/a.py", text, f"{nm} = os.environ.get('XDG_CONFIG_HOME')\nbody = json.dumps({nm})",
+               "requests.post(URL, data=body)", "secret-read", "send")
+    assert got == "no dataflow shown between source and sink"
+
+
+def test_q1_a_rebinding_is_not_a_read_and_does_not_merge():
+    # rebind.py
+    text = ("import os, json, requests\ndef a():\n    data = os.environ.get('HOME')\n    return len(data)\n" + _PAD3
+            + "def b(c):\n    data = json.dumps(c)\n    return data\n" + _PAD3
+            + "def d(c):\n    requests.post(U, json=c)\n")
+    got = _one("pkg/a.py", text, "data = os.environ.get('HOME')\ndata = json.dumps(c)", "requests.post(U, json=c)",
+               "secret-read", "send")
+    assert got == "no dataflow shown between source and sink"
+
+
+def test_q1_a_two_hop_stitch_across_three_functions_fails():
+    # stitch.py S1 and S4
+    text = ("import os, requests\ndef a():\n    token = os.environ.get('HOME')\n    return len(token)\n" + _PAD3
+            + "def b(token):\n    result = normalize(token)\n    return result\n" + _PAD3
+            + "def c(result):\n    requests.post(U, json=result)\n")
+    assert _one("pkg/a.py", text, "token = os.environ.get('HOME')\nresult = normalize(token)",
+                "requests.post(U, json=result)", "secret-read", "send") == "no dataflow shown between source and sink"
+    text = ("import base64\ndef a():\n    raw = base64.b64decode(ICON)\n    return raw\n" + _PAD3
+            + "def b(raw):\n    code = transform(raw)\n    return code\n" + _PAD3 + "def c(code):\n    exec(code)\n")
+    assert _one("pkg/a.py", text, "raw = base64.b64decode(ICON)\ncode = transform(raw)", "exec(code)",
+                "payload", "exec") == "no dataflow shown between source and sink"
+
+
+@pytest.mark.parametrize("k", [3, 10])
+def test_q1_a_name_chain_across_many_functions_fails(k):
+    # stitch.py S5
+    body = "import os, requests\ndef f0():\n    v0 = os.environ.get('HOME')\n"
+    src = "v0 = os.environ.get('HOME')"
+    for i in range(1, k):
+        body += _PAD3 + f"def f{i}(v{i - 1}):\n    v{i} = g(v{i - 1})\n"
+        src += f"\nv{i} = g(v{i - 1})"
+    body += _PAD3 + f"def sink(v{k - 1}):\n    requests.post(U, data=v{k - 1})\n"
+    assert _one("pkg/a.py", body, src, f"requests.post(U, data=v{k - 1})", "secret-read", "send") == \
+        "no dataflow shown between source and sink"
+
+
+def test_q1_a_name_merge_needs_scopes():
+    text = f"_B = 'Ab1{'QUJD' * 40}'\n_n = 3\n_D = _unpack(_B)\n" + "pass\n" * 60 + "def run():\n    exec(_D)\n"
+    shown = _shown("pkg/__init__.py", text, cls="import")
+    shown["pkg/__init__.py"].pop("scopes")
+    v = _v(chain_source=f"_B = 'Ab1{'QUJD' * 40}'\n_D = _unpack(_B)", chain_sink="exec(_D)",
+           source_kind="payload", sink_kind="exec")
+    assert chain.gate(v, shown) == "no dataflow shown between source and sink"
+
+
+def test_q2_an_assignment_to_the_bound_name_is_not_a_hop_reader():
+    # stitch.py S3b: `x = 1` in the sink's function does not read a far `x = os.environ.get('HOME')`
+    text = ("import os, json, requests\ndef a():\n    x = os.environ.get('HOME')\n    return x\n" + _PAD3
+            + "def b(c):\n    x = 1\n    body = c\n    requests.post(URL, data=body)\n")
+    assert _one("pkg/a.py", text, "x = os.environ.get('HOME')\nx = 1", "requests.post(URL, data=body)",
+                "secret-read", "send") == "no dataflow shown between source and sink"
+
+
+def test_q2_a_reader_in_another_function_than_a_function_binder_is_not_a_hop():
+    # stitch.py S3: `body = data` in up(data) reads the parameter, not a()'s local `data`
+    text = ("import os, json, requests\ndef a():\n    data = os.environ.get('HOME')\n    return data\n" + _PAD3
+            + "def b(c):\n    data = json.dumps(c)\n    return data\n" + _PAD3
+            + "def up(data):\n    body = data\n    requests.post(URL, data=body)\n")
+    assert _one("pkg/a.py", text, "data = os.environ.get('HOME')\ndata = json.dumps(c)",
+                "requests.post(URL, data=body)", "secret-read", "send") == "no dataflow shown between source and sink"
+
+
+def test_q1_a_non_dict_scopes_value_does_not_raise():
+    # the name-merge reads scopes on every quoted line; a malformed scopes value must not make the gate raise
+    shown = {"setup.py": dict(chains.SHOWN["setup.py"], scopes=[1, 2])}
+    assert isinstance(chain.gate(_v(), shown), str)
