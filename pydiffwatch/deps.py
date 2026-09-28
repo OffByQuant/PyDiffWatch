@@ -7,17 +7,21 @@ with NO network call; only suspicious names (typosquat-close / nonexistent / bra
 No vet-mcp — vet is a peer scanner; depending on it for detection makes DiffWatch downstream/too-late.
 """
 import email.utils
+import logging
 import os
 import re
 import urllib.parse
 from datetime import datetime, timezone
 
 _CORPUS_PATH = os.path.join(os.path.dirname(__file__), "data", "top_pypi_names.txt")
+_ORGS_PATH = os.path.join(os.path.dirname(__file__), "data", "top_pypi_orgs.txt")
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")   # leading token of a Requires-Dist line
 _MIN_TYPOSQUAT_LEN = 5   # don't flag distance-1 noise on very short names (<=4 chars)
 _ESTABLISHED_DAYS = 365       # a typosquat-close dep this old AND with this many releases is not a fresh squat
 _ESTABLISHED_RELEASES = 5
 _CODE_HOSTS = {"github.com", "gitlab.com", "codeberg.org", "bitbucket.org"}
+
+logger = logging.getLogger(__name__)
 
 
 def identity(meta) -> dict:
@@ -79,6 +83,37 @@ def load_corpus(path: str | None = None) -> set[str]:
     return out
 
 
+def org_of(meta) -> str | None:
+    """The PyPI organisation in a package's JSON (`ownership.organization`), PEP 503-normalized; None when absent.
+    PyPI vets only an organisation's name, so this proves nothing alone: see load_popular_orgs."""
+    own = meta.get("ownership") if isinstance(meta, dict) else None
+    org = own.get("organization") if isinstance(own, dict) else None
+    return (normalize_name(org) or None) if isinstance(org, str) else None
+
+
+def load_popular_orgs(path: str | None = None, min_packages: int = 2) -> frozenset[str]:
+    """Organisations owning at least `min_packages` top-PyPI packages, from the vendored `org<TAB>package` map
+    (tools/build_top_orgs.py). Whoever controls such an organisation already controls popular packages, so a
+    lookalike dependency it publishes is not read as a typosquat. A missing file gives an empty set (today's
+    behaviour); comments, blanks, malformed and duplicate lines are skipped."""
+    pkgs = {}
+    try:
+        with open(path or _ORGS_PATH, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                org, _, pkg = line.partition("\t")
+                org, pkg = normalize_name(org), normalize_name(pkg)
+                if org and pkg:
+                    pkgs.setdefault(org, set()).add(pkg)
+    except FileNotFoundError:
+        logger.warning("no PyPI organisation map at %s; organisation-owned lookalike deps stay flagged",
+                       path or _ORGS_PATH)
+        return frozenset()
+    return frozenset(o for o, p in pkgs.items() if len(p) >= min_packages)
+
+
 def edit_distance(a: str, b: str) -> int:
     """Levenshtein distance (iterative two-row)."""
     if a == b:
@@ -112,13 +147,16 @@ def nearest_corpus(name: str, corpus, max_dist: int = 2) -> str | None:
 
 
 def screen_added_deps(added, corpus, *, fetch_json, now=None, brandnew_days: int = 30,
-                      cap: int = 10, cache: dict | None = None, own: dict | None = None) -> list[dict]:
+                      cap: int = 10, cache: dict | None = None, own: dict | None = None,
+                      orgs: frozenset = frozenset()) -> list[dict]:
     """Classify each added (normalized) dep name. Established/popular deps (in corpus) produce no finding and no
     fetch. A name within 2 edits of the corpus is looked up (PR E): a shared PyPI owner with `own` (the scanned
     package's identity) or age >= _ESTABLISHED_DAYS with >= _ESTABLISHED_RELEASES releases clears the typosquat
     reading; author-declared matches only annotate. A capped or failed lookup keeps the plain typosquat finding.
     `fetch_json(name)` returns the /pypi/{name}/json dict, None for a 404, {} on a transient error. Network is
-    bounded to `cap` fetches; `cache` (name -> json|None) skips re-fetches."""
+    bounded to `cap` fetches; `cache` (name -> json|None) skips re-fetches. `orgs` (load_popular_orgs): a candidate
+    whose PyPI organisation is in it is cleared like a shared owner, before the target is looked up; a brand-new
+    finding then carries that `pypi_org`."""
     now = now or datetime.now(timezone.utc)
     cache = cache if cache is not None else {}
     own = own or {"roles": set(), "emails": set(), "orgs": set()}
@@ -147,19 +185,20 @@ def screen_added_deps(added, corpus, *, fetch_json, now=None, brandnew_days: int
             findings.append({"name": name, "reason": "nonexistent", **({"target": target} if target else {})})
             continue
         same_owner = False
+        org = org_of(meta)
+        popular_org = org if org in orgs else None
         if target:
             if not meta:
                 findings.append({"name": name, "reason": "typosquat", "target": target})   # never cleared on no data
                 continue
             ident = identity(meta)
             same_owner = bool(ident["roles"] and own["roles"] and ident["roles"] & own["roles"])
-            if not same_owner:
+            if not same_owner and not popular_org:
                 earliest, n = _earliest_upload(meta), _release_count(meta)
                 if earliest is not None and (now - earliest).days >= _ESTABLISHED_DAYS and n >= _ESTABLISHED_RELEASES:
                     continue
                 tmeta = lookup(target) if ident["emails"] else None   # nothing to compare: spend no GET
                 tident = identity(tmeta) if isinstance(tmeta, dict) and tmeta else None
-                org = (meta.get("ownership") or {}).get("organization") if isinstance(meta.get("ownership"), dict) else None
                 findings.append({
                     "name": name, "reason": "typosquat", "target": target,
                     "first_upload": earliest.date().isoformat() if earliest else None, "releases": n,
@@ -167,13 +206,14 @@ def screen_added_deps(added, corpus, *, fetch_json, now=None, brandnew_days: int
                     "same_author_email": bool(ident["emails"] & own["emails"]),
                     "same_org": bool(ident["orgs"] & own["orgs"]),
                     "same_author_as_target": bool(tident and ident["emails"] & tident["emails"]),
-                    "pypi_org": org if isinstance(org, str) and org else None})
+                    "pypi_org": org})
                 continue
         if not meta:
             continue                                 # a transient error on a non-candidate: unknown age, no flag
         earliest = _earliest_upload(meta)
         if earliest is not None and (now - earliest).days < brandnew_days:
-            findings.append({"name": name, "reason": "brand-new", **({"same_owner": True} if same_owner else {})})
+            findings.append({"name": name, "reason": "brand-new", **({"same_owner": True} if same_owner else {}),
+                             **({"pypi_org": popular_org} if popular_org else {})})
     return findings
 
 

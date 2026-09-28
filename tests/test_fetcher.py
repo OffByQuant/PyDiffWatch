@@ -565,3 +565,16 @@ def test_download_carries_the_publishing_facts(monkeypatch):
     monkeypatch.setattr(fetcher, "_download", lambda url, cfg: make_sdist({"acme/__init__.py": b"x=1\n"}))
     dl = fetcher.download(Config(), NewRelease("acme", "1.1", 9))
     assert dl.publishing == {"releases": 2, "days_since_prior": 3}
+
+
+def test_screen_added_deps_passes_the_popular_org_map(monkeypatch):
+    from pydiffwatch import deps
+    sentinel = frozenset({"acme-org"})
+    monkeypatch.setattr(fetcher, "_ORGS", None)
+    monkeypatch.setattr(deps, "load_popular_orgs", lambda *a, **k: sentinel)
+    monkeypatch.setattr(fetcher, "_requires_dist", lambda p, v, cfg: [])
+    seen = {}
+    monkeypatch.setattr(deps, "screen_added_deps", lambda added, corpus, **kw: seen.update(kw) or [])
+    meta = {"info": {"version": "2.0", "requires_dist": ["acme-http2>=1"]}}
+    fetcher._screen_added_deps(meta, "acme", "1.0", Config(), version="2.0")
+    assert seen["orgs"] is sentinel

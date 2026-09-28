@@ -526,3 +526,20 @@ def test_author_values_in_the_line_are_escaped():
 def test_no_signal_line_carries_an_email():
     # Review Focus 3: findings hold booleans, so the line cannot
     assert "@" not in differ.render_signals(None, [_LOOKED, dict(_LOOKED, same_author_email=True)], [], None)
+
+
+def test_popular_org_brand_new_lines():
+    sig = differ.render_signals(None, [{"name": "acme-http2", "reason": "brand-new", "pypi_org": "acme-org"},
+                                       {"name": "acme-own", "reason": "brand-new", "same_owner": True,
+                                        "pypi_org": "acme-org"}], [], None)
+    assert sig.split("\n") == [
+        "dependency acme-http2: brand-new on PyPI; published under the PyPI organisation acme-org, which owns "
+        "popular packages",
+        "dependency acme-own: brand-new on PyPI; the same PyPI owner as this package; published under the PyPI "
+        "organisation acme-org, which owns popular packages"]
+
+
+def test_popular_org_name_is_escaped():
+    line = differ.render_signals(None, [{"name": "acme-x", "reason": "brand-new", "pypi_org": "evil\norg "}],
+                                 [], None)
+    assert "\n" not in line and " " not in line and "evil\\norg" in line
