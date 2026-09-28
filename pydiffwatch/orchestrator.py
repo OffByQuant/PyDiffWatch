@@ -485,7 +485,7 @@ def _refusal_note(action: str, reason: str) -> str:
 
 
 def _alert_unscanned(cfg, conn, rid, package, version, note, *, stage, score=0.0, fired_rules=(),
-                     queue=True) -> bool:
+                     queue=True, dedupe=None) -> bool:
     """The one path for an outcome that leaves a release unscanned: alert once, and queue it for a person.
 
     - `note` is the alert's reasoning. By convention it starts `UNREVIEWED:` and ends `Not scanned. Needs
@@ -497,13 +497,14 @@ def _alert_unscanned(cfg, conn, rid, package, version, note, *, stage, score=0.0
       `pending` until a person adjudicates it or a model review replaces the verdict. `queue=False` alerts
       only (nothing is left to review).
     - `score` / `fired_rules` carry the triage result into the alert when there is one.
+    - `dedupe` replaces the `unscanned:<stage>` suffix (a project-level alert dedupes per incident).
     Never classifies the release `malicious`. Returns True iff the alert was new."""
     v = Verdict(package, version, "suspicious", score or 0.0, list(fired_rules), False, confidence=0.0,
                 attack_type="none", reasoning=note, cited_hunk="", recommended_action="monitor", model="none")
     if queue:
         store.record_verdict(conn, rid, v)
     return notifier.emit(cfg, conn, dataclasses.replace(v, classification="suspicious-heuristic"), rid,
-                         dedupe_suffix=f"unscanned:{stage}")
+                         dedupe_suffix=dedupe or f"unscanned:{stage}")
 
 
 def _record_download(conn, rid, dl):
@@ -696,22 +697,52 @@ def _alert_project(cfg, conn, name, serial, stage, what):
     `<name>==*` at a terminal stage, so it waits in `pending` like any unscanned release; version `*` is never
     in a project's JSON, so nothing ever downloads it."""
     rid = store.record_release(conn, name, "*", serial, False, None, "sdist")
+    was, label = conn.execute("SELECT r.serial, v.human_label FROM releases r LEFT JOIN verdicts v "
+                              "ON v.release_id=r.id WHERE r.id=?", (rid,)).fetchone()
+    if was != serial:
+        # a later incident on a project alerted before. Still waiting in `pending`: point it at the new serial, no
+        # second alert. Already handled by a person: put it back in `pending` and alert again.
+        conn.execute("UPDATE releases SET serial=? WHERE id=?", (serial, rid))
+        if label is None:
+            conn.commit()
+            store.update_stage(conn, rid, stage)
+            return
+        conn.execute("UPDATE verdicts SET human_label=NULL, human_note=NULL, adjudicated_at=NULL "
+                     "WHERE release_id=?", (rid,))
+        conn.commit()
     store.update_stage(conn, rid, stage)
     _alert_unscanned(cfg, conn, rid, name, "*",
                      f"UNREVIEWED: {what}, so new releases in project {name} could not be listed. "
-                     f"Not scanned. Needs manual review.", stage=stage)
+                     f"Not scanned. Needs manual review.", stage=stage, dedupe=f"unscanned:{stage}:{serial}")
+
+
+def _hold_limit(cfg) -> int:
+    return max(1, cfg.max_hold_ticks)
+
+
+def _load_holds(raw) -> dict:
+    """meta `ingest_holds`, keeping only well-formed entries: a bad record must never wedge the tick."""
+    try:
+        holds = json.loads(raw or "{}")
+    except ValueError:
+        return {}
+    if not isinstance(holds, dict):
+        return {}
+    return {n: h for n, h in holds.items() if isinstance(n, str) and isinstance(h, dict)
+            and all(isinstance(h.get(k), int) and not isinstance(h.get(k), bool) for k in ("serial", "ticks"))}
 
 
 def _note_holds(cfg, conn, holds, held):
-    """Count, per (project, index serial), the ticks it has held the cursor, in meta `ingest_holds`. A project
-    no longer held is dropped; a new serial restarts its count. At max_hold_ticks it alerts once, and from the
-    next tick on it no longer holds (run_once passes it in release_holds)."""
+    """Count the consecutive ticks each project has held the cursor, in meta `ingest_holds` (a project that keeps
+    changing while it fails keeps counting). A project no longer held is dropped. At max_hold_ticks it alerts, and
+    from the next tick on it no longer holds (run_once passes it in release_holds); a later serial while it is still
+    failing goes to _alert_project again, which alerts only if a person has already handled the first one."""
     now = {}
     for name, serial, why in held:
         was = holds.get(name)
-        ticks = was["ticks"] + 1 if was and was["serial"] == serial else 1
+        ticks = was["ticks"] + 1 if was else 1
         now[name] = {"serial": serial, "ticks": ticks}
-        if ticks == cfg.max_hold_ticks:
+        if ticks == _hold_limit(cfg) or (ticks > _hold_limit(cfg) and was["serial"] != serial):
             logger.warning("%s has held the cursor below serial %d for %d ticks (%s); passing it", name, serial,
                            ticks, why)
             _alert_project(cfg, conn, name, serial, "gave_up",
@@ -815,11 +846,8 @@ def run_once(cfg: Config, *, seed_if_fresh: bool = True, recent: int | None = No
             floor = _iso(since - datetime.timedelta(minutes=cfg.floor_margin_minutes))
             store.set_meta(conn, "ingest_floor", floor)
             logger.info("no ingest floor on a cursor at serial %d; seeded it to %s", last, floor)
-        try:
-            holds = json.loads(store.get_meta(conn, "ingest_holds") or "{}")
-        except ValueError:
-            holds = {}
-        released = frozenset(n for n, h in holds.items() if h.get("ticks", 0) >= cfg.max_hold_ticks)
+        holds = _load_holds(store.get_meta(conn, "ingest_holds"))
+        released = frozenset(n for n, h in holds.items() if h["ticks"] >= _hold_limit(cfg))
         found = ingest.changes_since(cfg, last, floor=floor, stage=lambda p, v: store.get_stage(conn, p, v),
                                      terminal=frozenset(TERMINAL), release_holds=released)
         ceiling = getattr(found, "ceiling", None)   # a plain list (older stubs) has none: advance to listed serials

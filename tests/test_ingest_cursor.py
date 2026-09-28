@@ -345,3 +345,66 @@ def test_the_project_level_row_is_never_downloaded_by_pending_or_retries(tmp_pat
     orchestrator.prune(cfg)
     store.prune(store.connect(cfg), retention_days=1)
     assert len(store.pending_adjudication(store.connect(cfg))) == 2
+
+
+@pytest.mark.parametrize("raw", ["null", "[]", '{"x-demo": 5}', '{"stuck-demo": {"serial": 101}}'])
+def test_a_wrongly_shaped_hold_record_does_not_wedge_the_tick(tmp_path, monkeypatch, raw):
+    cfg = _cfg(tmp_path)
+    conn = store.connect(cfg); store.init_schema(conn); store.set_last_serial(conn, 100)
+    store.set_meta(conn, "ingest_floor", _now_iso(hours=1))
+    store.set_meta(conn, "ingest_holds", raw)
+    _stub_pipeline(monkeypatch)
+    monkeypatch.setattr(orchestrator, "_process_fetched", lambda *a: True)
+    _serve(monkeypatch, {"beta-demo": (200, {})})
+    orchestrator.run_once(cfg)
+    assert store.get_last_serial(store.connect(cfg)) == 200
+
+
+def test_a_failing_project_whose_serial_keeps_moving_is_still_passed_and_alerted(tmp_path, monkeypatch):
+    cfg = dataclasses.replace(_cfg(tmp_path), max_hold_ticks=3)
+    conn = store.connect(cfg); store.init_schema(conn); store.set_last_serial(conn, 100)
+    store.set_meta(conn, "ingest_floor", _now_iso(hours=1))
+    _stub_pipeline(monkeypatch)
+    monkeypatch.setattr(orchestrator, "_process_fetched", lambda *a: True)
+    projects = {"busy-demo": (150, {"1.0": _now_iso()}), "beta-demo": (300, {})}
+    _serve(monkeypatch, projects, fail={"busy-demo"})
+    for tick in range(5):
+        projects["busy-demo"] = (150 + tick, {"1.0": _now_iso()})   # a new upload each tick
+        orchestrator.run_once(cfg)
+    assert len(_unscanned_alerts(cfg, "busy-demo")) == 1
+    assert store.get_last_serial(store.connect(cfg)) == 300
+
+
+def test_a_second_give_up_at_a_new_serial_alerts_again_and_returns_to_pending(tmp_path, monkeypatch):
+    cfg = dataclasses.replace(_cfg(tmp_path), max_hold_ticks=2)
+    conn = store.connect(cfg); store.init_schema(conn); store.set_last_serial(conn, 100)
+    store.set_meta(conn, "ingest_floor", _now_iso(hours=1))
+    _stub_pipeline(monkeypatch)
+    monkeypatch.setattr(orchestrator, "_process_fetched", lambda *a: True)
+    projects = {"stuck-demo": (150, {"1.0": _now_iso()})}
+    _serve(monkeypatch, projects, fail={"stuck-demo"})
+    for _ in range(3):
+        orchestrator.run_once(cfg)
+    assert len(_unscanned_alerts(cfg, "stuck-demo")) == 1
+    c = store.connect(cfg)
+    rid = c.execute("SELECT id FROM releases WHERE package='stuck-demo' AND version='*'").fetchone()[0]
+    orchestrator.adjudicate(cfg, rid, "benign", "looked at it")
+    assert not [r for r in store.pending_adjudication(c) if r["package"] == "stuck-demo"]
+    projects["stuck-demo"] = (900, {"2.0": _now_iso()})            # a later, separate outage
+    for _ in range(3):
+        orchestrator.run_once(cfg)
+    assert len(_unscanned_alerts(cfg, "stuck-demo")) == 2
+    assert [r for r in store.pending_adjudication(store.connect(cfg)) if r["package"] == "stuck-demo"]
+
+
+def test_a_non_positive_max_hold_ticks_still_alerts_before_passing(tmp_path, monkeypatch):
+    cfg = dataclasses.replace(_cfg(tmp_path), max_hold_ticks=0)
+    conn = store.connect(cfg); store.init_schema(conn); store.set_last_serial(conn, 100)
+    store.set_meta(conn, "ingest_floor", _now_iso(hours=1))
+    _stub_pipeline(monkeypatch)
+    monkeypatch.setattr(orchestrator, "_process_fetched", lambda *a: True)
+    _serve(monkeypatch, {"stuck-demo": (150, {"1.0": _now_iso()}), "beta-demo": (200, {})}, fail={"stuck-demo"})
+    for _ in range(3):
+        orchestrator.run_once(cfg)
+    assert len(_unscanned_alerts(cfg, "stuck-demo")) == 1
+    assert store.get_last_serial(store.connect(cfg)) == 200
