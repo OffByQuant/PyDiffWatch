@@ -49,35 +49,17 @@ def cited(verdict) -> bool:
             and bool(clean(getattr(verdict, "chain_sink", None))))
 
 
-_CLOSERS = ('"""', "'''", '"', "'")
-
-
-def _raw_tokens(text: str) -> list | None:
-    """`text`'s tokens in full, or None on any tokenize error (an incomplete list would misread the line)."""
+def _tokens(text: str) -> list:
+    """A shown line's tokens, isolated from the rest of its file: whatever tokenize produced before it hit an
+    error (an incomplete multi-line call/string/binding reads on its own as unterminated, but the tokens up to
+    that point are still real — fix R3 round 3: no lexical retry here; a string-tail line is instead handled by
+    the caller passing in only the code portion of the line, via reviewer's "tails" (fix R3)."""
     out = []
     try:
         for t in tokenize.generate_tokens(io.StringIO(text.strip() + "\n").readline):
             out.append(t)
-        return out
     except (tokenize.TokenError, IndentationError, SyntaxError):
-        return None
-
-
-def _tokens(text: str) -> list:
-    """A shown line's tokens, isolated from the rest of its file. A line that is really the tail end of a string
-    opened on an earlier (unshown) line — the closing line of a multi-line string argument (fix R2) — reads on
-    its own as an unterminated string and fails to tokenize; retried after the first quote run in the text, so
-    the real code that follows it still tokenizes."""
-    out = _raw_tokens(text)
-    if out is None:
-        for closer in _CLOSERS:
-            i = text.find(closer)
-            if i >= 0:
-                out = _raw_tokens(text[i + len(closer):])
-                if out is not None:
-                    break
-        else:
-            out = []
+        pass
     return [t for t in out if t.type not in _NOISE]
 
 
@@ -207,13 +189,22 @@ def _near(a, b, scopes) -> bool:
     return sa is not None and sa == sb and (sa != "module" or abs(a - b) <= _MODULE_SPAN)
 
 
-def _anchors(hits, lines) -> list:
+def _text_at(n, lines, tails) -> str:
+    """The text to tokenize for shown line `n` (fix R3): from its recorded string-tail column onward when one is
+    present (a line that is really the tail of a multi-line string, with real code following the string's close
+    on that same line — reviewer's "tails"), else the whole line."""
+    text = lines.get(n, "")
+    col = tails.get(n)
+    return text[col:] if col is not None else text
+
+
+def _anchors(hits, lines, tails) -> list:
     """Matched lines that can support Connected — its names and its position both (fix I1): live, not a bare
     `import`/`from ... import` line, and carrying at least one name after `_names`'s exclusions. A quoted padding
     line (`pass`, a lone `)`, a copied import line) adds neither a name nor a position."""
     out = []
     for n in {m for ns in hits for m in ns}:
-        text = lines.get(n, "")
+        text = _text_at(n, lines, tails)
         if _live(text) and not _IMPORT_LINE.match(text) and _names(text):
             out.append(n)
     return out
@@ -225,21 +216,24 @@ def _connected(src_hits, snk_hits, entry) -> bool:
     of the same file, and R is near some sink line (R may be the sink line). No hop without scopes; never two.
     Only anchor lines (fix I1) supply names or positions for (a)/(b); the hop's hit end is likewise anchor-only."""
     lines = entry.get("lines") or {}
-    src = _anchors(src_hits, lines)
-    snk = _anchors(snk_hits, lines)
+    tails = entry.get("tails") or {}
+    src = _anchors(src_hits, lines, tails)
+    snk = _anchors(snk_hits, lines, tails)
     if not src or not snk:
         return False
-    if set().union(*(_names(lines[n]) for n in src)) & set().union(*(_names(lines[n]) for n in snk)):
+    if (set().union(*(_names(_text_at(n, lines, tails)) for n in src))
+            & set().union(*(_names(_text_at(n, lines, tails)) for n in snk))):
         return True
     scopes = entry.get("scopes")
     if not scopes:
         return False
     if any(_near(a, b, scopes) for a in src for b in snk):
         return True
-    bound = set().union(*(_bound(lines[n]) for n in src))
+    bound = set().union(*(_bound(_text_at(n, lines, tails)) for n in src))
     if not bound:
         return False
-    readers = [r for r, text in lines.items() if r not in src and _live(text) and bound & _names(text)]
+    readers = [r for r in lines if r not in src and _live(_text_at(r, lines, tails))
+               and bound & _names(_text_at(r, lines, tails))]
     return any(r == b or _near(r, b, scopes) for r in readers for b in snk)
 
 
@@ -253,9 +247,10 @@ def _gate_file(verdict, path, entry, src_hits, snk_hits) -> str:
     if cls in (None, "unknown"):
         return f"chain is in unclassified code ({path})"
     lines = entry.get("lines") or {}
-    if not any(_live(lines[n]) for ns in src_hits for n in ns):
+    tails = entry.get("tails") or {}
+    if not any(_live(_text_at(n, lines, tails)) for ns in src_hits for n in ns):
         return "source is only a comment or a string"
-    if not any(_live(lines[n]) for ns in snk_hits for n in ns):
+    if not any(_live(_text_at(n, lines, tails)) for ns in snk_hits for n in ns):
         return "sink is only a comment or a string"
     if not _connected(src_hits, snk_hits, entry):
         return "no dataflow shown between source and sink"

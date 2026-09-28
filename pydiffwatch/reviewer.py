@@ -557,21 +557,20 @@ def _is_str(node) -> bool:
     return isinstance(node, ast.JoinedStr) or (isinstance(node, ast.Constant) and isinstance(node.value, str))
 
 
+def _byte_to_char(line: str, i: int) -> int:
+    """`i`, an ast column offset (UTF-8 BYTES), converted back to a character index into `line` (fix R2)."""
+    return len(line.encode("utf-8")[:i].decode("utf-8"))
+
+
 def _blank_outside(line: str, start_byte, end_byte) -> bool:
     """True when the parts of `line` before `start_byte` and/or after `end_byte` hold nothing but whitespace or a
-    trailing `#` comment (fix R2). `None` skips that side's check (it is inside the string by construction).
-    ast column offsets are UTF-8 BYTE offsets, so they are converted back to character indices before slicing."""
-    b = line.encode("utf-8")
-
-    def to_char(i):
-        return len(b[:i].decode("utf-8"))
-
+    trailing `#` comment (fix R2). `None` skips that side's check (it is inside the string by construction)."""
     def blank(s):
         s = s.strip()
         return not s or s.startswith("#")
 
-    left = line[:to_char(start_byte)] if start_byte is not None else ""
-    right = line[to_char(end_byte):] if end_byte is not None else ""
+    left = line[:_byte_to_char(line, start_byte)] if start_byte is not None else ""
+    right = line[_byte_to_char(line, end_byte):] if end_byte is not None else ""
     return blank(left) and blank(right)
 
 
@@ -603,10 +602,29 @@ def _string_lines(tree, source_lines) -> list:
     return sorted(out)
 
 
+def _string_tails(tree, source_lines) -> dict:
+    """{line: character column just after a multi-line string's end} for each line on which a multi-line str
+    Constant/JoinedStr ends AND real code (non-whitespace, non-comment) follows it (fix R3): chain.py tokenizes
+    only from that column on such a line, instead of the whole line, which in isolation reads as the tail of an
+    unterminated string (e.g. a closing `\"\"\"` followed by real code) and mis-tokenizes or loses tokens. When
+    more than one qualifying span ends on the same line, the rightmost (last-closing) one wins."""
+    out: dict[int, int] = {}
+    for node in ast.walk(tree):
+        if not (_is_str(node) and node.end_lineno and node.end_lineno > node.lineno):
+            continue
+        line = source_lines[node.end_lineno - 1]
+        col = _byte_to_char(line, node.end_col_offset)
+        tail = line[col:].strip()
+        if tail and not tail.startswith("#"):
+            out[node.end_lineno] = max(col, out.get(node.end_lineno, -1))
+    return out
+
+
 def _shown_entry(fd, cls, whole) -> dict:
     """The lines a rendered file put in front of the model (added lines, or every line of a whole-file render),
-    by new-file line number, with each line's scope and whether it lies inside a string constant, when the file
-    parses (spec F §3.2 `shown`)."""
+    by new-file line number, with each line's scope, whether it lies inside a string constant, and (fix R3) a
+    string-tail column for a line where a multi-line string ends mid-line with real code after it — when the
+    file parses (spec F §3.2 `shown`)."""
     if whole:
         lines = dict(enumerate(fd.new_text.splitlines(), 1))
     else:
@@ -614,21 +632,25 @@ def _shown_entry(fd, cls, whole) -> dict:
     entry = {"cls": cls, "lines": lines}
     tree = _parse(fd.new_text)
     if tree is not None:
+        source_lines = fd.new_text.splitlines()
         scopes = _scopes(tree)
         entry["scopes"] = {n: scopes.get(n, "module") for n in lines}
-        strings = set(_string_lines(tree, fd.new_text.splitlines()))
+        strings = set(_string_lines(tree, source_lines))
         entry["strings"] = sorted(n for n in lines if n in strings)
+        tails = {n: c for n, c in _string_tails(tree, source_lines).items() if n in lines}
+        if tails:
+            entry["tails"] = tails
     return entry
 
 
 def shown_to_json(shown) -> str:
-    return json.dumps({p: {k: ({str(n): v for n, v in e[k].items()} if k in ("lines", "scopes") else e[k])
+    return json.dumps({p: {k: ({str(n): v for n, v in e[k].items()} if k in ("lines", "scopes", "tails") else e[k])
                            for k in e} for p, e in (shown or {}).items()})
 
 
 def shown_from_json(s) -> dict:
     raw = json.loads(s) if s else {}
-    return {p: {k: ({int(n): v for n, v in e[k].items()} if k in ("lines", "scopes") else e[k]) for k in e}
+    return {p: {k: ({int(n): v for n, v in e[k].items()} if k in ("lines", "scopes", "tails") else e[k]) for k in e}
             for p, e in raw.items()}
 
 

