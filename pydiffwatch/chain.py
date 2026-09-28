@@ -14,6 +14,7 @@ _IMPORT_LINE = re.compile(r"^\s*(?:import\s|from\s+\S+\s+import\b)")
 _NOISE = {tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT, tokenize.ENDMARKER, tokenize.COMMENT}
 _NOT_NAMES = set(keyword.kwlist) | set(getattr(keyword, "softkwlist", [])) | set(dir(builtins))
 _FSTRING_START = getattr(tokenize, "FSTRING_START", None)
+_FSTRING_MIDDLE = getattr(tokenize, "FSTRING_MIDDLE", None)
 _FSTRING_END = getattr(tokenize, "FSTRING_END", None)
 
 
@@ -266,8 +267,10 @@ def _gate_file(verdict, path, entry, src_hits, snk_hits) -> str:
         return "sink is only a comment or a string"
     if not _connected(src_hits, snk_hits, entry):
         return "no dataflow shown between source and sink"
-    return _kinds(verdict, [lines[n] for ns in src_hits for n in ns], [lines[n] for ns in snk_hits for n in ns],
-                  lines)
+    strings = set(entry.get("strings") or [])
+    kind_lines = {n: t for n, t in lines.items() if n not in strings}       # import table skips string lines (R8-1)
+    return _kinds(verdict, [_text_at(n, lines, tails) for ns in src_hits for n in ns],
+                  [_text_at(n, lines, tails) for ns in snk_hits for n in ns], kind_lines)
 
 
 def gate(verdict, shown) -> str:
@@ -299,5 +302,133 @@ def gate(verdict, shown) -> str:
     return first_reason
 
 
+PAIRS = frozenset({("secret-read", "send"), ("payload", "exec"), ("fetch", "exec"), ("fetch", "write-and-run"),
+                   ("payload", "write-and-run")})
+_CRED = re.compile(r"\.ssh|\.aws|\.pypirc|\.netrc|\.git-credentials|\.npmrc|\.docker/config\.json|\.kube/config|"
+                   r"keyring|/proc/[^/'\"]+/(?:environ|cmdline)|Cookies|Login Data|Local State|key4\.db|wallet\.dat|"
+                   r"Exodus|Electrum", re.I)
+_PERSIST = re.compile(r"\.pth\b|sitecustomize|\.bashrc|\.zshrc|\.profile|crontab|/etc/cron|systemd/|\.service\b|"
+                      r"LaunchAgents", re.I)
+_BLOB = re.compile(r"^(?:[A-Za-z0-9+/=_-]{128,}|(?:[0-9a-fA-F]{2}){64,})$")
+_DECODE = {"b64decode", "urlsafe_b64decode", "b16decode", "b32decode", "a85decode", "b85decode", "unhexlify",
+           "decompress", "fromhex", "a2b_base64", "a2b_hex", "a2b_uu"}
+_NET_ROOTS = {"requests", "httpx", "urllib", "urllib3", "aiohttp", "socket", "http", "smtplib", "ftplib"}
+_NET_FUNCS = {"urlopen", "urlretrieve", "Request", "create_connection"}
+_FETCH_METHODS = {"recv", "recv_into", "get", "read", "urlopen", "urlretrieve"}
+_SEND_METHODS = {"send", "sendall", "sendto", "request", "post", "put", "patch", "sendmail"}
+_PROCESS = {"os.system", "os.popen", "subprocess.Popen", "subprocess.run", "subprocess.call",
+            "subprocess.check_output", "subprocess.check_call", "subprocess.getoutput", "subprocess.getstatusoutput"}
+_WRITE_MODES = {"w", "wb", "a", "ab", "w+", "wb+", "a+", "ab+", "x", "xb"}
+
+
+def _import_table(lines) -> dict:
+    """name -> full dotted target from the shown file's import lines (Ruling F2)."""
+    table = {}
+    for text in lines:
+        toks = [t.string for t in _tokens(text)]
+        if toks[:1] == ["import"]:
+            for part in " ".join(toks[1:]).split(","):
+                words = part.replace(" . ", ".").split()
+                if words:
+                    table[words[-1] if "as" in words else words[0].split(".")[0]] = words[0] if "as" in words \
+                        else words[0].split(".")[0]
+        elif toks[:1] == ["from"] and "import" in toks:
+            mod = "".join(toks[1:toks.index("import")])
+            for part in " ".join(toks[toks.index("import") + 1:]).strip("() ").split(","):
+                words = part.split()
+                if words:
+                    table[words[-1]] = f"{mod}.{words[0]}"
+    return table
+
+
+def _facts(text, table) -> dict:
+    toks = _tokens(text)
+    calls, names = [], set()
+    i = 0
+    while i < len(toks):
+        if toks[i].type == tokenize.NAME and not (i and toks[i - 1].string == "."):
+            parts, j = [toks[i].string], i + 1
+            while j + 1 < len(toks) and toks[j].string == "." and toks[j + 1].type == tokenize.NAME:
+                parts.append(toks[j + 1].string)
+                j += 2
+            root = table.get(parts[0], parts[0])
+            full = ".".join([root] + parts[1:])
+            names.add(full)
+            if j < len(toks) and toks[j].string == "(":
+                calls.append(full)
+            i = j
+        else:
+            i += 1
+    methods = {toks[k].string for k in range(1, len(toks) - 1)
+               if toks[k].type == tokenize.NAME and toks[k - 1].string == "." and toks[k + 1].string == "("}
+    strings = []
+    for t in toks:
+        if t.type == tokenize.STRING:
+            s = t.string.lstrip("rRbBuUfF")
+            strings.append(s.strip("'\"") if len(s) >= 2 else s)
+        elif t.type == _FSTRING_MIDDLE:
+            strings.append(t.string)
+    fstr = any(t.type == tokenize.STRING and t.string[:1] in "fF" for t in toks) or \
+        any(t.type == _FSTRING_START for t in toks)
+    ops = {t.string for t in toks if t.type == tokenize.OP}
+    return {"calls": calls, "names": names, "methods": methods, "strings": strings, "ops": ops, "fstr": fstr}
+
+
+def _last(n):
+    return n.rsplit(".", 1)[-1]
+
+
+def _net_call(c):
+    return c.split(".", 1)[0] in _NET_ROOTS or _last(c) in _NET_FUNCS
+
+
+def _is_exec(f):
+    return (any(c in {"exec", "eval", "compile", "__import__"} or c in _PROCESS
+                or c.startswith(("os.exec", "os.spawn", "ctypes", "runpy", "importlib")) for c in f["calls"])
+            or any(n.split(".", 1)[0] == "ctypes" for n in f["names"]) or "exec_module" in f["methods"])
+
+
+def _is_write(f):
+    return (any(_last(c) == "open" for c in f["calls"]) and any(s in _WRITE_MODES for s in f["strings"])) \
+        or bool({"write_bytes", "write_text"} & f["methods"]) \
+        or any(c.startswith("shutil.copy") or c == "shutil.move" for c in f["calls"])
+
+
+def _evidence(kind, texts, table) -> bool:
+    fs = [_facts(t, table) for t in texts]
+    if kind == "secret-read":
+        return any(any(n == "os.environ" or n.startswith("os.environ.") or _last(n) == "getenv"
+                       or n.split(".", 1)[0] == "keyring" for n in f["names"])
+                   or any(_CRED.search(s) for s in f["strings"]) for f in fs)
+    if kind == "payload":
+        return any(any(_last(c) in _DECODE or c == "codecs.decode"
+                       or (_last(c) in ("loads", "load") and c.split(".", 1)[0] in ("pickle", "marshal", "dill"))
+                       for c in f["calls"])
+                   or bool(_DECODE & f["methods"]) or ("^" in f["ops"] and "[" in f["ops"])
+                   or any(_BLOB.match(s.strip()) for s in f["strings"]) for f in fs)
+    if kind == "fetch":
+        return any(any(_net_call(c) for c in f["calls"]) or bool(_FETCH_METHODS & f["methods"]) for f in fs)
+    if kind == "send":
+        return any(any(_net_call(c) for c in f["calls"]) or bool(_SEND_METHODS & f["methods"])
+                   or any(_last(c) in ("getaddrinfo", "gethostbyname") and ("+" in f["ops"] or f["fstr"])
+                          for c in f["calls"]) for f in fs)
+    if kind == "exec":
+        return any(_is_exec(f) for f in fs)
+    if kind == "write-and-run":
+        writes = any(_is_write(f) for f in fs)
+        runs = any(_is_exec(f) or any("chmod" in _last(c) for c in f["calls"]) for f in fs)
+        persist = any(_PERSIST.search(s) for f in fs for s in f["strings"])
+        return writes and (runs or persist)
+    return False
+
+
 def _kinds(verdict, src_lines, snk_lines, lines) -> str:
-    return ""        # Task 8
+    """Checks 5 (Kind) and 6 (Pair)."""
+    table = _import_table(t for t in lines.values() if t.lstrip().startswith(("import ", "from ")))
+    if not _evidence(verdict.source_kind, src_lines, table):
+        return f"source quoted as {verdict.source_kind}, but the quoted lines show no {verdict.source_kind}"
+    if not _evidence(verdict.sink_kind, snk_lines, table):
+        return f"sink quoted as {verdict.sink_kind}, but the quoted lines show no {verdict.sink_kind}"
+    if (verdict.source_kind, verdict.sink_kind) not in PAIRS:
+        return f"{verdict.source_kind} → {verdict.sink_kind} is not a chain that makes a release malicious"
+    return ""

