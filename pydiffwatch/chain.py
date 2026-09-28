@@ -11,6 +11,12 @@ _MODULE_SPAN = 50
 _PREFIX = re.compile(r"^(?:[+-](?=\s|$)|L?\d+:)")
 _AT_MARKER = re.compile(r"^@@[^@]*@@\s*")            # a sandwiched marker: strip it, keep any code after it (m8)
 _IMPORT_LINE = re.compile(r"^\s*(?:import\s|from\s+\S+\s+import\b)")
+
+
+def _pure_import(text: str) -> bool:
+    """A line that only imports: every `;`-separated statement is an import (R1). `import os; exec(...)` -- the
+    shape site runs from a .pth file -- is not, so it can carry a chain."""
+    return all(_IMPORT_LINE.match(p) or not p.strip() for p in text.split(";"))
 _NOISE = {tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT, tokenize.ENDMARKER, tokenize.COMMENT}
 _NOT_NAMES = set(keyword.kwlist) | set(getattr(keyword, "softkwlist", [])) | set(dir(builtins))
 _FSTRING_START = getattr(tokenize, "FSTRING_START", None)
@@ -577,7 +583,7 @@ class _File:
         """A matched line that can support Connected -- its names and its position both (fix I1): live, not a bare
         `import`/`from ... import` line, and carrying at least one name after `_names`'s exclusions. A quoted
         padding line (`pass`, a lone `)`, a copied import line) adds neither a name nor a position."""
-        return self.live(n) and not _IMPORT_LINE.match(self.text(n)) and bool(self.names(n))
+        return self.live(n) and not _pure_import(self.text(n)) and bool(self.names(n))
 
 
 def _near_any(lines, scopes):
@@ -605,6 +611,8 @@ def _connected(src, snk, f) -> bool:
     the binder reaches (Q2: the binder is module-level, or R shares its function scope) -- and R is near some sink
     line (R may be the sink line). No hop without scopes; never two. Only anchor lines (fix I1) supply names or
     positions for (a)/(b); the hop's hit end is likewise anchor-only."""
+    if any(f.live(n) and not _pure_import(f.text(n)) for n in set(src) & set(snk)):
+        return True                                 # R1: both ends on one live statement line
     src = [n for n in src if f.anchor(n)]
     snk = [n for n in snk if f.anchor(n)]
     if not src or not snk:
@@ -713,6 +721,8 @@ def _gate_file(verdict, path, entry, src_hits, snk_hits) -> str:
         return f"chain is in not-shipped code ({path})"
     if cls == "inert":
         return f"chain is in inert code ({path})"                # fix I4
+    if cls == "data":
+        return f"chain is in data ({path})"                      # R2: config/metadata text never runs
     if cls in (None, "unknown"):
         return f"chain is in unclassified code ({path})"
     f = _File(entry)
@@ -853,7 +863,7 @@ def _facts(text, table) -> dict:
         any(t.type == _FSTRING_START for t in toks)
     ops = {t.string for t in toks if t.type == tokenize.OP}
     # X3: a `^` with an integer or bytes literal operand, or on a line with a `for` (a comprehension or loop)
-    keyed_xor = "^" in ops and (any(t.type == tokenize.NAME and t.string == "for" for t in toks) or any(
+    keyed_xor = ("^=" in ops and ("[" in ops or any(_int_or_bytes(t) for t in toks))) or "^" in ops and (any(t.type == tokenize.NAME and t.string == "for" for t in toks) or any(
         toks[k].string == "^" and any(_int_or_bytes(toks[j]) for j in (k - 1, k + 1) if 0 <= j < len(toks))
         for k in range(len(toks))))
     return {"calls": calls, "names": names, "methods": methods, "strings": strings, "ops": ops, "fstr": fstr,
