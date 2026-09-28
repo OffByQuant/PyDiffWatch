@@ -79,6 +79,12 @@ def test_only_classification_is_mandatory():
         validate_verdict({"runs_when": "build", "confidence": 0.9}, reviewer.REVIEW_SCHEMA)
 
 
+def test_out_of_enum_chain_kinds_never_spend_a_review_attempt():
+    from pydiffwatch import backends, reviewer
+    backends.validate_verdict({"classification": "malicious", "source_kind": "x", "sink_kind": "y"},
+                              reviewer.REVIEW_SCHEMA)
+
+
 def test_a_truncated_tail_keeps_the_verdict():
     v = _review({"runs_when": "build", "classification": "malicious"})
     assert v.classification == "malicious" and v.runs_when == "build"

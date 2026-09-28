@@ -1,3 +1,4 @@
+import json
 import re
 from pydiffwatch.models import Diff, FileDiff, Hunk, FiredRule, TriageResult
 from pydiffwatch import reviewer
@@ -318,3 +319,40 @@ def test_reviewer_passes_schema_and_system_prompt_to_backend():
     assert kw["schema"] is reviewer.REVIEW_SCHEMA
     assert kw["system"] is reviewer.SYSTEM_PROMPT
     assert kw["max_tokens"] == Config().reviewer.max_output_tokens
+
+
+# ---- PR F: the chain fields ----
+
+def test_the_schema_orders_the_chain_before_the_prose():
+    keys = list(reviewer.REVIEW_SCHEMA["properties"])
+    assert keys == ["runs_when", "classification", "confidence", "urgent", "recommended_action", "attack_type",
+                    "source_kind", "sink_kind", "chain_source", "chain_sink", "cited_hunk", "reasoning"]
+    p = reviewer.REVIEW_SCHEMA["properties"]
+    assert p["source_kind"]["enum"] == ["secret-read", "payload", "fetch", "none"]
+    assert p["sink_kind"]["enum"] == ["send", "exec", "write-and-run", "none"]
+
+
+def test_the_prompt_says_what_to_quote_and_what_is_not_a_sink():
+    sp = reviewer.SYSTEM_PROMPT
+    for phrase in ("source_kind, sink_kind, chain_source, chain_sink, cited_hunk, reasoning", "copied from ONE shown file",
+                   "is not a sink", "installing a wheel runs none of it", "bundled binary is never malicious by itself",
+                   "cannot clear what you did not see"):
+        assert phrase in sp, phrase
+
+
+def _parse(d):
+    class B:
+        primary_model, escalation_model = "m", None
+        def complete(self, **kw):
+            return json.dumps(d)
+    from pydiffwatch.config import Config
+    text = "untrusted_content_marker: ===M===\n===M===\n--- file: a.py (added) ---\n+ a\n===M==="
+    return reviewer.Reviewer(Config(), backend=B()).review_text("p", "1", 1.0, [], text)
+
+
+def test_the_chain_fields_are_parsed_clipped_and_defaulted():
+    v = _parse({"classification": "malicious", "source_kind": "fetch", "sink_kind": "exec",
+                "chain_source": "a" * 5_000, "chain_sink": "exec(x)"})
+    assert (v.source_kind, v.sink_kind, len(v.chain_source), v.chain_sink) == ("fetch", "exec", 2_000, "exec(x)")
+    v = _parse({"classification": "malicious", "source_kind": "telepathy", "sink_kind": ["exec"]})
+    assert (v.source_kind, v.sink_kind, v.chain_source, v.chain_sink) == ("none", "none", "", "")

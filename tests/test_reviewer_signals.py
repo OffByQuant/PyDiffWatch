@@ -426,7 +426,7 @@ def test_the_note_says_cap_only_when_the_cap_cut_something():
 
 def test_the_system_prompt_frames_the_signals_block_as_leads_not_evidence():
     sp = reviewer.SYSTEM_PROMPT
-    assert "dependency / binary / ownership signals block is DiffWatch's heuristic screening" in sp
+    assert "dependency / ownership / publishing signals block is DiffWatch's heuristic screening" in sp
     assert "not evidence on its own" in sp and "a missing finding is not proof of safety" in sp
 
 

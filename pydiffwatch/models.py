@@ -85,3 +85,8 @@ class Verdict:
     recommended_action: str | None = None
     model: str | None = None          # which Claude model produced this verdict (-> verdicts.model)
     runs_when: str | None = None      # the model's answer to when the cited code runs (not stored)
+    source_kind: str | None = None    # spec F: the chain the model quoted (chain.SOURCE_KINDS / SINK_KINDS)
+    sink_kind: str | None = None
+    chain_source: str | None = None
+    chain_sink: str | None = None
+    gate: str | None = None           # why the chain gate or the weak rules held a malicious verdict ("" = stood)
