@@ -58,6 +58,8 @@ def _is_partial(row: dict) -> bool:
     by the same shape orchestrator._record routes there: a benign verdict parked in needs_adjudication by
     an actual model (model != 'none'; a not-scanned release reaching needs_adjudication is a different
     case, handled by _is_not_scanned)."""
+    if row.get("stage") == "reviewed_partial":
+        return True
     if (row.get("reasoning") or "").startswith("reviewed partially:"):
         return True
     return (row.get("stage") == "needs_adjudication"
@@ -118,6 +120,13 @@ def _card(row: dict) -> str:
     reason_html = f'<div class="reason">{e(shown)}</div>' if reasoning else ""
     cited_html = (f'<div class="cited"><span class="k">cited</span> {e(cited)}</div>'
                   if cited else "")
+    pasteable = lambda s: e(s.replace("<", "‹").replace(">", "›"))
+    chain_html = "".join(
+        f'<div class="chain"><span class="k">{label}</span> {e(kind or "?")}: <code>{pasteable(q)}</code></div>'
+        for label, kind, q in (("source", row.get("source_kind"), row.get("chain_source") or ""),
+                               ("sink", row.get("sink_kind"), row.get("chain_sink") or "")) if q)
+    gate = row.get("gate") or ""
+    gate_html = f'<div class="gate">held: {e(gate)}</div>' if gate else ""
     human_html = ""
     if human:
         note = row.get("human_note") or ""
@@ -145,6 +154,8 @@ def _card(row: dict) -> str:
   {model_line_html}
   {reason_html}
   {cited_html}
+  {chain_html}
+  {gate_html}
   <div class="actions">{''.join(actions)}</div>
 </div>"""
 
@@ -175,6 +186,7 @@ h1{font-size:24px;letter-spacing:-.3px}.sub{color:var(--muted);margin:6px 0 28px
 .reason{background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:12px 14px;font-size:14px;line-height:1.55;color:#c9d1d9}
 .human{margin-bottom:10px;font-size:13px;color:var(--ink);font-weight:600}
 .cited{margin-top:8px;font-size:12.5px;color:var(--muted);font-family:var(--mono)}
+.chain,.gate{font-family:var(--mono);font-size:13px;margin-top:6px;color:var(--muted)}.chain code{color:var(--ink)}
 .actions{display:flex;gap:10px;margin-top:14px}
 .btn{font-size:13px;font-weight:600;text-decoration:none;padding:8px 14px;border-radius:8px;border:1px solid var(--line);color:var(--ink)}
 .btn.report{background:#2d1416;border-color:var(--red);color:var(--red)}
