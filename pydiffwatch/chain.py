@@ -250,8 +250,51 @@ def _connected(src_hits, snk_hits, entry) -> bool:
     return any(r == b or _near(r, b, scopes) for r in readers for b in snk)
 
 
+_GROUP_CAP = 64          # K1: at most this many anchor-bearing groups per end are paired below
+
+
+def _groups(hits, lines) -> list:
+    """K1: one end's matched line numbers (all occurrences of all its quoted lines) split into contiguous
+    groups. Sorted n < m share a group only when every shown line strictly between them exists in `lines` and is
+    blank or comment-only (`#...`); a line that is not shown at all breaks the group. Without this, Connected and
+    Kind evidence could be stitched together from scattered, unrelated occurrences of the quoted text."""
+    ns = sorted({m for xs in hits for m in xs})
+    groups: list = []
+    cur: list = []
+    for n in ns:
+        if cur and all(k in lines and (not lines[k].strip() or lines[k].strip().startswith("#"))
+                       for k in range(cur[-1] + 1, n)):
+            cur.append(n)
+        else:
+            if cur:
+                groups.append(cur)
+            cur = [n]
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def _anchor_groups(hits, lines, tails) -> list:
+    """This end's groups (K1) that carry at least one anchor line, capped to the first `_GROUP_CAP` in line
+    order -- bounds the O(groups) pairing work in `_gate_file`."""
+    out = []
+    for g in _groups(hits, lines):
+        if _anchors([g], lines, tails):
+            out.append(g)
+            if len(out) >= _GROUP_CAP:
+                break
+    return out
+
+
+_LEVEL_RANK = {"connected": 1, "src-kind": 2, "snk-kind": 2, "pair": 3}
+
+
 def _gate_file(verdict, path, entry, src_hits, snk_hits) -> str:
-    """Checks 3-6 for one candidate file (Live, Connected, Kind, Pair); "" when this file makes the chain stand."""
+    """Checks 3-6 for one candidate file (Live, Connected, Kind, Pair); "" when this file makes the chain stand.
+    K1: Connected and Kind are checked per contiguous group of matched lines (`_groups`), not across all of an
+    end's occurrences at once -- the chain stands only when SOME (source group, sink group) pair passes Connected
+    and then Kind on that pair's own texts. When no pair passes, the reason returned is from whichever pair got
+    furthest (Connected < Kind < Pair), preferring a source-Kind reason over a sink-Kind one at the same depth."""
     cls = entry.get("cls")
     if cls == "not-shipped":
         return f"chain is in not-shipped code ({path})"
@@ -265,12 +308,29 @@ def _gate_file(verdict, path, entry, src_hits, snk_hits) -> str:
         return "source is only a comment or a string"
     if not any(_live(_text_at(n, lines, tails)) for ns in snk_hits for n in ns):
         return "sink is only a comment or a string"
-    if not _connected(src_hits, snk_hits, entry):
+    src_groups = _anchor_groups(src_hits, lines, tails)
+    snk_groups = _anchor_groups(snk_hits, lines, tails)
+    if not src_groups or not snk_groups:
         return "no dataflow shown between source and sink"
     strings = set(entry.get("strings") or [])
     kind_lines = {n: t for n, t in lines.items() if n not in strings}       # import table skips string lines (R8-1)
-    return _kinds(verdict, [_text_at(n, lines, tails) for ns in src_hits for n in ns],
-                  [_text_at(n, lines, tails) for ns in snk_hits for n in ns], kind_lines)
+    table = _import_table(t for t in kind_lines.values() if t.lstrip().startswith(("import ", "from ")))
+    best_rank, best_level, best_reason = -1, None, None
+    for sg in src_groups:
+        for kg in snk_groups:
+            if not _connected([sg], [kg], entry):
+                level, reason = "connected", "no dataflow shown between source and sink"
+            else:
+                reason = _kinds(verdict, [_text_at(n, lines, tails) for n in sg],
+                                [_text_at(n, lines, tails) for n in kg], table)
+                if reason == "":
+                    return ""
+                level = "src-kind" if reason.startswith("source quoted") else \
+                    "snk-kind" if reason.startswith("sink quoted") else "pair"
+            rank = _LEVEL_RANK[level]
+            if rank > best_rank or (rank == best_rank and level == "src-kind" and best_level == "snk-kind"):
+                best_rank, best_level, best_reason = rank, level, reason
+    return best_reason
 
 
 def gate(verdict, shown) -> str:
@@ -306,14 +366,18 @@ PAIRS = frozenset({("secret-read", "send"), ("payload", "exec"), ("fetch", "exec
                    ("payload", "write-and-run")})
 _CRED = re.compile(r"\.ssh|\.aws|\.pypirc|\.netrc|\.git-credentials|\.npmrc|\.docker/config\.json|\.kube/config|"
                    r"keyring|/proc/[^/'\"]+/(?:environ|cmdline)|Cookies|Login Data|Local State|key4\.db|wallet\.dat|"
-                   r"Exodus|Electrum", re.I)
-_PERSIST = re.compile(r"\.pth\b|sitecustomize|\.bashrc|\.zshrc|\.profile|crontab|/etc/cron|systemd/|\.service\b|"
-                      r"LaunchAgents", re.I)
-_BLOB = re.compile(r"^(?:[A-Za-z0-9+/=_-]{128,}|(?:[0-9a-fA-F]{2}){64,})$")
+                   r"Exodus|Electrum")
+_PERSIST = re.compile(r"\.pth$|(?:site|user)customize\.py$|(?:^|/)\.(?:bashrc|zshrc|profile|bash_profile)$|"
+                      r"crontab|/etc/cron|systemd/.*\.service$|LaunchAgents/")
+_BLOB = re.compile(r"^(?:(?=.*\d)(?=.*[A-Z])(?=.*[a-z])[A-Za-z0-9+/=_-]{128,}|(?:[0-9a-fA-F]{2}){65,})$")
 _DECODE = {"b64decode", "urlsafe_b64decode", "b16decode", "b32decode", "a85decode", "b85decode", "unhexlify",
            "decompress", "fromhex", "a2b_base64", "a2b_hex", "a2b_uu"}
 _NET_ROOTS = {"requests", "httpx", "urllib", "urllib3", "aiohttp", "socket", "http", "smtplib", "ftplib"}
 _NET_FUNCS = {"urlopen", "urlretrieve", "Request", "create_connection"}
+_NET_PRIMS = {"urlopen", "urlretrieve", "Request", "get", "post", "put", "patch", "delete", "head", "request",
+              "stream", "socket", "create_connection", "connect", "send", "sendall", "sendto", "recv", "Client",
+              "AsyncClient", "Session", "ClientSession", "PoolManager", "HTTPConnection", "HTTPSConnection", "SMTP",
+              "SMTP_SSL", "FTP"}
 _FETCH_METHODS = {"recv", "recv_into", "get", "read", "urlopen", "urlretrieve"}
 _SEND_METHODS = {"send", "sendall", "sendto", "request", "post", "put", "patch", "sendmail"}
 _PROCESS = {"os.system", "os.popen", "subprocess.Popen", "subprocess.run", "subprocess.call",
@@ -322,22 +386,36 @@ _WRITE_MODES = {"w", "wb", "a", "ab", "w+", "wb+", "a+", "ab+", "x", "xb"}
 
 
 def _import_table(lines) -> dict:
-    """name -> full dotted target from the shown file's import lines (Ruling F2)."""
+    """name -> full dotted target from the shown file's import lines (Ruling F2). Each line is split on a
+    top-level `;` first (K2: `import os; import subprocess as sp` -> `sp` maps to `subprocess`, not `os`)."""
     table = {}
     for text in lines:
         toks = [t.string for t in _tokens(text)]
-        if toks[:1] == ["import"]:
-            for part in " ".join(toks[1:]).split(","):
-                words = part.replace(" . ", ".").split()
-                if words:
-                    table[words[-1] if "as" in words else words[0].split(".")[0]] = words[0] if "as" in words \
-                        else words[0].split(".")[0]
-        elif toks[:1] == ["from"] and "import" in toks:
-            mod = "".join(toks[1:toks.index("import")])
-            for part in " ".join(toks[toks.index("import") + 1:]).strip("() ").split(","):
-                words = part.split()
-                if words:
-                    table[words[-1]] = f"{mod}.{words[0]}"
+        stmts, cur, depth = [], [], 0
+        for tok in toks:
+            if tok in ("(", "[", "{"):
+                depth += 1
+            elif tok in (")", "]", "}"):
+                depth -= 1
+            if tok == ";" and depth == 0:
+                stmts.append(cur)
+                cur = []
+            else:
+                cur.append(tok)
+        stmts.append(cur)
+        for toks in stmts:
+            if toks[:1] == ["import"]:
+                for part in " ".join(toks[1:]).split(","):
+                    words = part.replace(" . ", ".").split()
+                    if words:
+                        table[words[-1] if "as" in words else words[0].split(".")[0]] = words[0] if "as" in words \
+                            else words[0].split(".")[0]
+            elif toks[:1] == ["from"] and "import" in toks:
+                mod = "".join(toks[1:toks.index("import")])
+                for part in " ".join(toks[toks.index("import") + 1:]).strip("() ").split(","):
+                    words = part.split()
+                    if words:
+                        table[words[-1]] = f"{mod}.{words[0]}"
     return table
 
 
@@ -379,12 +457,13 @@ def _last(n):
 
 
 def _net_call(c):
-    return c.split(".", 1)[0] in _NET_ROOTS or _last(c) in _NET_FUNCS
+    return (c.split(".", 1)[0] in _NET_ROOTS and _last(c) in _NET_PRIMS) or _last(c) in _NET_FUNCS
 
 
 def _is_exec(f):
     return (any(c in {"exec", "eval", "compile", "__import__"} or c in _PROCESS
-                or c.startswith(("os.exec", "os.spawn", "ctypes", "runpy", "importlib")) for c in f["calls"])
+                or c.split(".", 1)[0] in {"ctypes", "runpy", "importlib"} or c.startswith(("os.exec", "os.spawn"))
+                for c in f["calls"])
             or any(n.split(".", 1)[0] == "ctypes" for n in f["names"]) or "exec_module" in f["methods"])
 
 
@@ -422,9 +501,8 @@ def _evidence(kind, texts, table) -> bool:
     return False
 
 
-def _kinds(verdict, src_lines, snk_lines, lines) -> str:
-    """Checks 5 (Kind) and 6 (Pair)."""
-    table = _import_table(t for t in lines.values() if t.lstrip().startswith(("import ", "from ")))
+def _kinds(verdict, src_lines, snk_lines, table) -> str:
+    """Checks 5 (Kind) and 6 (Pair). `table` is `_gate_file`'s import table (K1: built once, reused per group)."""
     if not _evidence(verdict.source_kind, src_lines, table):
         return f"source quoted as {verdict.source_kind}, but the quoted lines show no {verdict.source_kind}"
     if not _evidence(verdict.sink_kind, snk_lines, table):
