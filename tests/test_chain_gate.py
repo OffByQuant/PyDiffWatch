@@ -1068,3 +1068,140 @@ def test_q1_a_non_dict_scopes_value_does_not_raise():
     # the name-merge reads scopes on every quoted line; a malformed scopes value must not make the gate raise
     shown = {"setup.py": dict(chains.SHOWN["setup.py"], scopes=[1, 2])}
     assert isinstance(chain.gate(_v(), shown), str)
+
+
+# ---- Task 8 fix round 4 (rulings S1-S3): what `_reads` counts as a read ----
+
+@pytest.mark.parametrize("line, read, not_read", [
+    # S1: a comprehension's own loop targets are not reads on that line
+    ("r = [x for x in xs]", {"xs"}, {"r", "x"}),
+    ("r = {k: v for k, v in d.items()}", {"d"}, {"r", "k", "v"}),
+    ("r = f(x for x in xs)", {"f", "xs"}, {"x"}),
+    ("out = [t for t in raw if t != token]", {"raw", "token"}, {"t", "out"}),
+    ("for x in x:", {"x"}, set()),
+    # S2: binding-only positions
+    ("def x(a, b=c):", {"c"}, {"x", "a", "b"}),
+    ("def x(a=token):", {"token"}, {"x", "a"}),
+    ("def x(a: T = v) -> R:", {"T", "v", "R"}, {"x", "a"}),
+    ("async def x(a):", set(), {"x", "a"}),
+    ("def upload(data, url): return data", set(), {"upload", "data", "url"}),
+    ("class x(Base, metaclass=M):", {"Base", "M"}, {"x", "metaclass"}),
+    ("import x", set(), {"x"}),
+    ("import a as x", set(), {"a", "x"}),
+    ("from m import a as x", set(), {"m", "a", "x"}),
+    ("global x", set(), {"x"}),
+    ("nonlocal x", set(), {"x"}),
+    ("del x", set(), {"x"}),
+    ("g = lambda x: x + 1", set(), {"g", "x"}),
+    ("g = lambda x=d: y", {"d", "y"}, {"g", "x"}),
+    ("with f() as (a, b):", {"f"}, {"a", "b"}),
+    ("with open(p) as x:", {"p"}, {"x"}),
+    ("case x:", set(), {"x"}),
+    ("x: T", {"T"}, {"x"}),
+    ("(a, b) = f()", {"f"}, {"a", "b"}),
+    # S3: continuation, compound and annotated lines
+    ("URL, TOKEN, timeout=5,", {"URL", "TOKEN"}, {"timeout"}),
+    ("data=token,", {"token"}, {"data"}),
+    ("    data=token)", {"token"}, {"data"}),
+    ("token = os.environ.get('K',", {"os"}, {"token"}),
+    ("if TOKEN: h = {'a': 1}", {"TOKEN"}, {"h"}),
+    ("if x == y: z = 1", {"x", "y"}, {"z"}),
+    ("else: y = x", {"x"}, {"y"}),
+    ("x: T = v", {"T", "v"}, {"x"}),
+    ("x = 1; y = x", {"x"}, {"y"}),
+    ("match x:", {"x"}, set()),
+    # unchanged from round 3
+    ("x = x + 1", {"x"}, set()),
+    ("x[i] = v", {"x", "i", "v"}, set()),
+    ("a = b = a", {"a"}, {"b"}),
+    ("f(a, x=v)", {"f", "a", "v"}, {"x"}),
+])
+def test_s_reads_table(line, read, not_read):
+    got = chain._reads(line)
+    assert read <= got and not (got & not_read), got
+
+
+_PAD4 = "".join(f"def pad{i}():\n    return {i}\n" for i in range(40))
+
+
+@pytest.mark.parametrize("nm, comp", [("key", "{key: v for key, v in d.items()}"),
+                                      ("path", "[path.name for path in paths]"),
+                                      ("token", "[token.strip() for token in raw]")])
+def test_s1_a_comprehension_target_does_not_hop_from_a_module_binder(nm, comp):
+    text = (f"import os, requests\n{nm} = os.environ.get('API_KEY')\n" + _PAD4
+            + f"def upload(url, d, paths, raw):\n    out = {comp}\n    requests.post(url, json=out)\n")
+    got = _one("pkg/a.py", text, f"{nm} = os.environ.get('API_KEY')", "requests.post(url, json=out)",
+               "secret-read", "send")
+    assert got == "no dataflow shown between source and sink"
+
+
+def test_s1_a_generator_target_does_not_hop_to_exec():
+    text = ("import base64\ncode = base64.b64decode(BLOB)\n" + _PAD4
+            + "def run(lines):\n    src = '\\n'.join(code for code in lines)\n    exec(src)\n")
+    assert _one("pkg/a.py", text, "code = base64.b64decode(BLOB)", "exec(src)", "payload", "exec") == \
+        "no dataflow shown between source and sink"
+
+
+def test_s1_a_comprehension_that_reads_the_outer_name_still_hops():
+    text = ("import os, requests\ntoken = os.environ.get('API_KEY')\n" + _PAD4
+            + "def upload(url, raw):\n    out = [t for t in raw if t != token]\n    requests.post(url, json=out)\n")
+    assert _one("pkg/a.py", text, "token = os.environ.get('API_KEY')", "requests.post(url, json=out)",
+                "secret-read", "send") == ""
+
+
+_DATA = "import os, json, requests\ndata = os.environ.get('XDG_DATA_HOME')\n" + _PAD4
+
+
+@pytest.mark.parametrize("fn", [
+    "def upload(data, url):\n    requests.post(url, json=payload())\n",
+    "def upload(url):\n    del data\n    requests.post(url, json=rows)\n",
+    "def upload(url):\n    import data\n    requests.post(url, json=rows)\n",
+    "def upload(url):\n    key = lambda data: data.id\n    requests.post(url, json=key)\n",
+    "def upload(url):\n    with open(p) as (data, x): pass\n    requests.post(url, json=rows)\n",
+], ids=["unused-param", "del", "import", "lambda", "with-as-tuple"])
+def test_s2_a_binding_only_position_does_not_hop(fn):
+    sink = fn.rsplit("\n    ", 1)[1].strip()
+    assert _one("pkg/a.py", _DATA + fn, "data = os.environ.get('XDG_DATA_HOME')", sink, "secret-read", "send") == \
+        "no dataflow shown between source and sink"
+
+
+def test_s2_a_quoted_def_header_does_not_merge_with_a_module_binder():
+    text = _DATA + "def upload(data, url):\n    requests.post(url, json=payload())\n"
+    got = _one("pkg/a.py", text, "data = os.environ.get('XDG_DATA_HOME')\ndef upload(data, url):",
+               "requests.post(url, json=payload())", "secret-read", "send")
+    assert got == "no dataflow shown between source and sink"
+
+
+def test_s2_a_default_argument_value_is_a_read():
+    text = ("import os, requests\nTOKEN = os.environ['GITHUB_TOKEN']\n" + _PAD4
+            + "def send(t=TOKEN):\n    requests.post(URL, data=t)\n")
+    assert _one("pkg/a.py", text, "TOKEN = os.environ['GITHUB_TOKEN']", "requests.post(URL, data=t)",
+                "secret-read", "send") == ""
+
+
+def test_s3_a_black_positional_argument_line_reads_the_module_token():
+    text = ("import os, requests\nTOKEN = os.environ['GITHUB_TOKEN']\n" + _PAD4
+            + "def send():\n    r = requests.post(\n        URL, TOKEN, timeout=5,\n    )\n")
+    assert _one("pkg/a.py", text, "TOKEN = os.environ['GITHUB_TOKEN']", "r = requests.post(",
+                "secret-read", "send") == ""
+
+
+def test_s3_a_one_line_if_reads_its_condition():
+    text = ("import os, requests\nTOKEN = os.environ['GITHUB_TOKEN']\n" + _PAD4
+            + "def send():\n    if TOKEN: h = {'a': 1}\n    requests.post(URL, headers=h)\n")
+    assert _one("pkg/a.py", text, "TOKEN = os.environ['GITHUB_TOKEN']", "requests.post(URL, headers=h)",
+                "secret-read", "send") == ""
+
+
+@pytest.mark.parametrize("line", [
+    "(" + "for x " * 20_000 + ")",
+    "(" + "lambda x " * 20_000 + ")",
+    "x" + " as (" * 5_000 + ")" * 5_000,
+    "with f() as (" + "a, " * 20_000 + "): pass",
+    "else: " * 20_000 + "x",
+    "if a: " * 20_000 + "x = y",
+], ids=["fors", "lambdas", "nested-as", "wide-as", "else-chain", "if-chain"])
+def test_s_reads_is_linear_and_never_raises_on_hostile_lines(line):
+    t0 = time.perf_counter()
+    assert isinstance(chain._reads(line), set)
+    assert time.perf_counter() - t0 < 1.0

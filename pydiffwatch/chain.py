@@ -186,38 +186,149 @@ def _bound(text: str) -> set:
     return out
 
 
+_HEADERS = {"if", "elif", "else", "while", "for", "with", "try", "except", "finally", "match"}
+_NO_READS = {"import", "from", "global", "nonlocal", "del"}
+
+
 def _reads(text: str) -> set:
-    """Names a line really reads (Q1): a name counts only when it occurs more often than it occurs as an assignment
-    target -- before a top-level `=`, directly before `:=`, between `for` and `in`, or after `as`. So `x = x + 1`
-    reads x, `x += 1` reads x, and `data = json.dumps(c)` does not read data. A dotted receiver or a called name is a
-    read; an attribute, a keyword, a builtin, and a keyword-argument name (a NAME before `=` inside brackets) are not.
-    A target is a bare NAME at depth 0 (not `x[i]` or `x.attr`, which read x)."""
+    """Names a line really reads (Q1, round 4 S1-S3). Per `;`-separated statement, a name is read when it occurs
+    more often than it occurs as a binding target. Targets are bare names, including inside grouping brackets
+    (`(a, b) = f()`), in these places: before the last top-level `=` of a non-continuation line (the name
+    before `:` for an annotated one, whose annotation is read); directly before `:=`; between `for` and `in`;
+    after `as`. Never read: the name after `def`/`class`; `def`/`lambda` parameters and comprehension loop
+    targets (anywhere on the line); every name in `import`/`from`/`global`/`nonlocal`/`del` statements; a
+    `case` capture; a keyword-argument name. A continuation line (bracket balance < 0, or ending `,` without
+    opening one) has no targets. In a one-line compound statement (`if c: x = y`), the header is read and the
+    body after its `:` is a statement of its own. A dotted receiver or a called name is a read; an attribute,
+    a keyword or a builtin is not. `x += 1` reads x, and `x = x + 1` reads x. One pass per concern: linear in
+    the line's tokens."""
     toks = _tokens(text)
-    occ: dict = {}
-    targets: dict = {}
-    depths, depth, last_eq = [], 0, None
+    depths, match, opened, depth = [], [len(toks)] * len(toks), [], 0
     for i, t in enumerate(toks):
-        if t.string in (")", "]", "}"):
+        if t.type == tokenize.OP and t.string in (")", "]", "}"):
             depth -= 1
+            if opened:
+                match[opened.pop()] = i
         depths.append(depth)
-        if t.string in ("(", "[", "{"):
+        if t.type == tokenize.OP and t.string in ("(", "[", "{"):
             depth += 1
-        if depth == 0 and t.type == tokenize.OP and t.string == "=":
-            last_eq = i
-    loop = False
-    for i, t in enumerate(toks):
-        if t.type == tokenize.NAME and t.string in ("for", "in"):
-            loop = t.string == "for"
-        if t.type != tokenize.NAME or t.string in _NOT_NAMES or (i and toks[i - 1].string == "."):
-            continue
-        nxt = toks[i + 1].string if i + 1 < len(toks) else ""
-        if nxt == "=" and depths[i] > 0:
-            continue                                          # a keyword-argument name
-        occ[t.string] = occ.get(t.string, 0) + 1
-        if (loop or nxt == ":=" or (i and toks[i - 1].string == "as")
-                or (last_eq is not None and i < last_eq and depths[i] == 0 and nxt not in (".", "[", "("))):
-            targets[t.string] = targets.get(t.string, 0) + 1
-    return {n for n, c in occ.items() if c > targets.get(n, 0)}
+            opened.append(i)
+    cont = depth < 0 or (bool(toks) and toks[-1].string == "," and depth <= 0)
+    local: set = set()
+    out: set = set()
+    start = 0
+    for i in range(len(toks) + 1):
+        if i == len(toks) or (depths[i] == 0 and toks[i].string == ";"):
+            _stmt_reads(toks, depths, match, start, i, cont, out, local)
+            start = i + 1
+    return out - local
+
+
+def _grouped_names(toks, a, b) -> list:
+    """Indices of bare names in toks[a:b] that are binding targets: not dotted, not subscripted or called, and
+    inside only grouping brackets (a tuple/list display), never inside a call's or subscript's brackets."""
+    out, stack = [], []
+    for i in range(a, b):
+        t = toks[i]
+        prev = toks[i - 1] if i > a else None
+        if t.string in ("(", "[", "{"):
+            stack.append(t.string != "{" and not (prev is not None and (prev.type in (tokenize.NAME, tokenize.STRING)
+                                                                      or prev.string in (")", "]"))))
+        elif t.string in (")", "]", "}"):
+            if stack:
+                stack.pop()
+        elif (t.type == tokenize.NAME and all(stack) and not (prev is not None and prev.string == ".")
+              and not (i + 1 < b and toks[i + 1].string in (".", "[", "("))):
+            out.append(i)
+    return out
+
+
+def _stmt_reads(toks, depths, match, a, b, cont, out, local) -> None:
+    """`_reads` for one statement, toks[a:b]; adds its read names to `out` and its line-local names to `local`.
+    A one-line compound statement is walked header by header (a loop, not recursion)."""
+    while True:
+        while a < b and toks[a].string == "async":
+            a += 1
+        if a >= b or toks[a].string in _NO_READS:
+            return
+        first, d0 = toks[a].string, depths[a]
+        colon = next((i for i in range(a, b) if depths[i] == d0 and toks[i].string == ":"), None)
+        skip: set = set()               # never counted
+        targets: list = []
+        body = None                     # where a one-line compound statement's body starts (its header's `:`)
+        if first in ("def", "class"):
+            skip.add(a + 1)
+            if first == "def" and a + 2 < b and toks[a + 2].string == "(":
+                for i in range(a + 3, min(match[a + 2], b)):
+                    if (toks[i].type == tokenize.NAME and depths[i] == d0 + 1
+                            and toks[i - 1].string in ("(", ",", "*", "**")):
+                        skip.add(i)
+                        local.add(toks[i].string)
+            body = colon
+        elif first in _HEADERS:
+            body = colon
+            if first == "for":
+                stop = colon if colon is not None else b
+                j = next((i for i in range(a + 1, stop) if depths[i] == d0 and toks[i].string == "in"), stop)
+                targets += _grouped_names(toks, a + 1, j)
+        elif first == "case":
+            for i in range(a + 1, colon if colon is not None else b):
+                if toks[i].type == tokenize.NAME and toks[i - 1].string != "." and \
+                        not (i + 1 < b and toks[i + 1].string in (".", "(", "=")):
+                    skip.add(i)
+            body = colon
+        elif not cont:
+            eqs = [i for i in range(a, b) if depths[i] == d0 and toks[i].string == "="]
+            if colon is not None and first != "lambda" and (not eqs or colon < eqs[0]):
+                targets += _grouped_names(toks, a, colon)          # an annotated target; its annotation is read
+            elif eqs:
+                targets += _grouped_names(toks, a, eqs[-1])
+        end = body if body is not None else b
+        fors: dict = {}
+        lambdas: dict = {}
+        covered = a
+        for i in range(a, end):
+            s, d = toks[i].string, depths[i]
+            if s == ":=" and i > a and toks[i - 1].type == tokenize.NAME:
+                targets.append(i - 1)
+            elif s == "as" and i + 1 < end:
+                if toks[i + 1].string != "(":
+                    targets.append(i + 1)
+                elif i + 1 >= covered:                            # nested `as (` regions are scanned once
+                    covered = min(match[i + 1], end - 1) + 1
+                    targets += _grouped_names(toks, i + 1, covered)
+            elif s == "for" and d > d0:
+                fors[d] = i
+            elif s == "in" and d in fors:                         # a comprehension's own loop targets
+                for k in _grouped_names(toks, fors.pop(d) + 1, i):
+                    skip.add(k)
+                    local.add(toks[k].string)
+            elif s == "lambda":
+                lambdas[d] = i
+            elif s == ":" and d in lambdas:
+                for k in range(lambdas.pop(d) + 1, i):
+                    if (toks[k].type == tokenize.NAME and depths[k] == d
+                            and toks[k - 1].string in ("lambda", ",", "*", "**")):
+                        skip.add(k)
+                        local.add(toks[k].string)
+        occ: dict = {}
+        for i in range(a, end):
+            t = toks[i]
+            if (i in skip or t.type != tokenize.NAME or t.string in _NOT_NAMES
+                    or (i and toks[i - 1].string == ".")):
+                continue
+            if (i + 1 < len(toks) and toks[i + 1].string == "=" and (depths[i] > d0 or cont)
+                    and (i == a or toks[i - 1].string in ("(", ","))):
+                continue                                      # a keyword-argument name (not `a: T = v`'s T)
+            occ[t.string] = occ.get(t.string, 0) + 1
+        tgt: dict = {}
+        for i in set(targets):
+            if a <= i < end and i not in skip:
+                tgt[toks[i].string] = tgt.get(toks[i].string, 0) + 1
+        out.update(n for n, c in occ.items() if c > tgt.get(n, 0))
+        if body is None:
+            return
+        a, cont = body + 1, False
 
 
 def _cuts(entry) -> dict:
