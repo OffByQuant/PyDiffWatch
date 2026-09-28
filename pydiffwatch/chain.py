@@ -243,7 +243,7 @@ def _connected(src_hits, snk_hits, entry) -> bool:
     bound = set().union(*(_bound(_text_at(n, lines, tails)) for n in src))
     if not bound:
         return False
-    strings = set(entry.get("strings") or [])
+    strings = set(entry.get("strings") or []) - set(entry.get("fields") or {})   # field code may read (N1)
     readers = [r for r in lines if r not in src and r not in strings and _live(_text_at(r, lines, tails))
                and bound & _names(_text_at(r, lines, tails))]
     return any(r == b or _near(r, b, scopes) for r in readers for b in snk)

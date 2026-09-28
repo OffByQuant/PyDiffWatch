@@ -670,13 +670,23 @@ def _field_code(tree, pos) -> dict:
     statement's fields are left out: the whole statement stays a string line, as before."""
     bare = {id(c) for n in ast.walk(tree) if isinstance(n, ast.Expr) and isinstance(n.value, ast.JoinedStr)
             for c in ast.walk(n.value)}
+    fvs = [n for n in ast.walk(tree) if isinstance(n, ast.FormattedValue)]
+    # only the outermost field's code: a field nested in another's `.value` is already inside that slice (fix N2)
+    inner = {id(c) for fv in fvs for c in ast.walk(fv.value) if c is not fv.value}
     out: dict[int, list] = {}
-    for fv in ast.walk(tree):
-        if not (isinstance(fv, ast.FormattedValue) and fv.value.end_lineno) or id(fv) in bare:
+    for fv in fvs:
+        if not fv.value.end_lineno or id(fv) in bare or id(fv) in inner:
             continue
         o1 = pos.offset(fv.value.lineno, fv.value.col_offset)
         o2 = pos.offset(fv.value.end_lineno, fv.value.end_col_offset)
+        literal = set()                                 # interior lines of a string nested in the field (fix N3)
+        for c in ast.walk(fv.value):
+            if _is_str(c) and c.end_lineno:
+                c1 = pos.shown_line(pos.offset(c.lineno, c.col_offset))
+                literal.update(range(c1 + 1, pos.shown_line(pos.offset(c.end_lineno, c.end_col_offset))))
         for n in range(pos.shown_line(o1), pos.shown_line(o2) + 1):
+            if n in literal:
+                continue
             s, e = pos.spans[n - 1]
             if seg := pos.text[max(o1, s):min(o2, e)].strip():
                 out.setdefault(n, []).append((max(o1, s), seg))
@@ -702,9 +712,9 @@ def _shown_entry(fd, cls, whole) -> dict:
         entry["scopes"] = {n: scopes.get(pos.ast_line(n), "module") if n <= len(pos.spans) else "module"
                            for n in lines}
         strings, fields = set(_string_lines(tree, pos)), _field_code(tree, pos)
-        entry["strings"] = sorted(n for n in lines if n in strings and n not in fields)
+        entry["strings"] = sorted(n for n in lines if n in strings)   # field lines too: never a quoted end (N1)
         if code := {n: fields[n] for n in lines if n in strings and n in fields}:
-            entry["fields"] = code                      # a string line holding `{...}` code: that code only (G1)
+            entry["fields"] = code                      # ...but a hop may read their `{...}` code (G1)
         tails = {n: c for n, c in _string_tails(tree, pos).items() if n in lines}
         if tails:
             entry["tails"] = tails
