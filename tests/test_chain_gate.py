@@ -105,7 +105,7 @@ def test_same_function_connects_without_a_shared_name():
 
 
 def test_one_hop_connects_through_a_shown_reading_line():
-    # plan review I6: the caracas tuple shape — the literal at module level, `b = _B[0]` inside _run reads it
+    # plan review I6: the audited hex-tuple shape — the literal at module level, `b = _B[0]` inside _run reads it
     blob = "ab" * 80
     text = (f"import os\n_B = (bytes.fromhex('{blob}'), 1)\ndef _run(v):\n    k = os.urandom(32)\n    b = _B[0]\n"
             "    o = bytes(c ^ k[i % 32] for i, c in enumerate(b))\n    exec(o[3:], {'T': v})\n")
@@ -623,7 +623,7 @@ def test_send_evidence_on_any_receiver(sink):
     assert _one("pkg/a.py", text, "k = os.environ['K']", sink, "secret-read", "send") == ""
 
 
-def test_caracas_shape_passes_through_the_shared_name():
+def test_hex_tuple_loader_passes_through_the_shared_name():
     blob = "ab" * 80
     text = (f"import os\n_B = (bytes.fromhex('{blob}'),)\ndef _run(v):\n    k = os.urandom(32)\n    b = _B[0]\n"
             "    o = bytes(c ^ k[i % 32] for i, c in enumerate(b))\n    exec(o[3:], {'T': v})\n")
@@ -631,14 +631,14 @@ def test_caracas_shape_passes_through_the_shared_name():
     assert _one("pkg/__init__.py", text, xor, "exec(o[3:], {'T': v})", "payload", "exec", cls="import") == ""
 
 
-def test_caracas_literal_and_exec_at_module_level_pass_through_the_scope():
+def test_hex_tuple_loader_literal_and_exec_at_module_level_pass_through_the_scope():
     blob = "ab" * 80
     text = f"_B = bytes.fromhex('{blob}')\nexec(_run(_B))\n"
     assert _one("pkg/__init__.py", text, f"_B = bytes.fromhex('{blob}')", "exec(_run(_B))", "payload", "exec",
                 cls="import") == ""
 
 
-def test_caracas_literal_at_module_level_and_exec_in_a_function_is_held():
+def test_hex_tuple_loader_literal_at_module_level_and_exec_in_a_function_is_held():
     # the spec's accepted cost (§7): no shared name, different scopes -> downgraded, not dropped
     blob = "ab" * 80
     text = f"_P = '{blob}'\ndef _run(v):\n    exec(v)\n"
@@ -806,7 +806,7 @@ def test_k2_blob_needs_more_than_a_digest_or_plain_words(blob):
     assert got == "source quoted as payload, but the quoted lines show no payload"
 
 
-def test_k2_blob_caracas_hex_still_passes():
+def test_k2_blob_hex_tuple_loader_still_passes():
     blob = "ab" * 80
     text = f"_B = bytes.fromhex('{blob}')\nexec(_run(_B))\n"
     assert _one("pkg/__init__.py", text, f"_B = bytes.fromhex('{blob}')", "exec(_run(_B))", "payload", "exec",
@@ -1310,3 +1310,54 @@ def test_a_nested_lambda_colon_does_not_end_the_outer_lambda(line):
 def test_tokens_never_raises_on_a_line_the_c_tokenizer_cannot_decode():
     # Task 10 fix J1: a "\r" before a U+2028 made tokenize raise UnicodeDecodeError out of the gate
     chain._tokens(")\r f'{x")
+
+
+# ---- final review fix pass ----
+
+@pytest.mark.parametrize("line", ["o = bytes(c ^ 0x5a for c in b)", "o = bytes(x ^ 90 for x in data)",
+                                  "o = bytes(c ^ b'Z'[0] for c in b)", "o = k ^ 0x5a"])
+def test_x3_single_key_xor_is_payload(line):
+    assert chain._evidence("payload", [line], {})
+
+
+@pytest.mark.parametrize("line", ["h = a ^ b", "flags = mode ^ other"])
+def test_x3_a_bare_xor_of_names_is_not_payload(line):
+    assert not chain._evidence("payload", [line], {})
+
+
+_HEXBLOB = "".join(f"{(i * 7) % 256:02x}" for i in range(369))
+_HEX_TUPLE = (f'import sys\n_B = (bytes.fromhex("{_HEXBLOB}"),)\ndef _run():\n    b = _B[0]\n'
+              '    o = bytes(c ^ 0x5a for c in b)\n    exec(o[3:], {"T": sys})\n_run()\n')
+_BLOB_LINE = f'_B = (bytes.fromhex("{_HEXBLOB}"),)'
+_EXEC = 'exec(o[3:], {"T": sys})'
+_XOR = "o = bytes(c ^ 0x5a for c in b)"
+
+
+def _xg(src, text=_HEX_TUPLE):
+    return chain.gate(_v(chain_source=src, chain_sink=_EXEC, source_kind="payload", sink_kind="exec"),
+                      _shown("pkg/__init__.py", text, cls="import"))
+
+
+@pytest.mark.parametrize("dots", ["...", "…", " ..."])
+def test_x6_a_truncated_blob_line_plus_the_xor_line_stands(dots):
+    assert _xg(_BLOB_LINE[:80] + dots + "\n" + _XOR) == ""
+
+
+def test_x6_a_short_truncated_prefix_is_not_found():
+    assert _xg(_BLOB_LINE[:20] + "...") == "source not found in the shown code"
+
+
+def test_x6_a_prefix_of_two_shown_lines_is_not_found():
+    text = _HEX_TUPLE.replace("import sys\n", f"import sys\n_B = (bytes.fromhex(\"{_HEXBLOB}\"), 2)\n")
+    assert _xg(_BLOB_LINE[:80] + "...\n" + _XOR, text) == "source not found in the shown code"
+
+
+def test_x6_a_prefix_of_a_line_inside_a_string_is_not_found():
+    text = 'import sys\nDOC = """\n' + _BLOB_LINE + '\n"""\ndef _run(o):\n    exec(o[3:], {"T": sys})\n'
+    assert _xg(_BLOB_LINE[:80] + "...", text) == "source not found in the shown code"
+
+
+def test_x6_an_exact_quote_ending_in_dots_still_matches_exactly():
+    text = 'import sys\ndef _run(o):\n    msg = "loading the embedded payload module now..."\n    exec(o[3:], {"T": sys})\n'
+    assert chain._hits(chain._index(_shown("pkg/a.py", text)["pkg/a.py"]),
+                       chain.clean('msg = "loading the embedded payload module now..."'), set()) == [[3]]

@@ -136,12 +136,41 @@ def _index(entry) -> dict:
     return idx
 
 
+_CUT_MIN = 32            # X6: the shortest truncated-quote prefix that may name a shown line
+
+
+def _cut(text: str):
+    """A quoted line the model cut short: its text without the trailing "..."/"…", or None."""
+    for e in ("...", "…"):
+        if text.endswith(e):
+            return text[:-len(e)].rstrip()
+    return None
+
+
+def _prefix_hit(keys, prefix):
+    """The one line of `keys` (sorted (normalised text, line) pairs) starting with `prefix`, or None when none or
+    several do -- a bisect and at most two steps."""
+    i = bisect.bisect_left(keys, (prefix,))
+    found = []
+    while i < len(keys) and len(found) < 2 and keys[i][0].startswith(prefix):
+        found.append(keys[i][1])
+        i += 1
+    return found[0] if len(found) == 1 else None
+
+
 def _hits(idx, pairs, strings) -> list | None:
     """Line numbers of every quoted line in one file, or None when some quoted line is not there. A matched
-    occurrence whose line number lies inside a string constant does not count (fix I3b)."""
-    out = []
+    occurrence whose line number lies inside a string constant does not count (fix I3b). A quoted line with no
+    exact match that ends in "..." or "…" (X6) matches the ONE shown line outside strings that its remaining text,
+    at least _CUT_MIN chars, is a prefix of."""
+    out, keys = [], None
     for raw, stripped in pairs:
         found = [n for n in (idx.get(raw) or idx.get(stripped) or []) if n not in strings]
+        if not found:
+            cuts = [c for c in (_cut(raw), _cut(stripped)) if c is not None and len(c) >= _CUT_MIN]
+            if cuts and keys is None:
+                keys = sorted(((t, n) for t, ns in idx.items() for n in ns if n not in strings), key=lambda k: k[0])
+            found = next(([n] for c in cuts if (n := _prefix_hit(keys, c)) is not None), [])
         if not found:
             return None
         out.append(found)
@@ -823,7 +852,19 @@ def _facts(text, table) -> dict:
     fstr = any(t.type == tokenize.STRING and t.string[:1] in "fF" for t in toks) or \
         any(t.type == _FSTRING_START for t in toks)
     ops = {t.string for t in toks if t.type == tokenize.OP}
-    return {"calls": calls, "names": names, "methods": methods, "strings": strings, "ops": ops, "fstr": fstr}
+    # X3: a `^` with an integer or bytes literal operand, or on a line with a `for` (a comprehension or loop)
+    keyed_xor = "^" in ops and (any(t.type == tokenize.NAME and t.string == "for" for t in toks) or any(
+        toks[k].string == "^" and any(_int_or_bytes(toks[j]) for j in (k - 1, k + 1) if 0 <= j < len(toks))
+        for k in range(len(toks))))
+    return {"calls": calls, "names": names, "methods": methods, "strings": strings, "ops": ops, "fstr": fstr,
+            "keyed_xor": keyed_xor}
+
+
+def _int_or_bytes(t) -> bool:
+    s = t.string.lower()
+    if t.type == tokenize.NUMBER:                      # an int: hex, or no float/complex marks
+        return s.startswith("0x") or not any(c in s for c in ".ej")
+    return t.type == tokenize.STRING and "b" in s[:2]   # a bytes literal (b'', rb'', br'')
 
 
 def _last(n):
@@ -859,7 +900,7 @@ def _evidence(kind, texts, table) -> bool:
         return any(any(_last(c) in _DECODE or c == "codecs.decode"
                        or (_last(c) in ("loads", "load") and c.split(".", 1)[0] in ("pickle", "marshal", "dill"))
                        for c in f["calls"])
-                   or bool(_DECODE & f["methods"]) or ("^" in f["ops"] and "[" in f["ops"])
+                   or bool(_DECODE & f["methods"]) or ("^" in f["ops"] and "[" in f["ops"]) or f["keyed_xor"]
                    or any(_BLOB.match(s.strip()) for s in f["strings"]) for f in fs)
     if kind == "fetch":
         return any(any(_net_call(c) for c in f["calls"]) or bool(_FETCH_METHODS & f["methods"]) for f in fs)

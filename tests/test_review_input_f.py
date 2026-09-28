@@ -260,3 +260,53 @@ def test_not_seen_from_text_reads_both_blocks():
     text = reviewer.build_review_input(d, TriageResult(40.0, [FiredRule("r", 40.0, "pkg/a.py", (1, 1))], True),
                                        max_chars=5_000)
     assert reviewer.not_seen_from_text(text) == (["pkg/b.py"], ["pkg/_c.so"])
+
+
+# ---- final review fix pass ----
+
+@pytest.mark.parametrize("kind", ["hosts", "ipv4"])
+def test_endpoints_on_one_line_of_200k_unique_endpoints_is_fast(kind):
+    # X1: a list membership scan per match was quadratic in the matches on a line
+    import time
+    n = 200_000
+    line = " ".join(f"http://h{i}.x" for i in range(n)) if kind == "hosts" else \
+        " ".join(f"{(i >> 16) & 255}.{(i >> 8) & 255}.{i & 255}.1" for i in range(n))
+    d = Diff("p", "1.1", False, [FileDiff("pkg/a.py", "modified", [Hunk((0, 0), (0, 1), [line], [])], line + "\n")], [])
+    t0 = time.perf_counter()
+    ep = reviewer._endpoints(d)
+    text = reviewer._render_block(reviewer._ENDPOINTS_HEADING, "\n".join(ep), reviewer._NEW_BLOCK_MAX)
+    assert time.perf_counter() - t0 < 1.0 and 0 < len(ep) <= 30 and text
+
+
+def test_endpoints_are_still_unique_in_first_seen_order():
+    fd = _fd("pkg/a.py", ["a = 'https://x.example/1'; b = 'https://x.example/2'", "c = '10.0.0.1' + '10.0.0.1'",
+                          "d = 'http://y.example'"])
+    assert reviewer._endpoints(Diff("p", "1.1", False, [fd], [])) == ["x.example", "IP 10.0.0.1", "y.example"]
+
+
+def test_a_file_over_the_parse_bound_has_no_ast_keys_and_is_fast():
+    # X2: the parent parses every rendered file's full text; past _PARSE_MAX_CHARS it does not (spec §3.2 no-scopes)
+    import time
+    body = "x = 1\n" * (1_200_000 // 6)
+    fd = FileDiff("pkg/big.py", "modified", [Hunk((0, 0), (0, 1), ["x = 1"], [])], body)
+    t0 = time.perf_counter()
+    entry = reviewer._shown_entry(fd, "runtime-call", False)
+    assert time.perf_counter() - t0 < 2.0
+    assert entry == {"cls": "runtime-call", "lines": {1: "x = 1"}}
+    assert reviewer._PARSE_MAX_CHARS == 1_000_000
+    small = FileDiff("pkg/a.py", "modified", [Hunk((0, 0), (0, 1), ["x = 1"], [])], "x = 1\n")
+    assert reviewer._shown_entry(small, "runtime-call", False) == {
+        "cls": "runtime-call", "lines": {1: "x = 1"}, "scopes": {1: "module"}, "strings": []}
+
+
+def test_a_hook_target_over_the_whole_file_bound_is_not_shown_without_the_cap_note():
+    # X5: the 4 KB whole-file bound, not the input cap, left it out: listed not shown, no TRUNCATION_NOTE
+    big = "\n".join(f"def f{i}():\n    return {i}" for i in range(3_500)) + "\n"
+    assert len(big) > 85_000
+    hook = FileDiff("helper.py", "unchanged", [], big, run_by="setup.py")
+    d = Diff("p", "1.1", False, [_fd("setup.py", ["import helper"])], [], hook_targets=[hook])
+    dropped = []
+    text = reviewer.build_review_input(d, TriageResult(40.0, [FiredRule("r", 40.0, "setup.py", (1, 1))], True),
+                                       max_chars=200_000, dropped=dropped)
+    assert dropped == ["helper.py"] and "helper.py (" in text.split(reviewer._NOT_SHOWN_HEADING, 1)[1]
+    assert reviewer.TRUNCATION_NOTE not in text

@@ -454,7 +454,7 @@ def build_review_input(diff, triage, *, max_chars: int, dropped: list | None = N
             add = len(rendered) + (1 if body_parts else 0)
         whole_only = fd.change_kind == "unchanged" and "\n@@ whole file" not in rendered
         if used + add > max_chars or whole_only:
-            truncated = True
+            truncated = truncated or not whole_only   # the whole-file bound, not the cap, leaves out whole_only (X5)
             if i == 0 and not whole_only:        # the top-ranked file: nothing renders (InputTooLarge, as before F)
                 skipped = list(ranked_paths)
                 break
@@ -514,23 +514,32 @@ def _endpoints(diff) -> list[str]:
     """Hosts of http(s) URLs and IPv4 literals (each octet <= 255) in ADDED lines of changed files, first-seen order,
     at most 30 (spec F §3.2). Listed, never fetched. IPv6 and bare hostnames are out (they false-match)."""
     out: list[str] = []
+    seen: set[str] = set()                  # a set, and a return at the cap: linear in a line's matches (X1)
     for fd in diff.changed:
         for ln in (ln for h in fd.hunks for ln in h.added):
             for m in _URL.finditer(ln):
                 host = m.group(1).rsplit("@", 1)[-1].split(":", 1)[0].lower()
-                if host and host not in out:
+                if host and host not in seen:
+                    seen.add(host)
                     out.append(_one_line(host)[:200])
+                    if len(out) >= _MAX_ENDPOINTS:
+                        return out
             for m in _IPV4.finditer(ln):
-                if all(int(g) <= 255 for g in m.groups()) and (ip := f"IP {m.group(0)}") not in out:
+                if all(int(g) <= 255 for g in m.groups()) and (ip := f"IP {m.group(0)}") not in seen:
+                    seen.add(ip)
                     out.append(ip)
-            if len(out) >= _MAX_ENDPOINTS:
-                return out[:_MAX_ENDPOINTS]
+                    if len(out) >= _MAX_ENDPOINTS:
+                        return out
     return out
 
 
+_PARSE_MAX_CHARS = 1_000_000     # the parent parses no larger file: no scopes for it (spec §3.2; X2, memory)
+
+
 def _parse(text):
-    """The new file's AST, or None when it does not parse (text is None or a SyntaxError etc.)."""
-    if text is None:
+    """The new file's AST, or None when it does not parse (text is None, longer than _PARSE_MAX_CHARS, or a
+    SyntaxError etc.)."""
+    if text is None or len(text) > _PARSE_MAX_CHARS:
         return None
     try:
         return ast.parse(text)
