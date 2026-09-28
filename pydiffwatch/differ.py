@@ -1,4 +1,5 @@
 import difflib
+import re
 from . import execctx, facts
 from .models import ArtifactSet, Diff, FileDiff, Hunk
 
@@ -83,6 +84,35 @@ def render_signals(requires_dist_change, added_dep_findings, added_binaries, mai
     return "\n".join(out)
 
 
+_MAX_HOOK_TARGETS = 20      # carried to the reviewer, which shows at most 5 whole (spec F §3.2)
+_HOOK_SOURCES = ("setup.py", "pyproject.toml", "setup.cfg")
+_EP_TARGET = re.compile(r"(?<![\w.])([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*:\s*[A-Za-z_]\w*")
+_PY_PATH = re.compile(r"""["']((?:\./)?[\w./-]+\.py)["']""")
+
+
+def _hook_targets(new_files, changed) -> list[FileDiff]:
+    """Unchanged files that a changed setup.py, pyproject.toml, setup.cfg or entry_points.txt names in an ADDED
+    line — an import in setup.py, an entry-point target `mod:attr`, a quoted *.py path (Ruling F6) — carried whole
+    so the reviewer sees code this release newly runs (spec F §2.5). Never scored: not in Diff.changed."""
+    changed_paths = {f.path for f in changed}
+    out: dict[str, str] = {}
+    for f in changed:
+        if f.change_kind == "removed" or not (f.path in _HOOK_SOURCES or f.path.endswith("/entry_points.txt")):
+            continue
+        named = set()
+        for ln in (ln for h in f.hunks for ln in h.added):
+            s = ln.strip()
+            if f.path == "setup.py" and s.startswith(("import ", "from ")):
+                named |= execctx.local_imports("setup.py", s.encode("utf-8", "replace"), new_files)
+            named |= {p for m in _EP_TARGET.finditer(ln) if (p := execctx.module_file(m.group(1), new_files))}
+            named |= {p for m in _PY_PATH.finditer(ln) if (p := m.group(1).removeprefix("./")) in new_files}
+        for p in sorted(named):
+            if p not in changed_paths and p not in out and len(out) < _MAX_HOOK_TARGETS:
+                out[p] = f.path
+    return [FileDiff(p, "unchanged", [], new_files[p].decode("utf-8", errors="replace"), run_by=by)
+            for p, by in out.items()]
+
+
 def build_diff(a: ArtifactSet) -> Diff:
     changed: list[FileDiff] = []
     for path in sorted(set(a.new_files) | set(a.prior_files)):
@@ -99,8 +129,10 @@ def build_diff(a: ArtifactSet) -> Diff:
         if hunks:
             new_text = new.decode("utf-8", errors="replace") if new is not None else None
             changed.append(FileDiff(path, kind, hunks, new_text))
+    hooks = _hook_targets(a.new_files, changed)
+    classes = execctx.classify(a.new_files, [f.path for f in changed] + [h.path for h in hooks])
     return Diff(a.package, a.version, a.prior_version is None, changed,
                 list(a.added_binaries), list(a.added_dep_findings), _description(a.description),
                 execctx.build(a.new_files, a.too_large),
                 a.prior_version if a.prior_error and a.prior_version else "", a.surface_omitted,
-                "", requires_python=a.requires_python)
+                "", requires_python=a.requires_python, file_classes=classes, hook_targets=hooks)

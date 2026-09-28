@@ -82,6 +82,9 @@ def _fetch_cases(monkeypatch):
 def _canon_diff(d):
     out = dataclasses.asdict(d)
     assert out.pop("requires_python") is None   # PR D added the field after the goldens
+    assert out.pop("file_classes") == {p["path"]: _CLASS[p["path"]] for p in out["changed"]}   # PR F
+    assert out.pop("hook_targets") == []                                                      # PR F
+    assert all(f.pop("run_by") is None for f in out["changed"])   # PR F: added to FileDiff after the goldens
     return out
 
 
@@ -92,6 +95,7 @@ def test_fetch_is_unchanged(monkeypatch):
 # ---- one release that fires a code, a binary, a dep and a maintainer rule, with every signal line ----
 
 _SCAN_REL = NewRelease("scn", "1.1", 9)
+_CLASS = {"scn/__init__.py": "import", "upd/__init__.py": "import"}    # PR F: the classes of the golden files
 _OWNERS = {"current": {"roles": ["mallory"]}, "prior": {"roles": ["alice"]}}
 _SCAN_BLOBS = {
     "mock://scn/1.0": make_sdist({"scn/__init__.py": b"x = 1\n", "setup.py": b"from setuptools import setup\nsetup()\n"}),

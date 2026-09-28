@@ -153,6 +153,10 @@ _MALFORMED = {
     "is_first_release as a string": _tamper(("diff", "is_first_release"), "no"),
     "a binary with a float size": _tamper(("diff", "added_binaries", 0, "size"), 1.5),
     "description missing": lambda out: out["diff"].pop("description"),
+    "a class the parent does not know": _tamper(("diff", "file_classes"), {"scn/__init__.py": "rootkit"}),
+    "file_classes as a list": _tamper(("diff", "file_classes"), ["import"]),
+    "a hook target that changed": lambda out: out["diff"]["hook_targets"].append(
+        {"path": "x.py", "change_kind": "modified", "new_text": "", "run_by": "setup.py"}),
 }
 
 
@@ -176,6 +180,18 @@ def test_a_refusal_inside_the_box_is_a_refusal_and_any_other_error_a_sandbox_err
         sandbox._decode_output(b'{"error": "members", "error_type": "RefusedToExtract"}', Config(), _scan_dl(), [])
     with pytest.raises(sandbox.SandboxError, match="^sandbox worker failed: BadGzipFile: Not a gzipped file"):
         sandbox._decode_output(b'{"error": "BadGzipFile: Not a gzipped file"}', Config(), _scan_dl(), [])
+
+
+def test_classes_and_hook_targets_round_trip():
+    cfg, rs = Config(), rules.load_rules(_RULES)
+    old = dict(_OLD, **{"_helper.py": b"import os\n"})
+    new = dict(_NEW, **{"_helper.py": b"import os\n",
+                        "setup.py": b"from setuptools import setup\nimport _helper\nsetup(name='scn')\n"})
+    dl = _dl(new, old, package="scn")
+    art, d, tr = sandbox.compute(cfg, dl, rs)
+    assert d.hook_targets and d.file_classes
+    got_d, _, _ = sandbox._decode_output(sandbox._encode_output(art, d, tr), cfg, dl, rs)
+    assert (got_d.file_classes, got_d.hook_targets) == (d.file_classes, d.hook_targets)
 
 
 _DETERMINISM = ("import sys\n"
