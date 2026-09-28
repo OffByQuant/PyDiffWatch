@@ -42,7 +42,7 @@ def test_fresh_cursor_seed_failure_skips_run(tmp_cfg, monkeypatch):
 def test_backfill_does_not_seed_and_processes_from_genesis(tmp_cfg, monkeypatch):
     monkeypatch.setattr(ingest, "current_serial", _throw)             # must NOT seed under backfill
     seen = {}
-    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: (seen.update(since=since) or []))
+    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since, **kw: (seen.update(since=since) or []))
     assert orchestrator.run_once(tmp_cfg, seed_if_fresh=False) == 0
     assert seen["since"] == 0                              # processed from the cursor as-is (genesis)
 
@@ -51,7 +51,7 @@ def test_established_cursor_polls_forward_without_reseeding(tmp_cfg, monkeypatch
     conn = store.connect(tmp_cfg); store.init_schema(conn); store.set_last_serial(conn, 700); conn.close()
     monkeypatch.setattr(ingest, "current_serial", _throw)             # must NOT reseed an established cursor
     seen = {}
-    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: (seen.update(since=since) or []))
+    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since, **kw: (seen.update(since=since) or []))
     orchestrator.run_once(tmp_cfg)
     assert seen["since"] == 700                            # polled forward from the existing cursor
 
@@ -77,7 +77,7 @@ def test_recent_starts_a_fresh_cursor_n_events_back_and_scans_in_the_same_tick(t
     monkeypatch.setattr(ingest, "current_serial", lambda cfg: 10_000)
     seen = []
     monkeypatch.setattr(ingest, "changes_since",
-                        lambda cfg, since: seen.append(since) or [NewRelease("pkg", "1.0", 9_700)])
+                        lambda cfg, since, **kw: seen.append(since) or [NewRelease("pkg", "1.0", 9_700)])
     scan_stub.fetch(lambda cfg, rel: None)   # no sdist: terminal
     assert orchestrator.run_once(tmp_cfg, recent=500) == 1
     assert seen == [9_500]
@@ -90,6 +90,39 @@ def test_recent_is_ignored_once_the_cursor_is_set(tmp_cfg, monkeypatch):
     conn = store.connect(tmp_cfg); store.init_schema(conn); store.set_last_serial(conn, 5000); conn.close()
     monkeypatch.setattr(ingest, "current_serial", lambda cfg: 10_000)
     seen = []
-    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: seen.append(since) or [])
+    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since, **kw: seen.append(since) or [])
     orchestrator.run_once(tmp_cfg, recent=500)
     assert seen == [5000]
+
+
+def test_seeding_sets_the_new_version_floor_to_now(tmp_path, monkeypatch):
+    import datetime
+    from pydiffwatch import ingest, orchestrator, store
+    from pydiffwatch.config import Config
+    cfg = Config(db_path=tmp_path / "d.db", lock_path=tmp_path / "l.lock")
+    monkeypatch.setattr(ingest, "current_serial", lambda cfg: 5000)
+    assert orchestrator.seed_now(cfg) == 5000
+    floor = datetime.datetime.fromisoformat(store.get_meta(store.connect(cfg), "ingest_floor"))
+    assert abs(floor - datetime.datetime.now(datetime.UTC)) < datetime.timedelta(minutes=1)
+
+
+def test_recent_starts_n_serials_back_with_a_day_of_floor(tmp_path, monkeypatch):
+    import datetime
+    from pydiffwatch import ingest, orchestrator, store
+    from pydiffwatch.config import Config
+    cfg = Config(db_path=tmp_path / "d.db", lock_path=tmp_path / "state" / "l.lock", reviewer_enabled=False)
+    monkeypatch.setattr(orchestrator.egress, "is_installed", lambda: True)
+    monkeypatch.setattr(orchestrator.sandbox, "choose", lambda cfg: None)
+    monkeypatch.setattr(orchestrator, "_load_ruleset", lambda cfg: None)
+    monkeypatch.setattr(ingest, "current_serial", lambda cfg: 5000)
+    seen = {}
+
+    def fake(cfg_, since, **kw):
+        seen.update(kw, since=since)
+        return ingest.Changes()
+    monkeypatch.setattr(ingest, "changes_since", fake)
+    orchestrator.run_once(cfg, recent=500)
+    assert seen["since"] == 4500
+    floor = datetime.datetime.fromisoformat(seen["floor"])
+    expect = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=cfg.recent_floor_hours)
+    assert abs(floor - expect) < datetime.timedelta(minutes=1)

@@ -177,7 +177,7 @@ def test_a_retrying_release_that_is_now_removed_waits_one_recheck(tmp_path):
 def test_run_once_with_a_404_parks_then_records_and_never_pins_the_cursor(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     monkeypatch.setattr(ingest, "changes_since",
-                        lambda cfg, since: [r for r in (NewRelease("gone", "1.0", 10), NewRelease("after", "1.0", 11))
+                        lambda cfg, since, **kw: [r for r in (NewRelease("gone", "1.0", 10), NewRelease("after", "1.0", 11))
                                             if r.serial > since])
     monkeypatch.setattr(fetcher, "download", lambda cfg, rel, attempt=1:
                         fetcher.Removed("project_gone") if rel.package == "gone" else fetcher.NoSdist())

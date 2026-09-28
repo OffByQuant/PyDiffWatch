@@ -37,7 +37,7 @@ SAFE = make_sdist({"setup.py": b"from setuptools import setup\nsetup(name='s')\n
 
 
 def _wire(monkeypatch, releases, blobs):
-    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: [r for r in releases if r.serial > since])
+    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since, **kw: [r for r in releases if r.serial > since])
     # synthesize each package's PyPI version history from the blob keys (ascending upload time)
     from collections import defaultdict
     vers = defaultdict(list)

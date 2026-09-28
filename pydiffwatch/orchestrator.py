@@ -18,6 +18,10 @@ TERMINAL = {"triaged", "alerted", "reviewed", "new_package_skipped", "needs_adju
             "removed_before_scan", "metadata_retry", "gave_up", "no_sdist_wait"}
 
 
+def _iso(dt) -> str:
+    return dt.astimezone(datetime.UTC).isoformat()
+
+
 def _load_ruleset(cfg):
     return rules.load_rules(cfg.rules_dir)
 
@@ -682,6 +686,7 @@ def seed_now(cfg: Config):
     s = ingest.current_serial(cfg)
     if s is not None:
         store.set_last_serial(conn, s)
+        store.set_meta(conn, "ingest_floor", _iso(datetime.datetime.now(datetime.UTC)))
     return s
 
 
@@ -740,11 +745,14 @@ def run_once(cfg: Config, *, seed_if_fresh: bool = True, recent: int | None = No
                 return 0
             if not recent:
                 store.set_last_serial(conn, now_serial)
+                store.set_meta(conn, "ingest_floor", _iso(datetime.datetime.now(datetime.UTC)))
                 logger.info("fresh cursor seeded to PyPI serial %d; monitoring starts now", now_serial)
                 return 0
-            last = max(now_serial - recent, 0)      # start N changelog events back and scan them this tick
+            last = max(now_serial - recent, 0)      # start N PyPI serials back and scan them this tick
             store.set_last_serial(conn, last)
-            print(f"[pydiffwatch] starting {recent:,} PyPI changelog events back (serial {last:,}); "
+            store.set_meta(conn, "ingest_floor", _iso(datetime.datetime.now(datetime.UTC)
+                                                      - datetime.timedelta(hours=cfg.recent_floor_hours)))
+            print(f"[pydiffwatch] starting {recent:,} PyPI serials back (serial {last:,}); "
                   f"catching up to now", flush=True)
         rvw = _build_reviewer(cfg)
         ruleset = _load_ruleset(cfg)
@@ -766,7 +774,11 @@ def run_once(cfg: Config, *, seed_if_fresh: bool = True, recent: int | None = No
                 guard.begin_batch()
                 drain_pending(cfg, conn, rvw, auto=True, limit=cfg.reviewer.max_pending_per_tick, guard=guard)
         _retry_metadata(cfg, conn, rvw, ruleset, offline, guard)
-        releases = ingest.changes_since(cfg, last)[:cfg.max_releases_per_run]
+        tick_start = datetime.datetime.now(datetime.UTC)
+        floor = store.get_meta(conn, "ingest_floor")
+        found = ingest.changes_since(cfg, last, floor=floor, stage=lambda p, v: store.get_stage(conn, p, v))
+        ceiling = getattr(found, "ceiling", None)   # a plain list (older stubs) has none: advance to listed serials
+        releases = list(found)[:cfg.max_releases_per_run]
         prepared = [(rel, _to_fetch(conn, rel)) for rel in releases]
 
         # Fetch concurrently in a bounded window but CONSUME results in ascending-serial order on the
@@ -789,7 +801,14 @@ def run_once(cfg: Config, *, seed_if_fresh: bool = True, recent: int | None = No
                         advance_to = rel.serial
                     else:
                         blocked = True  # stop advancing past the first non-terminal release
-        store.set_last_serial(conn, advance_to)
+        if ceiling is not None:
+            advance_to = ceiling if not blocked else min(advance_to, ceiling)
+            if not blocked and getattr(found, "complete", False):
+                margin = datetime.timedelta(minutes=cfg.floor_margin_minutes)
+                new = tick_start - margin
+                if floor is None or new > datetime.datetime.fromisoformat(floor):
+                    store.set_meta(conn, "ingest_floor", _iso(new))      # the floor only moves forward
+        store.set_last_serial(conn, max(advance_to, store.get_last_serial(conn)))
         try:
             store.maybe_prune(conn, cfg.retention_days, cfg.prune_every_hours * 3600, time.time())
         except sqlite3.Error:

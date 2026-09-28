@@ -15,7 +15,7 @@ def _meta(pkg, versions):   # versions: list of (ver, iso_ts) -> synthetic PyPI 
             "upload_time_iso_8601": ts, "yanked": False}] for v, ts in versions}}
 
 def test_e2e_queues_the_flagged_release_and_alerts_on_nothing(tmp_cfg, monkeypatch):
-    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: [
+    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since, **kw: [
         NewRelease("victim", "1.0", 10), NewRelease("victim", "1.1", 11),
         NewRelease("safe", "1.0", 12)])
     blobs = {("victim", "1.0"): BENIGN, ("victim", "1.1"): MALICIOUS, ("safe", "1.0"): SAFE}
@@ -50,7 +50,7 @@ def test_cursor_resume_across_runs(tmp_cfg, monkeypatch):
     monkeypatch.setattr(fetcher, "_download",
                         lambda url, cfg: blobs[tuple(url.replace("mock://", "").split("/"))])
 
-    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: [
+    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since, **kw: [
         r for r in [NewRelease("victim", "1.0", 10)]
         if r.serial > since])
     orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
@@ -59,7 +59,7 @@ def test_cursor_resume_across_runs(tmp_cfg, monkeypatch):
     conn.close()
 
     # second run: a new release at serial 11; changes_since must only see it (since=10)
-    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: [
+    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since, **kw: [
         r for r in [NewRelease("victim", "1.1", 11)]
         if r.serial > since])
     n = orchestrator.run_once(tmp_cfg)
@@ -72,7 +72,7 @@ def test_cursor_resume_across_runs(tmp_cfg, monkeypatch):
 
 def test_first_release_processed(tmp_cfg, monkeypatch):
     # A package seen for the first time (no prior version) must process via the first-release path.
-    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: [
+    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since, **kw: [
         NewRelease("brandnew", "1.0", 5)])
     monkeypatch.setattr(fetcher, "_package_json", lambda pkg, cfg: _meta("brandnew", [("1.0", "2026-01-01T00:00:00Z")]))
     monkeypatch.setattr(fetcher, "_download", lambda url, cfg: SAFE)
@@ -102,7 +102,7 @@ def test_e2e_maintainer_metadata_persisted_and_change_detected(tmp_cfg, monkeypa
                 "ownership": {"roles": [{"role": "Owner", "user": u} for u in state["owners"]]}}
     monkeypatch.setattr(fetcher, "_package_json", pkg_json)
 
-    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: [
+    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since, **kw: [
         r for r in [NewRelease("acme", "1.0", 10)] if r.serial > since])
     orchestrator.run_once(tmp_cfg, seed_if_fresh=False)              # tick 1: owners {alice}
     conn = store.connect(tmp_cfg)
@@ -111,7 +111,7 @@ def test_e2e_maintainer_metadata_persisted_and_change_detected(tmp_cfg, monkeypa
     conn.close()
 
     state["owners"] = ["alice", "mallory"]                          # ownership changes
-    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: [
+    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since, **kw: [
         r for r in [NewRelease("acme", "1.1", 11)] if r.serial > since])
     orchestrator.run_once(tmp_cfg)                                   # tick 2: diffs vs stored v1 owners
     conn = store.connect(tmp_cfg)
@@ -122,7 +122,7 @@ def test_e2e_maintainer_metadata_persisted_and_change_detected(tmp_cfg, monkeypa
 
 def test_refused_extract_emits_suspicious_alert(tmp_cfg, monkeypatch, scan_stub):
     # A package whose sdist cannot be safely extracted must produce a suspicious alert (spec §8).
-    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: [
+    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since, **kw: [
         NewRelease("bomb", "1.0", 7)])
     # make extraction refuse by registering a RefusedToExtract through scan_stub
     scan_stub.fetch(lambda cfg, rel, **k: (_ for _ in ()).throw(fetcher.RefusedToExtract("bomb")))
@@ -142,7 +142,7 @@ def test_transient_fetch_error_is_retryable_not_poison(tmp_cfg, monkeypatch, sca
     good = NewRelease("good", "1.0", 10)
     boom = NewRelease("victimx", "1.1", 11)
     after = NewRelease("after", "1.0", 12)
-    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: [r for r in [good, boom, after] if r.serial > since])
+    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since, **kw: [r for r in [good, boom, after] if r.serial > since])
 
     calls = {"n": 0}
     def flaky_fetch(cfg, rel, **k):

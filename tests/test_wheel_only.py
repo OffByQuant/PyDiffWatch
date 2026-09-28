@@ -7,6 +7,8 @@ cursor (`no_sdist_wait`) for `wheel_only_grace_minutes`, then is re-fetched. An 
 with no alert; only a release still wheel-only after the grace warns. The changelog's sdist upload event is the
 fast path: it re-scans a waiting or no_sdist release at once."""
 import dataclasses
+import email.message
+import json
 
 from pydiffwatch import fetcher, ingest, orchestrator, store
 from pydiffwatch.config import Config
@@ -37,14 +39,37 @@ def _pypi(monkeypatch, metas):
 
 
 def _feed(monkeypatch, events):
-    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: [r for r in events if r.serial > since])
+    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since, **kw: [r for r in events if r.serial > since])
 
 
-def _proxy(monkeypatch, rows):
-    """The real ingest.changes_since over a fake XML-RPC changelog."""
-    class P:
-        def changelog_since_serial(self, since): return [r for r in rows if r[4] > since]
-    monkeypatch.setattr(ingest.xmlrpc.client, "ServerProxy", lambda url, **k: P())
+def _idx(entries, meta_serial):
+    """/simple/ body: entries = [(serial, name), ...]."""
+    return json.dumps({"meta": {"_last-serial": meta_serial, "api-version": "1.4"},
+                       "projects": [{"_last-serial": s, "name": n} for s, n in entries]}).encode()
+
+
+def _hdrs2(**kv):
+    m = email.message.Message()
+    for k, v in kv.items():
+        m[k.replace("_", "-")] = v
+    return m
+
+
+def _pjbody(name, serial, meta):
+    """A /pypi/<name>/json body built from a `_meta(name, versions)` dict."""
+    return json.dumps({"info": {"name": name}, "last_serial": serial, "releases": meta["releases"]}).encode()
+
+
+def _ingest_serve(monkeypatch, index, projects):
+    """The real ingest.changes_since over a stubbed ingest._get. index: /simple/ body bytes; projects:
+    {name: (header_serial, body_bytes)}."""
+    def fake_get(cfg_, url, headers, limit, deadline):
+        if url.endswith("/simple/"):
+            return 200, _hdrs2(), index
+        name = url.split("/pypi/")[1].split("/json")[0]
+        serial, body = projects[name]
+        return 200, _hdrs2(X_PyPI_Last_Serial=str(serial)), body
+    monkeypatch.setattr(ingest, "_get", fake_get)
 
 
 def _alerts(conn, package):
@@ -159,17 +184,21 @@ def test_prune_keeps_the_waiting_and_the_switch_rows(tmp_cfg, monkeypatch, capsy
 # --- the upload race -------------------------------------------------------------------------------------
 
 def test_a_merged_release_is_not_lost_when_the_per_run_cap_cuts_its_sdist_event(tmp_cfg, monkeypatch):
-    metas = {p: _meta(p, [("1.0", "2026-01-01T00:00:00Z", True)]) for p in "xabc"}
+    # Real ingest.changes_since (Task 3) over a stubbed simple index / project JSON, floor unset (backfill
+    # default): every unseen version counts as new. max_releases_per_run cuts the first poll to 3 of the 4
+    # projects; the cursor's ceiling holds below the cut one, so the second tick picks it up.
+    pkgs = ["x-demo", "a-demo", "b-demo", "c-demo"]
+    metas = {p: _meta(p, [("1.0", "2026-01-01T00:00:00Z", True)]) for p in pkgs}
     _pypi(monkeypatch, metas)
-    _proxy(monkeypatch, [("x", "1.0", 0, "new release", 10), ("a", "1.0", 0, "new release", 11),
-                         ("b", "1.0", 0, "new release", 12), ("c", "1.0", 0, "new release", 13),
-                         ("x", "1.0", 0, "add source file x-1.0.tar.gz", 14)])
+    entries = [(10, "x-demo"), (11, "a-demo"), (12, "b-demo"), (13, "c-demo")]
+    projects = {name: (serial, _pjbody(name, serial, metas[name])) for serial, name in entries}
+    _ingest_serve(monkeypatch, _idx(entries, 13), projects)
     cfg = dataclasses.replace(tmp_cfg, max_releases_per_run=3)
     orchestrator.run_once(cfg, seed_if_fresh=False)
     orchestrator.run_once(cfg, seed_if_fresh=False)
     conn = store.connect(cfg)
-    assert {p: store.get_stage(conn, p, "1.0") for p in "xabc"} == dict.fromkeys("xabc", "triaged")
-    assert store.get_last_serial(conn) == 14
+    assert {p: store.get_stage(conn, p, "1.0") for p in pkgs} == dict.fromkeys(pkgs, "triaged")
+    assert store.get_last_serial(conn) == 13
 
 
 def test_a_later_sdist_upload_rescans_a_wheel_first_release_at_once(tmp_cfg, monkeypatch, capsys):
@@ -201,16 +230,21 @@ def test_a_late_sdist_after_the_warning_rescans_and_clears_it(tmp_cfg, monkeypat
 
 
 def test_a_stale_json_on_the_merged_sdist_event_is_rescanned_when_due(tmp_cfg, monkeypatch, capsys):
-    metas = {"r": _meta("r", SW)}
+    # The poll's project JSON is still wheel-only (SW): the wheel-only release parks in no_sdist_wait, off
+    # the cursor. Its rescan, once the grace is over, goes through the retry sweep (_retry_metadata), not
+    # ingest, so PyPI's JSON catching up is modeled purely via the fetcher stub.
+    metas = {"r-demo": _meta("r-demo", SW)}
     _pypi(monkeypatch, metas)
-    _proxy(monkeypatch, [("r", "1.1", 0, "new release", 10), ("r", "1.1", 0, "add source file r-1.1.tar.gz", 20)])
-    orchestrator.run_once(tmp_cfg, seed_if_fresh=False)                   # both events in one batch, JSON stale
+    entries = [(10, "r-demo")]
+    projects = {"r-demo": (10, _pjbody("r-demo", 10, metas["r-demo"]))}
+    _ingest_serve(monkeypatch, _idx(entries, 10), projects)
+    orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
     conn = store.connect(tmp_cfg)
-    assert store.get_stage(conn, "r", "1.1") == "no_sdist_wait"
-    metas["r"] = _meta("r", BOTH)
+    assert store.get_stage(conn, "r-demo", "1.1") == "no_sdist_wait"
+    metas["r-demo"] = _meta("r-demo", BOTH)
     _grace_over(conn)
     orchestrator.run_once(tmp_cfg, seed_if_fresh=False)
-    assert store.get_stage(conn, "r", "1.1") == "triaged" and _alerts(conn, "r") == []
+    assert store.get_stage(conn, "r-demo", "1.1") == "triaged" and _alerts(conn, "r-demo") == []
 
 
 def test_an_sdist_upload_for_a_release_that_was_never_no_sdist_fetches_nothing(tmp_cfg, monkeypatch, request):

@@ -32,7 +32,7 @@ def _http(code):
 
 
 def _feed(monkeypatch, releases):
-    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since: [r for r in releases if r.serial > since])
+    monkeypatch.setattr(ingest, "changes_since", lambda cfg, since, **kw: [r for r in releases if r.serial > since])
 
 
 def test_a_404_on_package_metadata_is_project_gone(monkeypatch):

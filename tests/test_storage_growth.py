@@ -179,7 +179,7 @@ def test_a_release_below_the_review_threshold_stores_no_evidence(tmp_path, monke
 def test_run_prunes_by_itself_at_most_once_per_interval(tmp_path, monkeypatch):
     cfg, conn = _db(tmp_path)
     store.set_last_serial(conn, 100)
-    monkeypatch.setattr(ingest, "changes_since", lambda c, last: [])
+    monkeypatch.setattr(ingest, "changes_since", lambda c, last, **kw: [])
     old = _old(conn, "lib", "1.0", 120); _old(conn, "lib", "1.1", 1)
     orchestrator.run_once(cfg)
     assert conn.execute("SELECT count(*) FROM releases WHERE id=?", (old,)).fetchone()[0] == 0
