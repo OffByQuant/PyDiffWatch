@@ -75,8 +75,7 @@ pydiffwatch --model qwen-singleshot watch --serve --recent 500
   No API key needed.
 - `--endpoint` is where that server listens. Leave it out for `http://localhost:8000/v1`, or point it at
   another machine: `--endpoint http://192.168.1.20:8000/v1`.
-- `--recent 500` starts 500 PyPI changelog events back, so results show up within minutes. One release is
-  several events (the release plus one per uploaded file), so that is fewer than 500 releases. Leave it out
+- `--recent 500` starts 500 PyPI serials back, so results show up within minutes. Each upload, yank or edit on PyPI is one serial, so that is fewer releases than 500. Leave it out
   to watch only what's published from now on. Once scanning has started, a restart resumes where it
   stopped, and while a backlog is waiting `watch` scans back-to-back, sleeping only once it has caught up.
 

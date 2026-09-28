@@ -1,55 +1,11 @@
 """PR E part 2 (npm #39 port): a release PyPI no longer serves is recorded as removed_before_scan, silently."""
-import dataclasses, datetime, json, logging, time
+import dataclasses, json, logging, time
 
 import pytest
 
 from pydiffwatch import dashboard, fetcher, ingest, orchestrator, store
 from pydiffwatch.config import Config
 from pydiffwatch.models import ArtifactSet, NewRelease
-
-
-class _Proxy:
-    def __init__(self, rows):
-        self.rows = rows
-
-    def changelog_since_serial(self, since):
-        return self.rows
-
-
-def _changes(monkeypatch, rows):
-    monkeypatch.setattr(ingest, "_proxy", lambda cfg: _Proxy(rows))
-    return ingest.changes_since(Config(), 0)
-
-
-# ---- ingest ----
-
-def test_a_same_batch_remove_sets_removed_at(monkeypatch):
-    got = _changes(monkeypatch, [("p", "1.0", 1790319000, "new release", 10),
-                                 ("p", "1.0", 1790319118, "remove release", 11)])
-    assert [(r.package, r.version, r.serial, r.removed_at) for r in got] == [
-        ("p", "1.0", 10, datetime.datetime.fromtimestamp(1790319118, datetime.UTC).isoformat())]
-
-
-def test_a_remove_only_row_yields_no_item(monkeypatch):
-    assert _changes(monkeypatch, [("q", "2.0", 1790319118, "remove release", 11)]) == []
-
-
-def test_an_item_without_a_remove_has_no_removed_at(monkeypatch):
-    [r] = _changes(monkeypatch, [("p", "1.0", 1790319000, "new release", 10)])
-    assert r.removed_at is None and r.serial == 10
-
-
-def test_a_remove_followed_by_a_reupload_is_not_evidence(monkeypatch):
-    [r] = _changes(monkeypatch, [("p", "1.0", 1790319000, "new release", 10),
-                                 ("p", "1.0", 1790319118, "remove release", 11),
-                                 ("p", "1.0", 1790319200, "add source file p-1.0.tar.gz", 12)])
-    assert r.removed_at is None
-
-
-def test_a_non_numeric_remove_timestamp_is_ignored(monkeypatch):
-    # Review Focus 2 (Ruling P4)
-    [r] = _changes(monkeypatch, [("p", "1.0", 1790319000, "new release", 10), ("p", "1.0", "x", "remove release", 11)])
-    assert r.removed_at is None
 
 
 # ---- fetcher ----
@@ -221,7 +177,7 @@ def test_a_retrying_release_that_is_now_removed_waits_one_recheck(tmp_path):
 def test_run_once_with_a_404_parks_then_records_and_never_pins_the_cursor(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     monkeypatch.setattr(ingest, "changes_since",
-                        lambda cfg, since: [r for r in (NewRelease("gone", "1.0", 10), NewRelease("after", "1.0", 11))
+                        lambda cfg, since, **kw: [r for r in (NewRelease("gone", "1.0", 10), NewRelease("after", "1.0", 11))
                                             if r.serial > since])
     monkeypatch.setattr(fetcher, "download", lambda cfg, rel, attempt=1:
                         fetcher.Removed("project_gone") if rel.package == "gone" else fetcher.NoSdist())
@@ -322,13 +278,6 @@ def test_the_export_carries_the_counts(tmp_path):
     rid = store.record_release(conn, "p", "1.0", 1, False, None, "sdist")
     store.record_removed(conn, rid, "version_gone", None)
     assert "1 removed before scan (version gone: 1)" in orchestrator.export_dashboard(cfg).read_text()
-
-
-@pytest.mark.parametrize("ts", [1e20, -1e12, 2 ** 63, float("nan"), float("inf")])
-def test_an_unrepresentable_remove_timestamp_is_ignored(monkeypatch, ts):
-    # final review I1: a number fromtimestamp rejects must not escape ingest and pin the cursor
-    [r] = _changes(monkeypatch, [("p", "1.0", 1790319000, "new release", 10), ("p", "1.0", ts, "remove release", 11)])
-    assert r.removed_at is None
 
 
 def test_a_recorded_removal_is_not_counted_as_reviewed(tmp_path, scan_stub, monkeypatch):

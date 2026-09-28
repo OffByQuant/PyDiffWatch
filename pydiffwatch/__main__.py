@@ -36,7 +36,7 @@ def _configure_logging():
 
 
 def _non_negative(text):
-    """argparse type for --recent: a count of changelog events; 0 means start now, as with no --recent."""
+    """argparse type for --recent: a count of PyPI serials; 0 means start now, as with no --recent."""
     n = int(text)
     if n < 0:
         raise argparse.ArgumentTypeError(f"must be 0 or more, got {n}")
@@ -75,8 +75,8 @@ def main():
                       help="process from the cursor as-is (PyPI genesis on a fresh DB) instead of "
                            "seeding a fresh cursor to now")
     runp.add_argument("--recent", type=_non_negative, default=None, metavar="N",
-                      help="on a fresh database, start N PyPI changelog events back instead of now (one "
-                           "release is several events: the release plus one per uploaded file)")
+                      help="on a fresh database, start N PyPI serials back instead of now (each upload, "
+                           "yank or edit on PyPI is one serial)")
     sub.add_parser("seed-now",
                    help="set the cursor to PyPI's current serial and exit (start monitoring from now)")
     sub.add_parser("pending",
@@ -124,9 +124,9 @@ def main():
                     help="seconds between scans once caught up (default: 300)")
     wp.add_argument("--out", default=None, help="dashboard HTML path (default: <db dir>/dashboard.html)")
     wp.add_argument("--recent", type=_non_negative, default=None, metavar="N",
-                    help="on a fresh database, start N PyPI changelog events back instead of now (one "
-                         "release is several events), so the dashboard fills within minutes (ignored once "
-                         "scanning has started)")
+                    help="on a fresh database, start N PyPI serials back instead of now (each upload, "
+                         "yank or edit on PyPI is one serial), so the dashboard fills within minutes "
+                         "(ignored once scanning has started)")
     wp.add_argument("--serve", action="store_true",
                     help="also serve the dashboard on 127.0.0.1 (localhost only) while watching")
     wp.add_argument("--port", type=int, default=8787, help="port for --serve (default: 8787)")
@@ -136,8 +136,7 @@ def main():
     args = p.parse_args()
     _configure_logging()
     cfg = _cfg(args)
-    # xmlrpc.client is defused at import in ingest.py (covers library importers too). The egress guard
-    # mutates global socket state, so it stays a CLI-entry concern (see egress.py docstring).
+    # The egress guard mutates global socket state, so it stays a CLI-entry concern (see egress.py docstring).
     egress.install_guard(cfg)   # default-deny host allowlist for the whole process (see egress.py)
     try:
         _dispatch(args, cfg)

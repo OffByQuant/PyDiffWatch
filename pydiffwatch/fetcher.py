@@ -20,8 +20,8 @@ class NoSdist:
 @dataclass(frozen=True)
 class Removed:
     """PyPI no longer serves this release (npm #39 port). kind: "project_gone" (the project JSON answers 404) or
-    "version_gone" (the JSON is live but lists no such version). `at`: the changelog's `remove release` time when
-    it was in the same batch, else None (the removal is then confirmed at one re-check before it is recorded)."""
+    "version_gone" (the JSON is live but lists no such version). `at`: the removal time when known (ingest no
+    longer reports one), else None (the removal is then confirmed at one re-check before it is recorded)."""
     kind: str
     at: str | None = None
 

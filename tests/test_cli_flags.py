@@ -45,13 +45,13 @@ def test_flags_do_not_bypass_the_missing_config_check(tmp_path):
 
 
 @pytest.mark.parametrize("cmd", ["run", "watch"])
-def test_recent_help_counts_changelog_events_not_releases(cmd, monkeypatch, capsys):
+def test_recent_help_counts_pypi_serials_not_releases(cmd, monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["pydiffwatch", cmd, "--help"])
     with pytest.raises(SystemExit):
         cli.main()
     help_text = " ".join(capsys.readouterr().out.split())
     recent = help_text[help_text.index("--recent N"):]
-    assert "changelog events" in recent
+    assert "PyPI serials" in recent
     assert "N releases" not in recent and "N PyPI releases" not in recent
 
 

@@ -62,11 +62,16 @@ class Config:
     dep_brandnew_days: int = 30
     max_dep_lookups: int = 10
     max_decompressed_bytes: int = 120 * 1024 * 1024
-    fetch_timeout_s: float = 30.0          # per socket read (and XML-RPC call)
+    fetch_timeout_s: float = 30.0          # per socket read
     fetch_deadline_s: float = 120.0        # per download, total
     packument_deadline_s: float = 300.0    # PyPI JSON metadata, total (big projects list every release)
     max_metadata_bytes: int = 64_000_000   # PyPI JSON metadata size cap
     max_releases_per_run: int = 2000
+    max_projects_per_run: int = 2000       # per-project JSON fetches per tick; the rest wait (cursor held below them)
+    max_index_bytes: int = 256_000_000     # decoded /simple/ index cap (~44 MB in 2026); refuses a gzip bomb
+    recent_floor_hours: float = 24.0       # --recent: unseen versions uploaded this far back still count as new
+    floor_margin_minutes: float = 120.0    # the new-version floor trails tick start by this (index/JSON CDN lag)
+    max_hold_ticks: int = 12               # ticks one failing/stale project may hold the cursor before it is passed
     fetch_concurrency: int = 4
     new_package_policy: str = "surface"   # "surface" | "skip" | "full"
     threshold_t: float = 40.0             # baseline default; tune for your tolerance

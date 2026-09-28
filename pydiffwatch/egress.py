@@ -1,7 +1,7 @@
 """Default-deny egress: a process-wide host allowlist enforced at socket.getaddrinfo.
 
 Every outbound connection in PyDiffWatch resolves its hostname through socket.getaddrinfo before it
-connects — urllib (PyPI JSON, sdist downloads, webhook), xmlrpc (changelog), and the Anthropic SDK's
+connects — urllib (PyPI JSON, sdist downloads, webhook), the JSON simple index, and the Anthropic SDK's
 httpx all funnel through it, even for IP-literal hosts. Wrapping that single chokepoint lets us fail
 CLOSED on any host not on the allowlist, enforcing the architectural invariant that only PyPI, the
 configured LLM endpoint, and an optional webhook are ever contacted.

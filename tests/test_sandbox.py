@@ -667,7 +667,7 @@ def _count_choose(monkeypatch, result="seatbelt"):
 def test_every_scanning_entry_point_proves_the_sandbox_once(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     conn = store.connect(cfg); store.init_schema(conn); store.set_last_serial(conn, 5); conn.close()
-    monkeypatch.setattr(orchestrator.ingest, "changes_since", lambda c, since: [])
+    monkeypatch.setattr(orchestrator.ingest, "changes_since", lambda c, since, **kw: [])
     for entry in (orchestrator.run_once, orchestrator.list_pending, orchestrator.backfill_evidence):
         monkeypatch.setattr(sandbox, "_backend", "off")
         calls = _count_choose(monkeypatch)

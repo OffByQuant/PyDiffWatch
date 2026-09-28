@@ -11,11 +11,15 @@ logger = logging.getLogger(__name__)
 # Stages that represent a completed analysis or permanent decision; skipped on future ticks.
 # pending_review is terminal for the cursor: the LLM-review queue retries it, not the scan. Likewise
 # metadata_retry: a release whose metadata or sdist download, or diff/triage, failed is retried from its
-# release row (bounded, then gave_up), not the changelog. So is no_sdist_wait: a wheel-only release re-checked
+# release row (bounded, then gave_up), not ingest. So is no_sdist_wait: a wheel-only release re-checked
 # for a late sdist once wheel_only_grace_minutes are over.
 TERMINAL = {"triaged", "alerted", "reviewed", "new_package_skipped", "needs_adjudication",
             "refused_to_extract", "no_sdist", "refused_to_fetch", "pending_review",
             "removed_before_scan", "metadata_retry", "gave_up", "no_sdist_wait"}
+
+
+def _iso(dt) -> str:
+    return dt.astimezone(datetime.UTC).isoformat()
 
 
 def _load_ruleset(cfg):
@@ -481,7 +485,7 @@ def _refusal_note(action: str, reason: str) -> str:
 
 
 def _alert_unscanned(cfg, conn, rid, package, version, note, *, stage, score=0.0, fired_rules=(),
-                     queue=True) -> bool:
+                     queue=True, dedupe=None) -> bool:
     """The one path for an outcome that leaves a release unscanned: alert once, and queue it for a person.
 
     - `note` is the alert's reasoning. By convention it starts `UNREVIEWED:` and ends `Not scanned. Needs
@@ -493,13 +497,14 @@ def _alert_unscanned(cfg, conn, rid, package, version, note, *, stage, score=0.0
       `pending` until a person adjudicates it or a model review replaces the verdict. `queue=False` alerts
       only (nothing is left to review).
     - `score` / `fired_rules` carry the triage result into the alert when there is one.
+    - `dedupe` replaces the `unscanned:<stage>` suffix (a project-level alert dedupes per incident).
     Never classifies the release `malicious`. Returns True iff the alert was new."""
     v = Verdict(package, version, "suspicious", score or 0.0, list(fired_rules), False, confidence=0.0,
                 attack_type="none", reasoning=note, cited_hunk="", recommended_action="monitor", model="none")
     if queue:
         store.record_verdict(conn, rid, v)
     return notifier.emit(cfg, conn, dataclasses.replace(v, classification="suspicious-heuristic"), rid,
-                         dedupe_suffix=f"unscanned:{stage}")
+                         dedupe_suffix=dedupe or f"unscanned:{stage}")
 
 
 def _record_download(conn, rid, dl):
@@ -682,11 +687,72 @@ def seed_now(cfg: Config):
     s = ingest.current_serial(cfg)
     if s is not None:
         store.set_last_serial(conn, s)
+        store.set_meta(conn, "ingest_floor", _iso(datetime.datetime.now(datetime.UTC)))
     return s
 
 
+def _alert_project(cfg, conn, name, serial, stage, what):
+    """The project-level unscanned alert: a project whose new releases the ingest could not list (its JSON was
+    refused, or it held the cursor for max_hold_ticks and was passed). It is recorded as a synthetic release
+    `<name>==*` at a terminal stage, so it waits in `pending` like any unscanned release; version `*` is never
+    in a project's JSON, so nothing ever downloads it."""
+    rid = store.record_release(conn, name, "*", serial, False, None, "sdist")
+    was, label = conn.execute("SELECT r.serial, v.human_label FROM releases r LEFT JOIN verdicts v "
+                              "ON v.release_id=r.id WHERE r.id=?", (rid,)).fetchone()
+    if was != serial:
+        # a later incident on a project alerted before. Still waiting in `pending`: point it at the new serial, no
+        # second alert. Already handled by a person: put it back in `pending` and alert again.
+        conn.execute("UPDATE releases SET serial=? WHERE id=?", (serial, rid))
+        if label is None:
+            conn.commit()
+            store.update_stage(conn, rid, stage)
+            return
+        conn.execute("UPDATE verdicts SET human_label=NULL, human_note=NULL, adjudicated_at=NULL "
+                     "WHERE release_id=?", (rid,))
+        conn.commit()
+    store.update_stage(conn, rid, stage)
+    _alert_unscanned(cfg, conn, rid, name, "*",
+                     f"UNREVIEWED: {what}, so new releases in project {name} could not be listed. "
+                     f"Not scanned. Needs manual review.", stage=stage, dedupe=f"unscanned:{stage}:{serial}")
+
+
+def _hold_limit(cfg) -> int:
+    return max(1, cfg.max_hold_ticks)
+
+
+def _load_holds(raw) -> dict:
+    """meta `ingest_holds`, keeping only well-formed entries: a bad record must never wedge the tick."""
+    try:
+        holds = json.loads(raw or "{}")
+    except ValueError:
+        return {}
+    if not isinstance(holds, dict):
+        return {}
+    return {n: h for n, h in holds.items() if isinstance(n, str) and isinstance(h, dict)
+            and all(isinstance(h.get(k), int) and not isinstance(h.get(k), bool) for k in ("serial", "ticks"))}
+
+
+def _note_holds(cfg, conn, holds, held):
+    """Count the consecutive ticks each project has held the cursor, in meta `ingest_holds` (a project that keeps
+    changing while it fails keeps counting). A project no longer held is dropped. At max_hold_ticks it alerts, and
+    from the next tick on it no longer holds (run_once passes it in release_holds); a later serial while it is still
+    failing goes to _alert_project again, which alerts only if a person has already handled the first one."""
+    now = {}
+    for name, serial, why in held:
+        was = holds.get(name)
+        ticks = was["ticks"] + 1 if was else 1
+        now[name] = {"serial": serial, "ticks": ticks}
+        if ticks == _hold_limit(cfg) or (ticks > _hold_limit(cfg) and was["serial"] != serial):
+            logger.warning("%s has held the cursor below serial %d for %d ticks (%s); passing it", name, serial,
+                           ticks, why)
+            _alert_project(cfg, conn, name, serial, "gave_up",
+                           f"pydiffwatch gave up on project {name}: it held the cursor for {ticks} ticks "
+                           f"({_clip(why)})")
+    store.set_meta(conn, "ingest_holds", json.dumps(now, sort_keys=True))
+
+
 def _to_fetch(conn, rel) -> bool:
-    """Whether run_once fetches and processes this changelog item. A release not yet at a TERMINAL stage is
+    """Whether run_once fetches and processes this ingest item. A release not yet at a TERMINAL stage is
     fetched. An sdist upload re-scans a release left wheel-only (its wheels uploaded first); on any other
     release it is a no-op (one SELECT, no fetch), since that release's own `new release` event covers it."""
     stg = store.get_stage(conn, rel.package, rel.version)
@@ -740,11 +806,14 @@ def run_once(cfg: Config, *, seed_if_fresh: bool = True, recent: int | None = No
                 return 0
             if not recent:
                 store.set_last_serial(conn, now_serial)
+                store.set_meta(conn, "ingest_floor", _iso(datetime.datetime.now(datetime.UTC)))
                 logger.info("fresh cursor seeded to PyPI serial %d; monitoring starts now", now_serial)
                 return 0
-            last = max(now_serial - recent, 0)      # start N changelog events back and scan them this tick
+            last = max(now_serial - recent, 0)      # start N PyPI serials back and scan them this tick
             store.set_last_serial(conn, last)
-            print(f"[pydiffwatch] starting {recent:,} PyPI changelog events back (serial {last:,}); "
+            store.set_meta(conn, "ingest_floor", _iso(datetime.datetime.now(datetime.UTC)
+                                                      - datetime.timedelta(hours=cfg.recent_floor_hours)))
+            print(f"[pydiffwatch] starting {recent:,} PyPI serials back (serial {last:,}); "
                   f"catching up to now", flush=True)
         rvw = _build_reviewer(cfg)
         ruleset = _load_ruleset(cfg)
@@ -766,7 +835,23 @@ def run_once(cfg: Config, *, seed_if_fresh: bool = True, recent: int | None = No
                 guard.begin_batch()
                 drain_pending(cfg, conn, rvw, auto=True, limit=cfg.reviewer.max_pending_per_tick, guard=guard)
         _retry_metadata(cfg, conn, rvw, ruleset, offline, guard)
-        releases = ingest.changes_since(cfg, last)[:cfg.max_releases_per_run]
+        tick_start = datetime.datetime.now(datetime.UTC)
+        floor = store.get_meta(conn, "ingest_floor")
+        if last == 0 and not seed_if_fresh:
+            store.set_meta(conn, "ingest_backfill", _iso(tick_start))   # a crawl from genesis: no floor until caught up
+        elif last > 0 and floor is None and store.get_meta(conn, "ingest_backfill") is None:
+            # A database from the changelog build has a cursor and no floor: without one, every old version of
+            # each changed project would count as new. Seed it from the cursor's last move.
+            since = ingest._when((store.get_cursor(conn) or {}).get("updated_at")) or tick_start
+            floor = _iso(since - datetime.timedelta(minutes=cfg.floor_margin_minutes))
+            store.set_meta(conn, "ingest_floor", floor)
+            logger.info("no ingest floor on a cursor at serial %d; seeded it to %s", last, floor)
+        holds = _load_holds(store.get_meta(conn, "ingest_holds"))
+        released = frozenset(n for n, h in holds.items() if h["ticks"] >= _hold_limit(cfg))
+        found = ingest.changes_since(cfg, last, floor=floor, stage=lambda p, v: store.get_stage(conn, p, v),
+                                     terminal=frozenset(TERMINAL), release_holds=released)
+        ceiling = getattr(found, "ceiling", None)   # a plain list (older stubs) has none: advance to listed serials
+        releases = list(found)[:cfg.max_releases_per_run]
         prepared = [(rel, _to_fetch(conn, rel)) for rel in releases]
 
         # Fetch concurrently in a bounded window but CONSUME results in ascending-serial order on the
@@ -787,9 +872,28 @@ def run_once(cfg: Config, *, seed_if_fresh: bool = True, recent: int | None = No
                         terminal = _process_fetched(cfg, conn, rvw, ruleset, rel, futs[i].result(), offline, guard)
                     if terminal and not blocked:
                         advance_to = rel.serial
-                    else:
+                    elif not terminal:
+                        # Under the simple index every release of one project shares that project's serial:
+                        # a non-terminal release must cap advance_to BELOW its own serial, even if an earlier
+                        # terminal release at the same serial already raised advance_to to it.
+                        advance_to = min(advance_to, rel.serial - 1)
                         blocked = True  # stop advancing past the first non-terminal release
-        store.set_last_serial(conn, advance_to)
+                    else:
+                        blocked = True  # a later terminal release after the block: still can't advance
+        if ceiling is not None:            # the index was read: account for held and refused projects
+            _note_holds(cfg, conn, holds, getattr(found, "held", []))
+            for name, serial in getattr(found, "refused", []):
+                _alert_project(cfg, conn, name, serial, "refused_to_fetch",
+                               f"pydiffwatch refused to fetch the PyPI JSON of project {name} (it is over the "
+                               f"metadata size cap)")
+            advance_to = ceiling if not blocked else min(advance_to, ceiling)
+            if not blocked and getattr(found, "complete", False):
+                margin = datetime.timedelta(minutes=cfg.floor_margin_minutes)
+                new = tick_start - margin
+                old = ingest._when(floor)      # None on a naive/malformed stored floor: always rewrite
+                if old is None or new > old:
+                    store.set_meta(conn, "ingest_floor", _iso(new))      # the floor only moves forward
+        store.set_last_serial(conn, max(advance_to, store.get_last_serial(conn)))
         try:
             store.maybe_prune(conn, cfg.retention_days, cfg.prune_every_hours * 3600, time.time())
         except sqlite3.Error:
@@ -960,8 +1064,8 @@ def _cursor(cfg) -> int:
 
 
 def _behind(cfg, before: int) -> bool:
-    """True when the tick moved the cursor and at least max_releases_per_run PyPI changelog events are
-    still waiting. A pinned cursor (the PyPI changelog call keeps failing) is never "behind": retrying it
+    """True when the tick moved the cursor and at least max_releases_per_run PyPI serials are
+    still waiting. A pinned cursor (the PyPI index call keeps failing) is never "behind": retrying it
     back-to-back would hammer PyPI."""
     after = _cursor(cfg)
     if after <= before:

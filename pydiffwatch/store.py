@@ -90,6 +90,15 @@ def set_last_serial(conn, serial: int):
     conn.execute("UPDATE cursor SET last_serial=?, updated_at=? WHERE id=1", (serial, _now()))
     conn.commit()
 
+def get_meta(conn, key):
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
+
+def set_meta(conn, key, value: str):
+    conn.execute("INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                 (key, value))
+    conn.commit()
+
 def release_exists(conn, package, version) -> bool:
     return conn.execute("SELECT 1 FROM releases WHERE package=? AND version=?",
                         (package, version)).fetchone() is not None
