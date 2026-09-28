@@ -21,7 +21,7 @@ import sys
 import threading
 from pathlib import Path
 
-from . import differ, engine, fetcher
+from . import differ, engine, execctx, fetcher
 from .config import Config
 from .models import Diff, Download, FileDiff, FiredRule, Hunk, TriageResult
 from .rules import Rule
@@ -144,7 +144,10 @@ def _encode_output(art, d: Diff, tr: TriageResult) -> bytes:
                              for f in d.changed],
                  "added_binaries": d.added_binaries, "description": d.description,
                  "exec_context": d.exec_context, "baseline_unavailable": d.baseline_unavailable,
-                 "surface_omitted": d.surface_omitted, "requires_python": d.requires_python},
+                 "surface_omitted": d.surface_omitted, "requires_python": d.requires_python,
+                 "file_classes": d.file_classes,
+                 "hook_targets": [{"path": h.path, "change_kind": h.change_kind, "new_text": h.new_text,
+                                   "run_by": h.run_by} for h in d.hook_targets]},
         "triage": {"fired_rules": [{"rule": r.rule, "weight": r.weight, "file": r.file, "lines": list(r.lines)}
                                    for r in tr.fired_rules]},
         "prior_error": art.prior_error}, sort_keys=True).encode()
@@ -215,11 +218,20 @@ def _decode_output(raw: bytes, cfg, dl: Download, ruleset):
                                                for k, v in b.items()) for b in bins), "binary list")
         omitted = dd["surface_omitted"]
         _check(omitted is None or type(omitted) is int, "surface_omitted")
+        requires_python = _str(dd["requires_python"], "requires_python", optional=True)
+        _check(requires_python is None or len(requires_python) <= 4096, "requires_python")
+        classes = _dict(dd["file_classes"], "file classes")
+        _check(all(v in execctx.CLASSES for v in classes.values()), "file class")
+        hooks = []
+        for h in _list(dd["hook_targets"], "hook targets")[:differ._MAX_HOOK_TARGETS]:
+            _dict(h, "hook target")
+            _check(h["change_kind"] == "unchanged", "hook target kind")
+            hooks.append(FileDiff(_str(h["path"], "path"), "unchanged", [], _str(h["new_text"], "file text"),
+                                  run_by=_str(h["run_by"], "run by")))
         d = Diff(dd["package"], dd["version"], dd["is_first_release"], changed, bins, [],
                  _str(dd["description"], "description"), _str(dd["exec_context"], "exec context"),
                  _str(dd["baseline_unavailable"], "baseline"), omitted, "",
-                 requires_python=_str(dd["requires_python"], "requires_python", optional=True))
-        _check(d.requires_python is None or len(d.requires_python) <= 4096, "requires_python")
+                 requires_python=requires_python, file_classes=classes, hook_targets=hooks)
         prior_error = _str(out["prior_error"], "prior_error", optional=True)
         known = {r.id for r in ruleset}
         fired = []
@@ -403,7 +415,7 @@ def analyze(cfg, dl, owners, ruleset, backend=None):
         d, tr, prior_error = _decode_output(_run(cfg, backend, _encode_input(cfg, dl, ruleset)), cfg, dl, ruleset)
     d = dataclasses.replace(d, added_dep_findings=list(dl.added_dep_findings),
                             signals=differ.render_signals(dl.requires_dist_change, dl.added_dep_findings,
-                                                          d.added_binaries, owners))
+                                                          d.added_binaries, owners, dl.publishing))
     return d, _with_parent_rules(cfg, dl, d, tr, owners, ruleset), prior_error
 
 

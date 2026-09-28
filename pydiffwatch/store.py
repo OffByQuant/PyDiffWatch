@@ -47,11 +47,16 @@ def migrate_schema(conn):
     for col, typ in (("review_attempts", "INTEGER DEFAULT 0"), ("pending_reason", "TEXT"),
                      ("pending_detail", "TEXT"), ("review_input", "BLOB"),
                      ("fetch_attempts", "INTEGER DEFAULT 0"), ("fetch_note", "TEXT"), ("recheck_at", "REAL"),
-                     ("removed_reason", "TEXT"), ("removed_at", "TEXT")):
+                     ("removed_reason", "TEXT"), ("removed_at", "TEXT"), ("review_shown", "BLOB")):
         try:
             conn.execute(f"SELECT {col} FROM releases LIMIT 1")
         except sqlite3.OperationalError:
             conn.execute(f"ALTER TABLE releases ADD COLUMN {col} {typ}"); conn.commit()
+    for col in ("runs_when", "source_kind", "sink_kind", "chain_source", "chain_sink", "gate"):   # spec F
+        try:
+            conn.execute(f"SELECT {col} FROM verdicts LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute(f"ALTER TABLE verdicts ADD COLUMN {col} TEXT"); conn.commit()
     try:
         conn.execute("SELECT review_input_chars FROM releases LIMIT 1")
     except sqlite3.OperationalError:
@@ -161,9 +166,10 @@ def prune(conn, retention_days: int = 0):
       actionable stage), except each package's newest release, and its newest release carrying maintainer
       metadata, which get_release_metadata reads as the next release's maintainer baseline;
     then compact the file."""
-    # needs_adjudication is excluded even when the stored verdict says 'benign': spec U2 routes a
-    # partially-reviewed benign verdict there for a person to look at, and that person may act on it.
-    conn.execute("UPDATE releases SET evidence=NULL WHERE evidence IS NOT NULL AND stage != 'needs_adjudication' "
+    # needs_adjudication and reviewed_partial are excluded even when the stored verdict says 'benign': spec U2
+    # routes a partially-reviewed benign verdict there for a person to look at, and that person may act on it.
+    conn.execute("UPDATE releases SET evidence=NULL WHERE evidence IS NOT NULL "
+                 "AND stage NOT IN ('needs_adjudication', 'reviewed_partial') "
                  "AND (stage='triaged' OR id IN "
                  "(SELECT release_id FROM verdicts WHERE classification='benign' "
                  "AND COALESCE(human_label,'benign')='benign'))")
@@ -239,13 +245,28 @@ def bump_review_attempts(conn, release_id) -> int:
     conn.commit()
     return review_attempts(conn, release_id)
 
-def park_for_review(conn, release_id, reason, detail, review_input):
-    """Queue a flagged release for a later LLM review. The review input is kept (compressed) so the
-    review doesn't depend on PyPI still hosting the sdist; it is dropped once a verdict lands."""
-    conn.execute("UPDATE releases SET stage='pending_review', pending_reason=?, pending_detail=?, "
-                 "review_input=?, review_input_chars=? WHERE id=?",
-                 (reason, detail, zlib.compress(review_input.encode()), len(review_input), release_id))
+_KEEP = object()    # park_for_review: leave the stored review_shown as it is (Ruling F10)
+
+
+def park_for_review(conn, release_id, reason, detail, review_input, shown=_KEEP):
+    """Queue a flagged release for a later LLM review. The review input is kept (compressed) so the review doesn't
+    depend on PyPI still hosting the sdist; it is dropped once a verdict lands. `shown` (spec F R2-4): the lines the
+    input shows, kept beside it; omitted, the stored one stays (a re-park of the same text); None clears it."""
+    sets, params = ("stage='pending_review', pending_reason=?, pending_detail=?, review_input=?, "
+                    "review_input_chars=?"), [reason, detail, zlib.compress(review_input.encode()), len(review_input)]
+    if shown is not _KEEP:
+        from .reviewer import shown_to_json
+        sets += ", review_shown=?"
+        params.append(None if shown is None else zlib.compress(shown_to_json(shown).encode()))
+    conn.execute(f"UPDATE releases SET {sets} WHERE id=?", params + [release_id])  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
     conn.commit()
+
+
+def review_shown(conn, release_id) -> dict | None:
+    """The stored input's shown lines, or None (none stored: a pre-F park, or a reviewer_disabled one)."""
+    from .reviewer import shown_from_json
+    row = conn.execute("SELECT review_shown FROM releases WHERE id=?", (release_id,)).fetchone()
+    return shown_from_json(zlib.decompress(row[0]).decode()) if row and row[0] else None
 
 def set_pending_reason(conn, release_id, reason, detail):
     """Re-park a pending_review row under a new reason, keeping its stored review input."""
@@ -255,7 +276,7 @@ def set_pending_reason(conn, release_id, reason, detail):
 
 def clear_pending(conn, release_id):
     conn.execute("UPDATE releases SET pending_reason=NULL, pending_detail=NULL, review_input=NULL, "
-                 "review_input_chars=NULL WHERE id=?",
+                 "review_input_chars=NULL, review_shown=NULL WHERE id=?",
                  (release_id,))
     conn.commit()
 
@@ -362,8 +383,8 @@ def removed_counts(conn) -> dict:
 # Stages a release reaches only after its sdist was downloaded, or refused for its size: the store's own evidence
 # that a package shipped one. refused_to_fetch also covers a quarantine refusal and an over-size package JSON,
 # which prove no sdist; counting them errs toward a switch warning, never toward silence.
-SDIST_STAGES = ("triaged", "alerted", "reviewed", "needs_adjudication", "pending_review", "new_package_skipped",
-                "refused_to_extract", "refused_to_fetch")
+SDIST_STAGES = ("triaged", "alerted", "reviewed", "needs_adjudication", "reviewed_partial", "pending_review",
+                "new_package_skipped", "refused_to_extract", "refused_to_fetch")
 
 def previous_sdist_release(conn, package, version):
     """The package's most recent release recorded before this (recorded) one, if it reached an sdist-scanned
@@ -436,17 +457,25 @@ def record_alert(conn, release_id, classification, score, fired_rules_json, dedu
     return cur.rowcount == 1   # True = newly inserted, False = deduped
 
 def record_verdict(conn, release_id, verdict) -> int:
-    """Persist an LLM Verdict (§5 verdicts table). UNIQUE(release_id) -> a re-review replaces."""
+    """Persist an LLM Verdict (§5 verdicts table), with its quoted chain and the gate's reason (spec F).
+    UNIQUE(release_id) -> a re-review replaces."""
+    clip = lambda s: s[:2_000] if isinstance(s, str) else s
     conn.execute("""INSERT INTO verdicts
-        (release_id,classification,confidence,attack_type,reasoning,cited_hunk,model,urgent,created_at)
-        VALUES(?,?,?,?,?,?,?,?,?)
+        (release_id,classification,confidence,attack_type,reasoning,cited_hunk,model,urgent,created_at,
+         runs_when,source_kind,sink_kind,chain_source,chain_sink,gate)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(release_id) DO UPDATE SET
           classification=excluded.classification, confidence=excluded.confidence,
           attack_type=excluded.attack_type, reasoning=excluded.reasoning,
           cited_hunk=excluded.cited_hunk, model=excluded.model,
-          urgent=excluded.urgent, created_at=excluded.created_at""",
+          urgent=excluded.urgent, created_at=excluded.created_at, runs_when=excluded.runs_when,
+          source_kind=excluded.source_kind, sink_kind=excluded.sink_kind, chain_source=excluded.chain_source,
+          chain_sink=excluded.chain_sink, gate=excluded.gate""",
         (release_id, verdict.classification, verdict.confidence, verdict.attack_type,
-         verdict.reasoning, verdict.cited_hunk, verdict.model, int(verdict.urgent), _now()))
+         verdict.reasoning, verdict.cited_hunk, verdict.model, int(verdict.urgent), _now(),
+         getattr(verdict, "runs_when", None), getattr(verdict, "source_kind", None), getattr(verdict, "sink_kind", None),
+         clip(getattr(verdict, "chain_source", None)), clip(getattr(verdict, "chain_sink", None)),
+         getattr(verdict, "gate", None)))
     conn.commit()
     return conn.execute("SELECT id FROM verdicts WHERE release_id=?", (release_id,)).fetchone()[0]
 
@@ -477,7 +506,7 @@ def pending_adjudication(conn):
                   r.evidence, r.stage, r.pending_reason,
                   v.classification, v.confidence, v.attack_type, v.reasoning, v.cited_hunk, v.model
            FROM releases r JOIN verdicts v ON v.release_id = r.id
-           WHERE (r.stage = 'needs_adjudication'
+           WHERE (r.stage IN ('needs_adjudication', 'reviewed_partial')
                   OR (r.stage IN ({','.join('?' * len(UNSCANNED_STAGES))}) AND v.model = 'none'))
              AND v.human_label IS NULL
            ORDER BY r.id""", UNSCANNED_STAGES).fetchall()
@@ -520,7 +549,8 @@ def all_verdicts(conn):
         """SELECT r.id AS release_id, r.package, r.version, r.prior_version,
                   r.is_first_release, r.triage_score, r.stage,
                   v.classification, v.confidence, v.attack_type, v.reasoning,
-                  v.cited_hunk, v.model, v.urgent, v.created_at, v.human_label, v.human_note
+                  v.cited_hunk, v.model, v.urgent, v.created_at, v.human_label, v.human_note,
+                  v.runs_when, v.source_kind, v.sink_kind, v.chain_source, v.chain_sink, v.gate
            FROM releases r JOIN verdicts v ON v.release_id = r.id
            ORDER BY CASE v.classification WHEN 'malicious' THEN 0
                     WHEN 'suspicious' THEN 1 ELSE 2 END, r.id DESC""").fetchall()

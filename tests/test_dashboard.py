@@ -357,3 +357,29 @@ def test_report_button_opens_pypis_malware_report_form_not_the_project_page():
     out = dashboard.render_dashboard([{"package": "evil pkg", "version": "1.0.0",
                                        "classification": "malicious", "model": "qwen", "reasoning": "x"}])
     assert ('class="btn report" href="https://pypi.org/project/evil%20pkg/submit-malware-report/"' in out)
+
+
+# ---- PR F: the chain on the card ----
+
+def test_a_malicious_card_shows_the_quoted_chain_pasteable():
+    html = dashboard.render_dashboard([{"package": "p", "version": "1", "classification": "malicious",
+                                        "model": "m", "reasoning": "r", "stage": "reviewed",
+                                        "source_kind": "secret-read", "sink_kind": "send",
+                                        "chain_source": "k = open('/proc/<pid>/environ').read()",
+                                        "chain_sink": "requests.post(U, data=k)", "gate": ""}])
+    assert "secret-read" in html and "requests.post(U, data=k)" in html
+    assert "/proc/‹pid›/environ" in html and "&lt;pid&gt;" not in html
+
+
+def test_a_downgraded_card_says_why_it_was_held():
+    html = dashboard.render_dashboard([{"package": "p", "version": "1", "classification": "suspicious",
+                                        "model": "m", "reasoning": "model said malicious (downgraded: x)",
+                                        "stage": "needs_adjudication", "chain_source": "a", "chain_sink": "b",
+                                        "gate": "no dataflow shown between source and sink"}])
+    assert "held: no dataflow shown between source and sink" in html
+
+
+def test_a_reviewed_partial_row_is_partial_even_when_reworded():
+    row = {"package": "p", "version": "1", "classification": "suspicious", "model": "m", "reasoning": "x",
+           "stage": "reviewed_partial"}
+    assert dashboard.counts([row])["partial"] == 1

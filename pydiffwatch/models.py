@@ -38,6 +38,7 @@ class Download:
     added_dep_findings: list[dict]  # signal 5, screened here: the lookups need the network
     requires_dist_change: dict | None
     description: str | None         # the JSON info.summary; PKG-INFO's Summary replaces it once extracted
+    publishing: dict | None = None  # {"releases", "days_since_prior"} from the package JSON (parent-side; spec F)
 
 @dataclass(frozen=True)
 class Hunk:
@@ -46,8 +47,9 @@ class Hunk:
 
 @dataclass(frozen=True)
 class FileDiff:
-    path: str; change_kind: str; hunks: list[Hunk]   # added|removed|modified
+    path: str; change_kind: str; hunks: list[Hunk]   # added|removed|modified (unchanged: a hook target, spec F)
     new_text: str | None = None                      # complete new-file source (for whole-file AST parse)
+    run_by: str | None = None                        # a hook target: the changed file that names it (spec F)
 
 @dataclass(frozen=True)
 class Diff:
@@ -60,6 +62,8 @@ class Diff:
     surface_omitted: int | None = None   # a first release under `surface`: source files not shown
     signals: str = ""              # dependency / binary / ownership signals, one per line (author strings escaped)
     requires_python: str | None = None   # from the ArtifactSet: the release's declared interpreter floor, verbatim
+    file_classes: dict = field(default_factory=dict)   # path -> when it runs (execctx.CLASSES; spec F §3.1)
+    hook_targets: list = field(default_factory=list)   # unchanged FileDiffs a changed build/metadata file names
 
 @dataclass(frozen=True)
 class FiredRule:
@@ -81,3 +85,8 @@ class Verdict:
     recommended_action: str | None = None
     model: str | None = None          # which Claude model produced this verdict (-> verdicts.model)
     runs_when: str | None = None      # the model's answer to when the cited code runs (not stored)
+    source_kind: str | None = None    # spec F: the chain the model quoted (chain.SOURCE_KINDS / SINK_KINDS)
+    sink_kind: str | None = None
+    chain_source: str | None = None
+    chain_sink: str | None = None
+    gate: str | None = None           # why the chain gate or the weak rules held a malicious verdict ("" = stood)

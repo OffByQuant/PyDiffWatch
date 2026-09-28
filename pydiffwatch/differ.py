@@ -1,4 +1,5 @@
 import difflib
+import re
 from . import execctx, facts
 from .models import ArtifactSet, Diff, FileDiff, Hunk
 
@@ -62,25 +63,64 @@ def _dep_line(f) -> str:
     return f"dependency {name}: {_DEP_REASONS.get(reason) or _esc(reason)}"
 
 
-def render_signals(requires_dist_change, added_dep_findings, added_binaries, maintainer_context) -> str:
-    """The dependency / binary / ownership signals triage scored, one line each, for the reviewer (spec B2).
-    Rendered by the parent from its own data (parse-sandbox spec decision 5). Every author-written value (names,
-    specifiers, paths, owners) is escaped to one line here."""
+def render_signals(requires_dist_change, added_dep_findings, added_binaries, maintainer_context,
+                   publishing=None) -> str:
+    """The dependency / ownership / publishing signals, one line each, for the reviewer (spec B2, F decision 6).
+    Rendered by the parent from its own data (parse-sandbox spec decision 5). Every author-written value is escaped
+    to one line here. Binaries are listed by render_unreadable instead (spec F Ruling F4); `added_binaries` stays in
+    the signature for callers."""
     out = []
     for key in ("added", "removed"):
         if items := (requires_dist_change or {}).get(key):
             out.append(f"requires-dist {key}: {_list(items)}")
-    deps = [_dep_line(f) for f in added_dep_findings]
-    out += _capped("dependency", deps)
-    bins = []
-    # unscored oversized files last: the shared cap must never cut a scored line for one
-    for b in sorted(facts._normalize_binaries(added_binaries), key=lambda b: b["reason"] == "file-too-large"):
-        reason = _esc(b.get("reason") or "unknown") + (f" ({_esc(b['ext'])})" if b.get("ext") else "")
-        bins.append(f"added file {_esc(b.get('path'))}: {_esc(b.get('size'))} bytes, {reason}")
-    out += _capped("added file", bins)
+    out += _capped("dependency", [_dep_line(f) for f in added_dep_findings])
     if change := facts.roles_change(maintainer_context):
         out.append(f"maintainer set changed: {_list(change[0])} -> {_list(change[1])}")
+    if isinstance(publishing, dict):
+        n, d = publishing.get("releases"), publishing.get("days_since_prior")
+        out.append(f"releases on PyPI: {n if type(n) is int else 'unknown'}")
+        out.append("days since the previous release: "
+                   + (str(d) if type(d) is int else "none (no earlier release)"))
     return "\n".join(out)
+
+
+def render_unreadable(added_binaries) -> str:
+    """The changed files DiffWatch could not show as text (binaries, oversized or foreign-language members), one
+    line each, unscored oversized files last (spec F §3.2). Author paths escaped to one line."""
+    lines = []
+    for b in sorted(facts._normalize_binaries(added_binaries), key=lambda b: b["reason"] == "file-too-large"):
+        reason = _esc(b.get("reason") or "unknown") + (f" ({_esc(b['ext'])})" if b.get("ext") else "")
+        lines.append(f"{_esc(b.get('path'))}: {_esc(b.get('size'))} bytes, {reason}")
+    return "\n".join(_capped("not readable", lines))
+
+
+_MAX_HOOK_TARGETS = 20      # carried to the reviewer, which shows at most 5 whole (spec F §3.2)
+_HOOK_SOURCES = ("setup.py", "pyproject.toml", "setup.cfg")
+_EP_TARGET = re.compile(r"(?<![\w.])([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*:\s*[A-Za-z_]\w*")
+_PY_PATH = re.compile(r"""["']((?:\./)?[\w./-]+\.py)["']""")
+
+
+def _hook_targets(new_files, changed) -> list[FileDiff]:
+    """Unchanged files that a changed setup.py, pyproject.toml, setup.cfg or entry_points.txt names in an ADDED
+    line — an import in setup.py, an entry-point target `mod:attr`, a quoted *.py path (Ruling F6) — carried whole
+    so the reviewer sees code this release newly runs (spec F §2.5). Never scored: not in Diff.changed."""
+    changed_paths = {f.path for f in changed}
+    out: dict[str, str] = {}
+    for f in changed:
+        if f.change_kind == "removed" or not (f.path in _HOOK_SOURCES or f.path.endswith("/entry_points.txt")):
+            continue
+        named = set()
+        for ln in (ln for h in f.hunks for ln in h.added):
+            s = ln.strip()
+            if f.path == "setup.py" and s.startswith(("import ", "from ")):
+                named |= execctx.local_imports("setup.py", s.encode("utf-8", "replace"), new_files)
+            named |= {p for m in _EP_TARGET.finditer(ln) if (p := execctx.module_file(m.group(1), new_files))}
+            named |= {p for m in _PY_PATH.finditer(ln) if (p := m.group(1).removeprefix("./")) in new_files}
+        for p in sorted(named):
+            if p not in changed_paths and p not in out and len(out) < _MAX_HOOK_TARGETS:
+                out[p] = f.path
+    return [FileDiff(p, "unchanged", [], new_files[p].decode("utf-8", errors="replace"), run_by=by)
+            for p, by in out.items()]
 
 
 def build_diff(a: ArtifactSet) -> Diff:
@@ -99,8 +139,10 @@ def build_diff(a: ArtifactSet) -> Diff:
         if hunks:
             new_text = new.decode("utf-8", errors="replace") if new is not None else None
             changed.append(FileDiff(path, kind, hunks, new_text))
+    hooks = _hook_targets(a.new_files, changed)
+    classes = execctx.classify(a.new_files, [f.path for f in changed] + [h.path for h in hooks])
     return Diff(a.package, a.version, a.prior_version is None, changed,
                 list(a.added_binaries), list(a.added_dep_findings), _description(a.description),
                 execctx.build(a.new_files, a.too_large),
                 a.prior_version if a.prior_error and a.prior_version else "", a.surface_omitted,
-                "", requires_python=a.requires_python)
+                "", requires_python=a.requires_python, file_classes=classes, hook_targets=hooks)

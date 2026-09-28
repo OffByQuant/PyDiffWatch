@@ -98,7 +98,7 @@ def test_an_unavailable_baseline_version_stays_on_one_header_line():
 
 # ---- B2: the dependency / binary / ownership signals block ----
 
-_SIG = "--- dependency / binary / ownership signals (PyPI metadata and the sdist's file list; context, not code) ---"
+_SIG = "--- dependency / ownership / publishing signals (PyPI metadata; context, not code) ---"
 _TYPO = TriageResult(40.0, [FiredRule("dep-typosquat", 40.0, "reqeusts", (0, 0))], True)
 _MARKER_RE = re.compile(r"===DW-UNTRUSTED-[0-9a-f]{32}===")
 
@@ -161,10 +161,12 @@ def test_differ_lists_every_signal():
         "dependency ghost-pkg: not on PyPI (dependency confusion)",
         "dependency fresh: brand-new on PyPI",
         "dependency late: not screened (lookup cap reached)",
-        "added file p/x.so: 1234 bytes, new-binary",
-        "added file p/big.py: 9000000 bytes, source-too-large",
-        "added file p/l.php: 10 bytes, foreign-language-source (.php)",
         "maintainer set changed: alice -> mallory",
+    ]
+    assert differ.render_unreadable(art.added_binaries).split("\n") == [
+        "p/x.so: 1234 bytes, new-binary",
+        "p/big.py: 9000000 bytes, source-too-large",
+        "p/l.php: 10 bytes, foreign-language-source (.php)",
     ]
 
 
@@ -176,8 +178,8 @@ def test_no_signal_data_renders_no_signal_line_and_no_block():
 
 def test_each_kind_of_signal_is_capped_at_twenty_items():
     art = _art(added_binaries=[{"path": f"b{i}.so", "size": 1, "sha256": "x"} for i in range(50)])
-    lines = differ.render_signals(art.requires_dist_change, art.added_dep_findings, art.added_binaries, None).split("\n")
-    assert len(lines) == 21 and lines[-1] == "added file: … (+30 more)"
+    lines = differ.render_unreadable(art.added_binaries).split("\n")
+    assert len(lines) == 21 and lines[-1] == "not readable: … (+30 more)"
 
 
 def test_a_dependency_typosquat_is_shown_inside_the_markers_after_the_execution_context():
@@ -190,7 +192,7 @@ def test_a_dependency_typosquat_is_shown_inside_the_markers_after_the_execution_
     text = reviewer.build_review_input(d, _TYPO, max_chars=10_000)
     assert "typosquat of requests" not in _header(text)
     body = _untrusted(text)
-    assert body.index("--- execution context") < body.index(_SIG) < body.index("--- file: setup.py (modified) ---")
+    assert body.index("--- execution context") < body.index(_SIG) < body.index("--- file: setup.py (modified; class=build) ---")
     assert "  dependency reqeusts: its name is one or two edits away from the popular package requests; not looked up" in body
 
 
@@ -200,7 +202,7 @@ def test_a_dependency_only_fire_ranks_only_the_build_files_not_every_changed_fil
     d = Diff("p", "1.1", False, changed, [], signals="dependency reqeusts: typosquat of requests")
     text = reviewer.build_review_input(d, _TYPO, max_chars=10_000)
     heads = [ln for ln in text.split("\n") if ln.startswith("--- file: ")]
-    assert heads == ["--- file: setup.py (modified) ---", "--- file: pyproject.toml (modified) ---"]
+    assert heads == ["--- file: setup.py (modified; class=build) ---", "--- file: pyproject.toml (modified; class=data) ---"]
 
 
 def test_a_dependency_only_fire_with_no_build_file_change_is_not_reviewable():
@@ -264,7 +266,7 @@ def test_hostile_signal_strings_cannot_forge_a_heading(bad):
     assert not any(ln.startswith("--- file:") for ln in lines)                  # no heading, forged or real
     assert len([ln for ln in lines if _MARKER_RE.fullmatch(ln)]) == 2           # only the two real markers
     assert len([ln for ln in lines if ln.startswith("--- execution context")]) == 1  # the real one only
-    assert len([ln for ln in lines if ln.startswith("--- dependency / binary")]) == 1
+    assert len([ln for ln in lines if ln.startswith("--- dependency / ownership")]) == 1
     assert not reviewer._has_reviewable_content(text)
     assert reviewer.dropped_from_text(tr.fired_rules, text) == ["setup.py"]     # a forged heading is not a render
     assert "evil" not in _header(text)
@@ -295,7 +297,7 @@ def test_process_fetched_gives_the_reviewer_the_signals(tmp_path, scan_stub):
     body = _untrusted(seen["text"])
     assert "  dependency reqeusts: its name is one or two edits away from the popular package requests; not looked up" in body
     assert "  maintainer set changed: alice -> mallory" in body
-    assert "--- file: setup.py (modified) ---" in body
+    assert "--- file: setup.py (modified; class=build) ---" in body
 
 
 def test_a_hostile_pkg_info_summary_cannot_forge_a_heading(monkeypatch):
@@ -352,14 +354,14 @@ def test_a_dependency_only_fire_also_shows_code_files_naming_the_flagged_depende
     d = Diff("p", "1.1", False, changed, [], added_dep_findings=_REQ_FINDING)
     text = reviewer.build_review_input(d, _TYPO, max_chars=10_000)
     heads = [ln for ln in text.split("\n") if ln.startswith("--- file: ")]
-    assert heads == ["--- file: setup.py (modified) ---", "--- file: b/load.py (modified) ---",
-                     "--- file: reqs.py (modified) ---"]                         # a/core.py and PKG-INFO never
+    assert heads == ["--- file: setup.py (modified; class=build) ---", "--- file: b/load.py (modified; class=runtime-call) ---",
+                     "--- file: reqs.py (modified; class=import) ---"]                         # a/core.py and PKG-INFO never
 
 
 def test_an_uppercase_py_extension_still_ranks_as_code_naming_the_dependency():
     changed = [_fd("setup.py", "modified", "d"), _fd("b/LOAD.PY", "modified", "import reqeusts.sub")]
     d = Diff("p", "1.1", False, changed, [], added_dep_findings=_REQ_FINDING)
-    ranked, _ = reviewer._rank_files(d, _TYPO)
+    ranked, _, _ = reviewer._rank_files(d, _TYPO)
     assert "b/LOAD.PY" in ranked
 
 
@@ -391,7 +393,7 @@ def test_a_dependency_named_only_in_metadata_stays_unscanned(path, line):
 
 def test_a_pth_import_line_naming_the_dependency_is_shown():
     d = Diff("p", "1.1", False, [_fd("x.pth", "added", "import reqeusts")], [], added_dep_findings=_REQ_FINDING)
-    assert "--- file: x.pth (added) ---" in reviewer.build_review_input(d, _TYPO, max_chars=10_000)
+    assert "--- file: x.pth (added; class=startup) ---" in reviewer.build_review_input(d, _TYPO, max_chars=10_000)
 
 
 def test_binary_rules_never_drive_name_matching_and_ranking_stays_fast():
@@ -404,12 +406,12 @@ def test_binary_rules_never_drive_name_matching_and_ranking_stays_fast():
     d = Diff("p", "1.1", False, files, [], added_dep_findings=_REQ_FINDING)
     import time
     t = time.perf_counter()
-    ranked, _ = reviewer._rank_files(d, tr)
+    ranked, _, _ = reviewer._rank_files(d, tr)
     assert time.perf_counter() - t < 1.0 and ranked == []
 
 
 def test_the_note_says_cap_only_when_the_cap_cut_something():
-    changed = [_fd("setup.py", "modified", "exec(x)"), _fd("README.py", "modified", "doc")]
+    changed = [_fd("setup.py", "modified", "exec(x)"), _fd("README.md", "modified", "doc")]
     text = reviewer.build_review_input(Diff("p", "1.1", False, changed, []), _FIRED, max_chars=10_000)
     assert reviewer.TRUNCATION_NOTE not in text and text.endswith(reviewer.SELECTION_NOTE)
     assert "cap" not in reviewer.SELECTION_NOTE
@@ -424,7 +426,7 @@ def test_the_note_says_cap_only_when_the_cap_cut_something():
 
 def test_the_system_prompt_frames_the_signals_block_as_leads_not_evidence():
     sp = reviewer.SYSTEM_PROMPT
-    assert "dependency / binary / ownership signals block is DiffWatch's heuristic screening" in sp
+    assert "dependency / ownership / publishing signals block is DiffWatch's heuristic screening" in sp
     assert "not evidence on its own" in sp and "a missing finding is not proof of safety" in sp
 
 

@@ -4,9 +4,12 @@ silently; malicious alerts immediately."""
 from pydiffwatch import orchestrator, store
 from pydiffwatch.config import Config
 from pydiffwatch.models import Verdict, Diff, TriageResult, FiredRule
+from tests.fixtures import chains
 
 
 class _FakeRvw:
+    shown = chains.SHOWN      # the lines prepare() showed the model: the gate checks the quoted chain in them
+
     def __init__(self, verdict): self._v = verdict
     def prepare(self, d, tr, cap=None): return ""
     def review_text(self, *a, **kw): return self._v
@@ -19,7 +22,7 @@ def _setup(tmp_path, classification):
     d = Diff("p", "1.0", False, [], [])
     tr = TriageResult(50.0, [FiredRule("autoexec", 50.0, "setup.py", (1, 2))], True)
     v = Verdict("p", "1.0", classification, 50.0, tr.fired_rules, False, confidence=0.9,
-                attack_type="install-hook-rce", reasoning="model says...", model="qwen-singleshot")
+                attack_type="install-hook-rce", reasoning="model says...", model="qwen-singleshot", **chains.FIELDS)
     return cfg, conn, rid, d, tr, v
 
 

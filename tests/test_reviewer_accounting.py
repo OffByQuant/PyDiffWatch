@@ -27,6 +27,21 @@ def _headings(text):
     return [ln for ln in text.split("\n") if ln.startswith("--- file: ")]
 
 
+def _not_shown(text):
+    """(paths listed in the not-shown block, the block's length including its leading newline)."""
+    lines = text.split("\n")
+    if reviewer._NOT_SHOWN_HEADING not in lines:
+        return [], 0
+    i = lines.index(reviewer._NOT_SHOWN_HEADING)
+    block = [lines[i]]
+    for ln in lines[i + 1:]:
+        if not ln.startswith("  "):
+            break
+        block.append(ln)
+    paths = [ln[2:].rsplit(" (", 1)[0] for ln in block[1:] if not ln.startswith("  … (+")]
+    return paths, len("\n".join(block)) + 1
+
+
 def _sweep(d, tr, span=6_000):
     base = len(reviewer.build_review_input(d, tr, max_chars=0))
     out = []
@@ -34,11 +49,16 @@ def _sweep(d, tr, span=6_000):
         dropped = []
         text = reviewer.build_review_input(d, tr, max_chars=cap, dropped=dropped)
         assert len(text) <= cap, (cap, len(text))
-        assert reviewer.dropped_from_text(tr.fired_rules, text) == dropped, cap
+        assert _not_shown(text)[0] == dropped[:40], cap
         out.append((cap, text))
-    # Tight, not just <=: at the cap where a file first fits exactly, only the note's unused reserve is left over.
-    # A double-counted newline would leave 1 more char of slack on every such cap.
-    slack = [cap - len(t) for cap, t in out if _headings(t) and t.endswith(reviewer.TRUNCATION_NOTE)]
+    # Tight, not just <=: at the cap where a file first fits exactly, only the note's unused reserve is left over
+    # (and the part of the not-shown reserve this text's block did not use). A double-counted newline would leave
+    # 1 more char of slack on every such cap.
+    ranked, _, cut = reviewer._rank_files(d, tr)
+    reserve = lambda cap: reviewer._not_shown_reserve(d, ranked, cut, min(reviewer._NEW_BLOCK_MAX,
+                                                                           reviewer._block_cap(cap)))
+    slack = [cap - len(t) - (reserve(cap) - _not_shown(t)[1]) for cap, t in out
+             if _headings(t) and t.endswith(reviewer.TRUNCATION_NOTE)]
     assert slack and min(slack) == reviewer._NOTE_RESERVE - len(reviewer.TRUNCATION_NOTE)
     return out
 
@@ -69,13 +89,13 @@ def test_a_large_zero_weight_file_does_not_hide_smaller_ones_after_it():
     tr = TriageResult(50.0, [FiredRule("r", 50.0, "a.py", (1, 1))], True)
     assert reviewer._rank_files(d, tr)[0] == ["a.py", "b_big.txt", "c_small.txt", "d_small.txt"]
     results = _sweep(d, tr)
-    first = {p: next(cap for cap, t in results if f"--- file: {p} (added) ---" in _headings(t))
+    first = {p: next(cap for cap, t in results if f"--- file: {p} (added; class=inert) ---" in _headings(t))
              for p in ("b_big.txt", "c_small.txt", "d_small.txt")}
     assert first["c_small.txt"] < first["d_small.txt"] < first["b_big.txt"]
     for cap, t in results:
-        if "--- file: b_big.txt (added) ---" not in _headings(t):
+        if "--- file: b_big.txt (added; class=inert) ---" not in _headings(t):
             for p in ("c_small.txt", "d_small.txt"):   # the big one not fitting does not hide the small ones
-                assert (f"--- file: {p} (added) ---" in _headings(t)) is (cap >= first[p]), (cap, p)
+                assert (f"--- file: {p} (added; class=inert) ---" in _headings(t)) is (cap >= first[p]), (cap, p)
             assert t.endswith(reviewer.TRUNCATION_NOTE)
 
 
@@ -86,8 +106,8 @@ def test_a_dependency_only_fire_skips_a_large_build_file_but_shows_the_rest():
     tr = TriageResult(40.0, [FiredRule("dep", 40.0, "evilpkg", (0, 0))], True)
     results = _sweep(d, tr, span=8_000)
     shown = [set(_headings(t)) for _, t in results]
-    assert any({"--- file: setup.py (modified) ---", "--- file: setup.cfg (modified) ---"} <= s
-               and "--- file: pyproject.toml (modified) ---" not in s for s in shown)
+    assert any({"--- file: setup.py (modified; class=build) ---", "--- file: setup.cfg (modified; class=data) ---"} <= s
+               and "--- file: pyproject.toml (modified; class=data) ---" not in s for s in shown)
 
 
 def test_input_too_large_needed_renders_the_top_file():
@@ -98,7 +118,7 @@ def test_input_too_large_needed_renders_the_top_file():
     rvw = reviewer.Reviewer(Config(reviewer=ReviewerConfig(max_input_chars=500)), backend=object())
     with pytest.raises(reviewer.InputTooLarge) as e:
         rvw.prepare(d, tr)
-    assert "--- file: a.py (modified) ---" in e.value.text and len(e.value.text) <= e.value.needed
+    assert "--- file: a.py (modified; class=import) ---" in e.value.text and len(e.value.text) <= e.value.needed
 
 
 # --- final review minor 1: context-block caps scale with the input cap --------------------------------------------
@@ -112,7 +132,7 @@ def test_a_small_cap_with_both_blocks_at_full_size_leaves_room_for_the_top_hunk(
     dropped = []
     text = reviewer.build_review_input(d, tr, max_chars=cap, dropped=dropped)
     assert "--- file: a.py" in text and dropped == [] and not text.endswith(reviewer.TRUNCATION_NOTE)
-    assert len(text) <= cap and reviewer.dropped_from_text(tr.fired_rules, text) == dropped
+    assert len(text) <= cap and _not_shown(text)[0] == dropped[:40]
     assert text.count("e" * 100) and len(text.split(reviewer._EXEC_HEADING, 1)[1].split("--- ", 1)[0]) <= cap // 8
 
 
@@ -124,7 +144,7 @@ def test_scaled_block_caps_keep_accounting_exact(cap):
     tr = TriageResult(40.0, [FiredRule("r", 40.0, "a.py", (1, 3))], True)
     dropped = []
     text = reviewer.build_review_input(d, tr, max_chars=max(cap, 1), dropped=dropped)
-    assert reviewer.dropped_from_text(tr.fired_rules, text) == dropped
+    assert _not_shown(text)[0] == dropped[:40]
     if "--- file: a.py" in text:
         assert len(text) <= cap
 
@@ -165,7 +185,7 @@ def _too_large(d, tr, cap):
 def test_input_too_large_at_12k_with_full_blocks_stores_the_top_file():
     d, tr = _big_blocks_diff(10_000)
     e = _too_large(d, tr, 12_000)
-    assert reviewer._has_reviewable_content(e.text) and "--- file: a.py (modified) ---" in e.text
+    assert reviewer._has_reviewable_content(e.text) and "--- file: a.py (modified; class=import) ---" in e.text
     assert len(e.text) <= e.needed and reviewer.dropped_from_text(tr.fired_rules, e.text) == []
 
 
@@ -180,5 +200,5 @@ def test_input_too_large_sweep_always_stores_reviewable_text(cap, hunk):
         return                                           # it fit at this cap: nothing is stored
     except reviewer.InputTooLarge as e:
         assert reviewer._has_reviewable_content(e.text), (cap, hunk, e.needed, len(e.text))
-        assert "--- file: a.py (modified) ---" in e.text and len(e.text) <= e.needed
+        assert "--- file: a.py (modified; class=import) ---" in e.text and len(e.text) <= e.needed
         assert reviewer.dropped_from_text(tr.fired_rules, e.text) == []

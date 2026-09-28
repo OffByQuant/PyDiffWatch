@@ -216,8 +216,8 @@ the prior version in the baseline note is also escaped to one line and clipped t
 legacy release can predate those checks. None of it is ever run to build the input: it's all static
 parsing (`ast`, `tomllib`, `configparser`, `email.parser`) over the sdist's own metadata and source.
 
-**Header.** Before the fenced content: `package`, `version`, `is_first_release`, `triage_score`. Two cases
-add a note:
+**Header.** Before the fenced content: `package`, `version`, `is_first_release`. The score is not shown: the
+model is told where triage looked (flagged locations), never how much it scored. Two cases add a note:
 
 - the prior release couldn't be fetched — every file in the diff shows as `(added)`, and the header adds
   `baseline: the prior release <version> could not be fetched, so every file below shows as (added); most
@@ -280,11 +280,12 @@ raises and is never silently dropped: its name is added to an `unparseable: a, b
 it would have declared reads `unknown (<file> unparseable)` instead of a bare "none" (while setup.py exists
 at all, "none" means "none declared *literally* in setup.py" — setup.py is arbitrary code).
 
-**Signals.** A `--- dependency / binary / ownership signals (PyPI metadata and the sdist's file list;
-context, not code) ---` block lists Requires-Dist changes and each dependency finding (a look-alike name /
-not on PyPI / brand-new), added binaries (path, size, reason) and a maintainer-set change — PyDiffWatch's
-own heuristic screening of metadata, not code for the model to weigh on its own; a dependency-only fire no
-longer dumps every changed file, only the build files and any code lines that name the flagged dependency.
+**Signals.** A `--- dependency / ownership / publishing signals (PyPI metadata; context, not code) ---`
+block lists Requires-Dist changes, each dependency finding (a look-alike name / not on PyPI / brand-new), a
+maintainer-set change, and two publishing lines — `releases on PyPI: N` and `days since the previous
+release: N` (or `none (no earlier release)` for a first release) — PyDiffWatch's own heuristic screening of
+metadata, not code for the model to weigh on its own; a dependency-only fire no longer dumps every changed
+file, only the build files and any code lines that name the flagged dependency.
 
 A dependency whose name is one or two edits from a popular package is looked up on PyPI before it is flagged.
 It is not flagged as a look-alike when it shares a PyPI owner with the package, or when it is at least a year old
@@ -294,15 +295,51 @@ same author email or code-host organisation as the package, or the same author a
 email and organisation are author-declared, so they are shown but never clear a finding. No line calls a
 dependency a typosquat; that is for the model to judge.
 
-**Hunks.** Each selected file's diff follows, one `@@ new L<start>-<end>` line per hunk giving the new-file
-line range its added/removed lines occupy — the same `file:line-range` shape the model is asked to answer in
-`cited_hunk`. Positions count lines as DiffWatch splits them (Python's `str.splitlines()`), which also breaks
-on form feed (`\x0c`), `\x1c`–`\x1e`, `\x85`, U+2028 and U+2029; in a file containing those characters they
-can differ from an editor's or Python's own line numbers. A hunk that only removes lines has no new-file range
-to give instead: `@@ new (none; removed after L<n>)`, or `@@ new (none; removed before L1)` when the removal
-is at the very start of the file. A modified `setup.py` or `__init__.py` under about 4,000 rendered characters
-is shown whole instead (`@@ whole file, new L1-<n> (unchanged lines start with two spaces)`), so the model has
-full context for build- and import-time files without hunting across hunks.
+**New network endpoints.** A `--- new network endpoints (hosts and IP addresses in added lines; context, not
+code) ---` block lists the hosts of `http(s)://` URLs and IPv4 literals found in this release's added lines,
+in first-seen order, at most 30. They are listed for the model to weigh, never fetched.
+
+**Not readable as text.** A `--- not readable as text (changed files DiffWatch could not show you) ---`
+block lists every changed file DiffWatch could not show as text — a binary, an oversized member, or one in a
+foreign (non-Python) language — with its size and the reason it couldn't be shown. A changed non-source file
+under the size limit (a `.sh` script, say) is not recorded at all: the model neither sees it nor is told it
+exists.
+
+**Not shown.** A `--- not shown (selected files that did not fit; you did not see them) ---` block lists,
+by path and class, any selected file that did not fit the input and so was left out — the model is told it
+did not see them, rather than being left to assume they were clean.
+
+**Hunks.** Each selected file's diff is headed `--- file: <path> (<kind>; class=<class>[; run by <file>])
+---`, where `<kind>` is `added`, `modified` or `unchanged` and `<class>` is one of:
+
+- `build` — runs when pip builds or installs from the sdist (setup.py, the declared or in-tree build
+  backend, or code they import)
+- `startup` — a `.pth` import line, which runs at every interpreter start once the package is installed
+- `import` — runs when a program imports the package or module
+- `user-command` — a console script or setup command, run only when the user types it
+- `plugin-host` — an entry point a host tool loads automatically
+- `runtime-call` — runs only when the calling program calls that function
+- `not-shipped` — not installed, or never reachable (tests, docs, examples)
+- `data` — not code
+- `inert` — text that is never imported or executed (a README, a license file, a `.pyi` stub)
+
+`; run by <file>` is added, and the file is shown whole (`unchanged; class=...; run by <file>`), when it is
+an unchanged file that a changed `setup.py`, `pyproject.toml`, `setup.cfg` or `entry_points.txt` newly names
+— so the model sees code this release newly wires up to run, even though the file's own content is
+unchanged. At most 5 such files are shown whole; any more are listed under *not shown* instead.
+
+Files are shown weighted first (by summed triage weight, heaviest first), then the rest in run order (the
+class order above, top to bottom), smallest rendered first. One `@@ new L<start>-<end>` line per hunk gives
+the new-file line range its added/removed lines occupy — the same `file:line-range` shape the model is asked
+to answer in `cited_hunk`. Positions count lines as DiffWatch splits them (Python's `str.splitlines()`),
+which also breaks on form feed (`\x0c`), `\x1c`–`\x1e`, `\x85`, U+2028 and U+2029; in a file containing those
+characters they can differ from an editor's or Python's own line numbers. A hunk that only removes lines has
+no new-file range to give instead: `@@ new (none; removed after L<n>)`, or `@@ new (none; removed before
+L1)` when the removal is at the very start of the file. A modified `setup.py` or `__init__.py` under about
+4,000 rendered characters is shown whole instead (`@@ whole file, new L1-<n> (unchanged lines start with two
+spaces)`), so the model has full context for build- and import-time files without hunting across hunks. A
+selected file that does not fit the input cap is listed under *not shown* and skipped instead — except the
+top-ranked file, which still parks the release as too large to scan, as before.
 
 **Truncation and selection notes.** At most one trailing note: `[TRUNCATED: lowest-risk hunks omitted to
 fit the input cap.]` when the input cap dropped a file; `[SELECTED: only the 40 highest-risk files are
@@ -320,9 +357,31 @@ source to sink (secrets read and sent off the machine, or a payload fetched or d
 the execution context shows it runs unasked (`build`, `startup`, `import` or `plugin-host`); at most 0.6 if
 any link — the source, the sink, the flow between them, or when it runs — is inferred rather than shown.
 
-**Weak-malicious downgrade.** A `malicious` verdict is weak, and never alerts as malicious, when the cited
-code runs only on a user command or isn't shipped (`runs_when` is `user-command` or `not-shipped`), or
-confidence is missing, or confidence is below `reviewer.malicious_min_confidence`:
+**Chain.** For a `malicious` verdict the model also fills `source_kind`, `sink_kind`, `chain_source` and
+`chain_sink` — the kind of source and sink it saw, and the exact lines it read them from, copied from one
+shown file. Before a `malicious` verdict stands, the chain gate checks, in order:
+
+1. **Present** — a chain was quoted at all (`no chain quoted (source and sink)`).
+2. **Found** — both quotes appear in one shown file, in the code DiffWatch actually rendered (`source not
+   found in the shown code`, `sink not found in the shown code`, `source and sink are in different files`).
+3. **Live** — the quoted lines are live code: not a string or a comment, and not in code that is
+   not-shipped, inert or of an unrecognised class (`source is only a comment or a string`, `sink is only a
+   comment or a string`, and similar reasons for not-shipped, inert or unclassified code).
+4. **Kind** — each end's quoted lines actually show the kind of evidence the model declared (`source quoted
+   as <kind>, but the quoted lines show no <kind>`, and likewise for the sink).
+5. **Connected** — the two ends are connected: by a shared name, the same function, or one hop between them
+   (`no dataflow shown between source and sink`).
+6. **Pair** — the declared source and sink kind is one of the pairs that makes a release malicious:
+   `secret-read`→`send`, `payload`→`exec`, `fetch`→`exec`, `fetch`→`write-and-run`, `payload`→`write-and-run`
+   (`<source_kind> → <sink_kind> is not a chain that makes a release malicious`).
+
+A bundled binary is never malicious by itself: it takes shown code that downloads and runs it to make a
+chain.
+
+**Weak-malicious downgrade.** A `malicious` verdict is weak, and never alerts as malicious, when the chain
+gate above does not stand, or the cited code runs only on a user command, isn't shipped, or the model could
+not say when it runs (`runs_when` is `user-command`, `not-shipped` or `unknown`, or missing), or confidence
+is missing, or confidence is below `reviewer.malicious_min_confidence`:
 
 ```toml
 [reviewer]
@@ -332,13 +391,17 @@ malicious_min_confidence = 0.8   # a weaker malicious verdict alerts as suspicio
 (default `0.8`, range 0–1). A weak verdict is recorded and alerted as `suspicious` instead, with `urgent`
 cleared — kind `suspicious`, one alert, deduped separately from any UNREVIEWED alert on the release — with `model
 said malicious (downgraded: <reason>); needs manual review` prepended to the reasoning, where `<reason>` is
-`runs_when=user-command`, `runs_when=not-shipped`, `no confidence`, or `confidence <value> < <floor>`. It
-waits in `pending` for a human like any other suspicious verdict; the model's own classification stays visible
-in the reasoning, appended as `. Model: <the model's reasoning>`.
+`runs_when=user-command`, `runs_when=not-shipped`, `runs_when=unknown`, `no confidence`, `confidence <value>
+< <floor>`, or one of the chain gate's reasons above (including `gate error (<exception type>)` if the gate
+itself raised — a gate bug never loses the model's verdict, it only holds it back the same way a failed
+check would). It waits in `pending` for a human like any other suspicious verdict; the dashboard shows the
+held release's card as `held: <reason>`; the model's own classification stays visible in the reasoning,
+appended as `. Model: <the model's reasoning>`.
 
 **Schema defaults.** Only `classification` is mandatory; every other field a truncated reply never reaches
 takes a safe default (`runs_when` → `unknown`, `confidence` → unknown, `urgent` → `false`,
-`recommended_action` → `monitor`, `attack_type` → `none`) rather than sinking the verdict. A `malicious`
+`recommended_action` → `monitor`, `attack_type` → `none`, `source_kind` / `sink_kind` → `none`, and
+`chain_source` / `chain_sink` → empty) rather than sinking the verdict. A `malicious`
 classification always carries `recommended_action: report-to-pypi`, whatever the model itself chose — a
 strong malicious verdict always recommends reporting to PyPI.
 
@@ -513,11 +576,12 @@ then suspicious, then not-scanned/partial-review, then benign:
   (rendered as **NOT SCANNED** — the badge's CSS uppercases it, same as every other badge), the recorded
   reason, a plain PyPI link, and **no** report button — nobody has looked at the code, so there's nothing
   to report.
-- **Partial review** — the model reviewed the release but not all of it: a benign verdict parked for
-  adjudication because some flagged content was dropped from its input (spec U2). Badge text
-  `partial review` (**PARTIAL REVIEW**). The card still shows the model's own classification
-  (`model: benign`) and only carries a report button if the model called that partial review malicious or
-  suspicious.
+- **Partial review** — the model reviewed the release but couldn't see or read every selected file: a
+  `benign` verdict, or a `suspicious` one that quoted no chain, routed to `reviewed_partial` instead of
+  being saved silently or alerted (§10). A `malicious` verdict never lands here — it goes through the chain
+  gate instead. Badge text `partial review` (**PARTIAL REVIEW**). The card still shows the model's own
+  classification (`model: benign` or `model: suspicious`) and only carries a report button when that
+  classification is `suspicious`.
 
 A release still waiting for a model review has no card; the status strip counts it by reason. A label you give
 such a release shows `no model review` instead of what the model said.
@@ -818,13 +882,17 @@ release then waits in `pending` labelled
 The refused-to-download/-unpack `<reason>` is one of `decompressed-size`, `members`, `member-name` (a name
 too long **or** containing a control character), `total-size`, `download-size`, or `zip-sdist`.
 
-**A benign verdict on truncated input is not final.** When the reviewer's input cap drops a file that
-carried fired-rule weight — including a first release with more than 40 weighted (score > 0) files, since
-only the top 40 by weight are ever shown to the model — a `benign` classification is routed to
-adjudication instead of saved silently, with `reviewed partially: <files> not shown` prepended to the
-`reasoning` (no alert). It shows up in `pending` like any other model verdict
-(`model: benign conf=... attack=...`), not as `(not scanned: ...)` — it *was* reviewed, just not on every
-file.
+**reviewed_partial: a verdict on an incomplete view is not final.** A model that reviewed the release (not
+the UNREVIEWED no-content case) but did not see every selected file — because the input cap dropped a file
+that carried fired-rule weight, including a first release with more than 40 weighted (score > 0) files,
+since only the top 40 by weight are ever shown — or could not read a changed file as text at all, has
+neither cleared the release nor confirmed it. A `benign` classification, or a `suspicious` one that quotes
+no chain, is routed to its own `reviewed_partial` queue instead of being saved silently or alerted:
+`reviewed partially: <files> not shown or unreadable` is prepended to the `reasoning` (no alert). It shows
+up in `pending` labelled `reviewed partially; model: <classification> conf=... attack=...`, like any other
+model verdict, not as `(not scanned: ...)` — it *was* reviewed, just not on every file — and it is never
+cleared automatically; a person has to look at it. The UNREVIEWED no-content verdict (§ above) keeps its own
+`suspicious-heuristic` alert regardless.
 
 **A weak malicious verdict alerts as suspicious, not malicious.** See §5 for what makes a `malicious`
 verdict weak. It alerts with kind `suspicious` (one alert, deduped separately from any UNREVIEWED alert on the

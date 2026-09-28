@@ -296,6 +296,28 @@ def _switched_from(releases: dict, version: str) -> str | None:
                 and (ts := first(files)) is not None and ts < t), default=None)
     return prev[1] if prev and _sdist(releases[prev[1]]) else None
 
+def _publishing(meta: dict, version: str) -> dict:
+    """PyPI's own publishing facts for this release (spec F decision 6): how many releases the project has, and
+    how many days after the previous release (by first upload) this one came. From the JSON already fetched."""
+    releases = meta.get("releases") if isinstance(meta, dict) and isinstance(meta.get("releases"), dict) else {}
+
+    def first(files):
+        ts = [f.get("upload_time_iso_8601") for f in files if isinstance(f, dict)] if isinstance(files, list) else []
+        ts = [t for t in ts if isinstance(t, str)]
+        return min(ts) if ts else None
+    days, t = None, first(releases.get(version))
+    if t is not None:
+        prev = max((ts for v, files in releases.items() if v != version and (ts := first(files)) and ts < t),
+                   default=None)
+        if prev is not None:
+            try:
+                days = (datetime.fromisoformat(t.replace("Z", "+00:00"))
+                        - datetime.fromisoformat(prev.replace("Z", "+00:00"))).days
+            except (ValueError, TypeError):
+                days = None
+    return {"releases": deps._release_count(meta if isinstance(meta, dict) else {}), "days_since_prior": days}
+
+
 def _prior_unavailable(prior_ver, e) -> str:
     return f"prior {prior_ver} sdist unavailable ({type(e).__name__}: {e}); diffed against nothing"
 
@@ -332,13 +354,14 @@ def download(cfg, rel: NewRelease, attempt: int = 1) -> Download | NoSdist | Rem
     pred = _pick_predecessor(meta, rel.version)
     is_new = pred is None
     mtmeta = _maintainer_metadata(meta, new_sd)
+    pub = _publishing(meta, rel.version)
     info = meta.get("info") or {}
     # The package-level JSON carries the LATEST version's info; another version's claim is not this one's.
     summary = info.get("summary") if info.get("version") == rel.version else None
     if is_new and cfg.new_package_policy == "skip":
         # New package, skip policy: don't even download — but still record who shipped it, so a later
         # version of this package has a maintainer baseline to diff against (maintainer-set-change).
-        return Download(rel.package, rel.version, None, True, None, None, None, mtmeta, [], None, summary)
+        return Download(rel.package, rel.version, None, True, None, None, None, mtmeta, [], None, summary, pub)
     new_blob = _download(new_sd["url"], slow)
     prior_ver = prior_blob = prior_error = None
     dep_findings: list[dict] = []
@@ -352,7 +375,7 @@ def download(cfg, rel: NewRelease, attempt: int = 1) -> Download | NoSdist | Rem
         # signal 5: flag suspicious newly-added dependencies vs the predecessor (update path only).
         dep_findings = _screen_added_deps(meta, rel.package, prior_ver, cfg, change=req_change, version=rel.version)
     return Download(rel.package, rel.version, prior_ver, is_new, new_blob, prior_blob, prior_error, mtmeta,
-                    dep_findings, req_change if any(req_change.values()) else None, summary)
+                    dep_findings, req_change if any(req_change.values()) else None, summary, pub)
 
 
 def extract_download(cfg, dl: Download) -> ArtifactSet:

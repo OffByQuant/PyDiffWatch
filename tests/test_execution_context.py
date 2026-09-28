@@ -71,9 +71,11 @@ def test_no_block_line_can_pose_as_a_file_heading():
     files = _files(**{f"{evil}.pth": b"import x\n"})
     tr = TriageResult(50.0, [FiredRule("py-fs-write", 50.0, "src/acme_tools/hooks.py", (1, 1))], True)
     d = _update(files)
-    text = reviewer.build_review_input(d, tr, max_chars=len(reviewer.build_review_input(d, tr, max_chars=10**6)) - 40)
+    dropped = []
+    text = reviewer.build_review_input(d, tr, max_chars=len(reviewer.build_review_input(d, tr, max_chars=10**6)) - 40,
+                                       dropped=dropped)
     assert "--- file: src/acme_tools/hooks.py (modified) ---" in text          # present only inside a block line
-    assert reviewer.dropped_from_text(tr.fired_rules, text) == ["src/acme_tools/hooks.py"]
+    assert dropped == ["src/acme_tools/hooks.py"]                              # a forged heading is not a render
     assert not reviewer._has_reviewable_content(text)
 
 
@@ -129,7 +131,7 @@ def test_a_hostile_block_is_capped_after_escaping_and_the_hunk_still_renders():
     text = reviewer.build_review_input(d, tr, max_chars=200_000)
     block = _block(text)
     assert len(block) <= 4_000 and "(context truncated)" in block
-    assert "--- file: src/acme_tools/hooks.py (modified) ---" in text.split("\n")
+    assert "--- file: src/acme_tools/hooks.py (modified; class=runtime-call) ---" in text.split("\n")
     rv = reviewer.Reviewer.__new__(reviewer.Reviewer)
     rv.cfg = type("C", (), {"reviewer": type("R", (), {"max_input_chars": 200_000})})()
     assert reviewer._has_reviewable_content(rv.prepare(d, tr))          # no InputTooLarge, the hunk is there
@@ -157,9 +159,9 @@ def test_a_big_egg_info_file_cannot_crowd_out_the_build_files():
     text = reviewer.build_review_input(d, tr, max_chars=200_000, dropped=dropped)
     lines = text.split("\n")
     order = [ln for ln in lines if ln.startswith("--- file: ")]
-    assert order == ["--- file: brandnew/__init__.py (added) ---", "--- file: setup.py (added) ---",
-                     "--- file: pyproject.toml (added) ---"]                 # weighted first, then build files
-    assert dropped == [] and reviewer.dropped_from_text(tr.fired_rules, text) == []
+    assert order == ["--- file: brandnew/__init__.py (added; class=import) ---", "--- file: setup.py (added; class=build) ---",
+                     "--- file: pyproject.toml (added; class=data) ---"]     # weighted first, then build files
+    assert dropped == [] and reviewer._NOT_SHOWN_HEADING not in text
     assert len(text) <= 200_000
 
 
@@ -170,7 +172,7 @@ def test_build_files_lead_the_zero_weight_fallback_of_an_update():
                                        max_chars=10_000)
     # Task 11 (B2): a fire with no weighted changed file shows the build files only, never every changed file.
     assert [ln for ln in text.split("\n") if ln.startswith("--- file: ")] == [
-        "--- file: setup.py (modified) ---", "--- file: setup.cfg (modified) ---"]
+        "--- file: setup.py (modified; class=build) ---", "--- file: setup.cfg (modified; class=data) ---"]
 
 
 def test_the_prompt_says_the_summary_is_best_effort():

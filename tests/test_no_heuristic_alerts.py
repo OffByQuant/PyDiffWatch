@@ -212,10 +212,10 @@ def test_a_partial_benign_review_waits_for_a_person_without_an_alert(tmp_path, m
     big = FileDiff("big.py", "modified", [Hunk((0, 0), (0, 1), ["X" * 3000], [])])
     tr = TriageResult(50.0, [FiredRule("autoexec", 50.0, "setup.py", (1, 1)),
                              FiredRule("autoexec", 40.0, "big.py", (1, 1))], True)
-    cfg, conn, rid, _ = _setup(tmp_path, _Backend(), max_input_chars=500)    # big.py can't fit; setup.py can
+    cfg, conn, rid, _ = _setup(tmp_path, _Backend(), max_input_chars=700)    # big.py can't fit; setup.py can
     orchestrator._review_escalated(cfg, conn, reviewer.Reviewer(cfg, backend=_Backend()),
                                    Diff("pkg", "1.0.0", False, [small, big], []), tr, rid)
-    assert store.get_stage(conn, "pkg", "1.0.0") == "needs_adjudication" and emitted == []
+    assert store.get_stage(conn, "pkg", "1.0.0") == "reviewed_partial" and emitted == []
     [v] = conn.execute("SELECT classification, reasoning FROM verdicts").fetchall()
     assert v["classification"] == "benign" and v["reasoning"].startswith("reviewed partially:")
     c = dashboard.counts([dict(r) for r in store.all_verdicts(conn)])

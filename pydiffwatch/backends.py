@@ -67,7 +67,7 @@ def _usage_of(data) -> dict | None:
 # clamped toward caution at Verdict construction (reviewer.py): attack_type -> "none", and
 # recommended_action -> report-to-pypi (malicious) / monitor (otherwise), runs_when -> unknown. Only
 # `classification` — for which no safe default exists — stays a hard failure. This check itself is non-mutating.
-_SOFT_ENUM_KEYS = frozenset({"attack_type", "recommended_action", "runs_when"})
+_SOFT_ENUM_KEYS = frozenset({"attack_type", "recommended_action", "runs_when", "source_kind", "sink_kind"})
 # The one key a verdict must carry (spec B6): every other key has a default the reviewer fills in, so a reply
 # truncated after `classification` keeps its verdict. The schema still lists them all as required, which strict
 # json_schema endpoints demand.

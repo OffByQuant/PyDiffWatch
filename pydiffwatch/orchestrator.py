@@ -1,7 +1,7 @@
 import dataclasses, datetime, fcntl, http.client, json, logging, math, os, sqlite3, time, urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from . import ingest, fetcher, rules, notifier, store, reviewer, egress, dashboard, quarantine, sandbox
-from . import differ, facts
+from . import differ, facts, chain
 from . import guard as guard_mod
 from .config import Config
 from .models import Verdict, NewRelease, FiredRule
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 # for a late sdist once wheel_only_grace_minutes are over.
 TERMINAL = {"triaged", "alerted", "reviewed", "new_package_skipped", "needs_adjudication",
             "refused_to_extract", "no_sdist", "refused_to_fetch", "pending_review",
-            "removed_before_scan", "metadata_retry", "gave_up", "no_sdist_wait"}
+            "removed_before_scan", "metadata_retry", "gave_up", "no_sdist_wait", "reviewed_partial"}
 
 
 def _iso(dt) -> str:
@@ -73,38 +73,48 @@ def _clip_files(paths, limit=300) -> str:
 
 
 def _weak_malicious(cfg, verdict) -> str:
-    """Why a malicious verdict's evidence is weak (spec decision 2), or "" when it is not: the cited code runs
-    only on a user command or is not shipped, or confidence is missing or below malicious_min_confidence.
-    runs_when `unknown` alone is not weak."""
-    if verdict.runs_when in ("user-command", "not-shipped"):
-        return f"runs_when={verdict.runs_when}"
+    """Why a malicious verdict's evidence is weak (spec decision 2, F decision 9), or "" when it is not: the cited
+    code runs only on a user command, is not shipped, or the model could not say when it runs (unknown, or no
+    answer); or confidence is missing or below malicious_min_confidence."""
+    if verdict.runs_when in ("user-command", "not-shipped", "unknown", None):
+        return f"runs_when={verdict.runs_when or 'unknown'}"
     if verdict.confidence is None:
         return "no confidence"
     floor = cfg.reviewer.malicious_min_confidence
     return f"confidence {verdict.confidence:g} < {floor:g}" if verdict.confidence < floor else ""
 
 
-def _record(cfg, conn, rid, verdict, score, dropped=()):
+def _record(cfg, conn, rid, verdict, score, dropped=(), *, unreadable=(), shown=None):
     store.clear_pending(conn, rid)
-    # spec U2: a benign verdict is not final when the input cap dropped a file that carried fired-rule
-    # weight — the model never saw it, so route to adjudication instead of saving silently.
-    if verdict.classification == "benign" and dropped:
-        note = f"reviewed partially: {_clip_files(dropped)} not shown"
+    unseen = list(dropped) + [p for p in unreadable if p not in dropped]
+    # spec F §3.4: a model that could not see everything has not cleared the release (benign), nor confirmed it
+    # (suspicious with no chain): its own queue, no alert, evidence kept. Never the UNREVIEWED verdict (model
+    # 'none'; spec review C2). A benign verdict goes here whatever it quoted (plan review M1).
+    if (verdict.model != "none" and unseen and (verdict.classification == "benign" or (
+            verdict.classification == "suspicious" and not chain.cited(verdict)))):
+        note = f"reviewed partially: {_clip_files(unseen)} not shown or unreadable"
         reasoning = f"{note}. Model: {verdict.reasoning}" if verdict.reasoning else note
-        v = dataclasses.replace(verdict, reasoning=reasoning)
-        store.record_verdict(conn, rid, v)
-        store.update_stage(conn, rid, "needs_adjudication", score, None)  # -> `pydiffwatch pending`, no alert
+        store.record_verdict(conn, rid, dataclasses.replace(verdict, reasoning=reasoning))
+        store.update_stage(conn, rid, "reviewed_partial", score, None)    # -> `pydiffwatch pending`, no alert
         return
-    if verdict.classification == "malicious" and (weak := _weak_malicious(cfg, verdict)):
-        # spec decision 2: weak evidence never alerts as malicious. It is recorded and alerted as suspicious and
-        # waits in `pending`; the model's own label and reasoning stay in the reasoning for the person.
-        note = f"model said malicious (downgraded: {weak}); needs manual review"
-        reasoning = f"{note}. Model: {verdict.reasoning}" if verdict.reasoning else note
-        v = dataclasses.replace(verdict, classification="suspicious", reasoning=reasoning, urgent=False)
-        store.record_verdict(conn, rid, v)
-        store.update_stage(conn, rid, "needs_adjudication", score, None)  # -> `pydiffwatch pending`
-        notifier.emit(cfg, conn, v, rid, dedupe_suffix="downgraded")       # one alert; a person looks at it
-        return
+    if verdict.classification == "malicious":
+        try:
+            weak = chain.gate(verdict, shown)
+        except Exception as e:   # a gate bug downgrades; it never loses the model's verdict or the stored input
+            logger.exception("chain gate raised for %s==%s", verdict.package, verdict.version)
+            weak = f"gate error ({type(e).__name__})"
+        weak = weak or _weak_malicious(cfg, verdict)
+        verdict = dataclasses.replace(verdict, gate=weak)
+        if weak:
+            # spec decision 2 / F decision 10: weak evidence never alerts as malicious. It is recorded and alerted as
+            # suspicious and waits in `pending`; the model's label, quotes and reasoning stay for the person.
+            note = f"model said malicious (downgraded: {weak}); needs manual review"
+            reasoning = f"{note}. Model: {verdict.reasoning}" if verdict.reasoning else note
+            v = dataclasses.replace(verdict, classification="suspicious", reasoning=reasoning, urgent=False)
+            store.record_verdict(conn, rid, v)
+            store.update_stage(conn, rid, "needs_adjudication", score, None)
+            notifier.emit(cfg, conn, v, rid, dedupe_suffix="downgraded")
+            return
     store.record_verdict(conn, rid, verdict)
     # Route by the model's classification. A `suspicious` verdict is queued for human adjudication — it
     # is NOT alerted. benign is saved silently; malicious (or any unexpected class) alerts immediately.
@@ -138,12 +148,13 @@ def _max_tokens_for(cfg, guard, text, model) -> int:
 
 
 def _attempt_review(cfg, conn, rvw, rid, package, version, score, fired_rules, text, guard=None,
-                    dropped=()) -> bool:
+                    dropped=(), unreadable=(), shown=None) -> bool:
     """One review attempt; on failure the release is (re)parked with the reason. Returns False when no more
     reviews should be sent now (endpoint unreachable, guard deferring, or the guard's breaker just opened),
-    so a drain stops instead of hammering the server. `dropped`: weighted files this text's cap dropped
-    (spec U2), carried through to _record — from `rvw.dropped_files` on a fresh review, or recovered
-    from the stored text via reviewer.dropped_from_text() when drain_pending re-drives a parked row."""
+    so a drain stops instead of hammering the server. `dropped` (selected files this text did not show),
+    `unreadable` (changed files that could not be shown as text) and `shown` (the lines the model saw, for the
+    chain gate) are carried through to _record (spec U2, F §3.4) — from the reviewer on a fresh review, or from
+    the stored input (review_shown, not_seen_from_text; dropped_from_text for a pre-F input) on a drain."""
     if guard is not None:
         why = guard.admit()
         if why:
@@ -174,22 +185,23 @@ def _attempt_review(cfg, conn, rvw, rid, package, version, score, fired_rules, t
         # prompt_tokens cover the system prompt as well as the package content, so the chars must too.
         guard.record_success(getattr(rvw.backend, "last_usage", None), time.monotonic() - t0,
                              len(reviewer.SYSTEM_PROMPT) + len(text))
-    _record(cfg, conn, rid, verdict, score, dropped=dropped)
+    _record(cfg, conn, rid, verdict, score, dropped=dropped, unreadable=unreadable, shown=shown)
     return True
 
 
-def _park(conn, rid, reason, detail, text):
-    """park_for_review; text None (the stored input couldn't be read back) keeps the stored input."""
+def _park(conn, rid, reason, detail, text, shown=store._KEEP):
+    """park_for_review; text None (the stored input couldn't be read back) keeps the stored input and its shown
+    lines. `shown` travels with a newly stored input (spec F R2-4)."""
     if text is None:
         store.set_pending_reason(conn, rid, reason, detail)
     else:
-        store.park_for_review(conn, rid, reason, detail, text)
+        store.park_for_review(conn, rid, reason, detail, text, shown)
 
 
-def _park_auto(conn, rid, reason, detail, text):
+def _park_auto(conn, rid, reason, detail, text, shown=store._KEEP):
     """Park for a reason the auto-drain retries on its own. A stale UNREVIEWED verdict (e.g. from an earlier
     too_large park) goes: the release is not waiting for a person while the auto-drain owns it."""
-    _park(conn, rid, reason, detail, text)
+    _park(conn, rid, reason, detail, text, shown)
     store.clear_unscanned_verdict(conn, rid)
 
 
@@ -224,24 +236,26 @@ def _review_escalated(cfg, conn, rvw, d, tr, rid, *, offline=False, guard=None):
     queue with no alert."""
     if rvw is None:     # queued with no input and no evidence (spec decision 3): the drain rebuilds both
         store.park_for_review(conn, rid, "reviewer_disabled", "no reviewer this run (reviewer_enabled = false, or "
-                              "the anthropic backend has no ANTHROPIC_API_KEY)", "")
+                              "the anthropic backend has no ANTHROPIC_API_KEY)", "", None)
         return
     try:
         text = rvw.prepare(d, tr, cap=guard.input_cap_chars() if guard is not None else None)
     except reviewer.InputTooLarge as e:
         detail = f"{e}; {guard.cap_explain()}" if guard is not None else str(e)
-        _park(conn, rid, "too_large", detail, e.text)     # the input is kept for a larger-context model
+        _park(conn, rid, "too_large", detail, e.text, e.shown)   # the input is kept for a larger-context model
         return
     else:
-        dropped = getattr(rvw, "dropped_files", ())   # spec U2: weighted files prepare()'s cap dropped
+        # what prepare() did not show and the lines it did (spec U2, F §3.4); getattr: a test double may not set them
+        dropped, unreadable, shown = (getattr(rvw, "dropped_files", ()), getattr(rvw, "unreadable", ()),
+                                      getattr(rvw, "shown", None))
         if offline:
-            _park_auto(conn, rid, "endpoint_unreachable", "reviewer endpoint unreachable", text)
+            _park_auto(conn, rid, "endpoint_unreachable", "reviewer endpoint unreachable", text, shown)
         else:
             # Queued before the model call, which can take minutes: a kill mid-review leaves the release in the
             # auto-drain queue rather than at `triaged`, which no tick revisits. A finished review un-parks it.
-            _park_auto(conn, rid, "in_review", "the review was interrupted before it finished", text)
+            _park_auto(conn, rid, "in_review", "the review was interrupted before it finished", text, shown)
             _attempt_review(cfg, conn, rvw, rid, d.package, d.version, tr.score, tr.fired_rules, text, guard,
-                            dropped=dropped)
+                            dropped=dropped, unreadable=unreadable, shown=shown)
 
 
 _PAGE = 500     # rows per read of the manual drain
@@ -347,14 +361,19 @@ def _drain_one(cfg, conn, rvw, row, *, auto, cap, guard, drain):
             return True, True       # the download counts as a try for `limit`
         tr, text = got
         # Stored before the model call, as _review_escalated does: a kill mid-review does not download it again.
-        _park_auto(conn, rid, "in_review", "the review was interrupted before it finished", text)
+        _park_auto(conn, rid, "in_review", "the review was interrupted before it finished", text, rvw.shown)
         return True, _attempt_review(cfg, conn, rvw, rid, row["package"], row["version"], tr.score,
-                                     tr.fired_rules, text, guard, dropped=rvw.dropped_files)
+                                     tr.fired_rules, text, guard, dropped=rvw.dropped_files,
+                                     unreadable=rvw.unreadable, shown=rvw.shown)
     text = store.review_input(row, conn)
     fired_rules = _rules_from_json(row["triage_rules"])
-    dropped = reviewer.dropped_from_text(fired_rules, text)   # spec U2: recovered from stored text
+    shown = store.review_shown(conn, rid) or reviewer.shown_from_text(text)
+    seen = reviewer.not_seen_from_text(text)
+    # a pre-F input (no class= heading) keeps the old weighted-file test (Ruling F11)
+    dropped, unreadable = seen if seen is not None else (reviewer.dropped_from_text(fired_rules, text), [])
     go_on = _attempt_review(cfg, conn, rvw, rid, row["package"], row["version"], row["triage_score"],
-                            fired_rules, reviewer.refresh_marker(text), guard, dropped=dropped)
+                            fired_rules, reviewer.refresh_marker(text), guard, dropped=dropped,
+                            unreadable=unreadable, shown=shown)
     return True, go_on
 
 
@@ -434,7 +453,7 @@ def _rebuild_review_input(cfg, conn, rvw, row, ruleset, cap):
     try:
         return tr, rvw.prepare(d, tr, cap=cap)
     except reviewer.InputTooLarge as e:
-        _park(conn, rid, "too_large", str(e), e.text)
+        _park(conn, rid, "too_large", str(e), e.text, e.shown)
         return "failed"
 
 
@@ -1002,7 +1021,8 @@ def list_pending(cfg: Config):
                       "classification": row["classification"], "confidence": row["confidence"],
                       "attack_type": row["attack_type"], "reasoning": row["reasoning"],
                       "cited_hunk": row["cited_hunk"], "diff_text": diff_text, "fetch_error": err,
-                      "evidence_stored": stored is not None, "not_scanned": not_scanned})
+                      "evidence_stored": stored is not None, "not_scanned": not_scanned,
+                      "partial": row["stage"] == "reviewed_partial"})
     conn.close()
     return items
 
