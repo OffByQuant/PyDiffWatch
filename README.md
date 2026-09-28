@@ -207,4 +207,6 @@ popularity/typosquat corpus (`pydiffwatch/data/top_pypi_names.txt`, ~5000 names)
 snapshot derived from [hugovk/top-pypi-packages](https://github.com/hugovk/top-pypi-packages) (aggregated
 from PyPI's public BigQuery download stats); it's vendored, not fetched at runtime. The upstream ships no
 explicit license — the file holds package names (facts), not creative content; credit the source if you
-redistribute it.
+redistribute it. `pydiffwatch/data/top_pypi_orgs.txt` maps those names to their PyPI organisations (from PyPI's own
+project JSON, rebuilt by hand with `tools/build_top_orgs.py`): a lookalike dependency published by an organisation
+that owns two or more of those packages is not read as a typosquat.
