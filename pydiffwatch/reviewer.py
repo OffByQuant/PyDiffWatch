@@ -300,9 +300,10 @@ def _rank_files(diff, triage):
         return ([p for p in _BUILD_FILES if p in by_path]
                 + sorted(p for p in by_path if p not in _BUILD_FILES and pattern is not None
                          and _names_a_dep(by_path[p], pattern))), by_path, []
-    # the rules found something: every other added/modified runnable file (and the hook targets) may run with it
-    rest = {p for p, fd in by_path.items() if fd.change_kind in ("added", "modified", "unchanged")
-            and _cls(diff, p) in _RUNNABLE}
+    # the rules found something: every other added/modified runnable file may run with it, and so may the hook
+    # targets a changed build file now names, whatever their class (each is shown or listed as not shown)
+    rest = {p for p, fd in by_path.items() if fd.change_kind == "unchanged"
+            or (fd.change_kind in ("added", "modified") and _cls(diff, p) in _RUNNABLE)}
     ordered = sorted(rest - set(weighted), key=lambda p: (rank(p), size[p], p))
     return weighted + ordered, by_path, [h.path for h in hooks[_MAX_HOOK_SHOWN:]]
 
@@ -431,8 +432,8 @@ def build_review_input(diff, triage, *, max_chars: int, dropped: list | None = N
             if i == 0 and not whole_only:        # the top-ranked file: nothing renders (InputTooLarge, as before F)
                 skipped = list(ranked_paths)
                 break
-            if weights.get(path, 0.0) > 0.0 or cls in _RUNNABLE:     # spec §3.2 `dropped`: runnable or weighted
-                skipped.append(path)                                 # (Ruling F16)
+            if weights.get(path, 0.0) > 0.0 or cls in _RUNNABLE or fd.change_kind == "unchanged":
+                skipped.append(path)          # spec §3.2 `dropped`: runnable, weighted or a hook target (Ruling F16)
             continue
         body_parts.append(rendered)
         used += add
@@ -504,17 +505,18 @@ def dropped_from_text(fired_rules, text: str) -> list[str]:
     never a substring: every rendered diff line carries a leading '+ '/'- '/'  ' (see _render_file), the
     description/flagged_locations lines carry their own fixed prefixes, and `_one_line` means a path
     can never smuggle a raw newline into the text — so package content can never forge a match for a
-    heading it isn't.
+    heading it isn't. Both heading forms (pre-F `(kind)`, F `(kind; class=<cls>)`) are matched exactly against
+    the finite set, never by prefix/suffix: a path such as `victim.py (modified` must not pass for victim.py.
     """
     weights: dict[str, float] = {}
     for r in fired_rules:
         if r.lines == (0, 0):
             continue
         weights[r.file] = weights.get(r.file, 0.0) + r.weight
-    lines = text.split("\n")
-    return [p for p, w in sorted(weights.items(), key=lambda kv: -kv[1])
-            if w > 0.0 and not any(ln.startswith(f"--- file: {_one_line(p)} ({k}") and ln.endswith(") ---")
-                                   for ln in lines for k in _CHANGE_KINDS)]
+    lines = set(text.split("\n"))
+    return [p for p, w in sorted(weights.items(), key=lambda kv: -kv[1]) if w > 0.0 and lines.isdisjoint(
+        f"--- file: {_one_line(p)} ({k}{c}) ---" for k in _CHANGE_KINDS
+        for c in ("", *(f"; class={c}" for c in execctx.CLASSES)))]
 
 
 def build_evidence(diff, triage, *, max_chars: int) -> str:

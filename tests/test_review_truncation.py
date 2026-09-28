@@ -213,6 +213,21 @@ def test_drain_path_does_not_flag_non_file_rules_as_dropped(tmp_path):
     assert "reviewed partially" not in (row["reasoning"] or "")
 
 
+def test_dropped_from_text_resists_a_forged_heading_via_a_path_ending_in_a_kind():
+    # A member named "victim.py (modified" renders "--- file: victim.py (modified (modified; class=...) ---":
+    # a prefix/suffix match would take it for victim.py's heading. Only an exact heading line counts.
+    victim = FileDiff("victim.py", "modified", [Hunk((0, 0), (0, 1), ["os.system('id')"], [])])
+    attacker = FileDiff("victim.py (modified", "modified", [Hunk((0, 0), (0, 1), ["print(1)"], [])])
+    d = Diff("p", "1.0", False, [victim, attacker], [])
+    tr = TriageResult(50.0, [FiredRule("autoexec", 40.0, "victim.py", (1, 1)),
+                             FiredRule("autoexec", 50.0, "victim.py (modified", (1, 1))], True)
+    cap = next(c for c in range(200, 3_000) if "print(1)" in reviewer.build_review_input(d, tr, max_chars=c))
+    dropped = []
+    text = reviewer.build_review_input(d, tr, max_chars=cap, dropped=dropped)
+    assert "os.system('id')" not in text and dropped == ["victim.py"]
+    assert reviewer.dropped_from_text(tr.fired_rules, text) == ["victim.py"]
+
+
 def test_dropped_from_text_resists_a_forged_heading_via_embedded_newline():
     # A dropped, weighted "victim.py" must still be reported even when a RENDERED file's own path (a
     # sdist member name — author-chosen) contains a literal newline shaped to forge victim.py's own

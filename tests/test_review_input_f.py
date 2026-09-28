@@ -161,3 +161,23 @@ def test_the_not_shown_reserve_bounds_any_subset_of_long_paths():
     base = len(reviewer.build_review_input(d, tr, max_chars=0))
     for cap in range(base, base + 12_000, 7):
         assert len(reviewer.build_review_input(d, tr, max_chars=cap)) <= cap, cap
+
+
+def test_every_hook_target_is_shown_or_listed_whatever_its_class():
+    # a hook target the class test would not select (not-shipped) is still shown, or listed as not shown
+    hooks = [FileDiff("tests/helper.py", "unchanged", [], "x = 1\n", run_by="setup.py")] + [
+        FileDiff(f"h{i}.py", "unchanged", [], "x = 1\n", run_by="setup.py") for i in range(6)]
+    d = Diff("p", "1.1", False, [_fd("setup.py", ["import h0"])], [], hook_targets=hooks)
+    tr = TriageResult(40.0, [FiredRule("r", 40.0, "setup.py", (1, 1))], True)
+    dropped = []
+    text = reviewer.build_review_input(d, tr, max_chars=50_000, dropped=dropped)
+    shown = {h.split(" ")[2] for h in _heads(text)}
+    assert all((h.path in shown) != (h.path in dropped) for h in hooks)
+    assert "--- file: tests/helper.py (unchanged; class=not-shipped; run by setup.py) ---" in _heads(text)
+    # and one that does not fit is listed, never silently skipped
+    base = len(reviewer.build_review_input(d, tr, max_chars=0))
+    for cap in range(base, base + 600, 5):
+        dropped = []
+        text = reviewer.build_review_input(d, tr, max_chars=cap, dropped=dropped)
+        shown = {h.split(" ")[2] for h in _heads(text)}
+        assert all((h.path in shown) != (h.path in dropped) for h in hooks), cap
