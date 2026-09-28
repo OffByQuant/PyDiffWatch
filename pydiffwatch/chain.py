@@ -1,7 +1,7 @@
 """Spec F §3.3: the chain gate. A malicious verdict stands only when the model quoted a chain the shown code
 contains. Pure: it reads the verdict's quotes and `shown` (the lines the model was shown), never package bytes, and
 never runs or fetches anything."""
-import builtins, io, keyword, re, tokenize
+import bisect, builtins, io, keyword, re, tokenize
 
 SOURCE_KINDS = ("secret-read", "payload", "fetch", "none")
 SINK_KINDS = ("send", "exec", "write-and-run", "none")
@@ -186,12 +186,6 @@ def _bound(text: str) -> set:
     return out
 
 
-def _near(a, b, scopes) -> bool:
-    """Rule (b): the same scope other than module, or both module-level within _MODULE_SPAN lines."""
-    sa, sb = scopes.get(a), scopes.get(b)
-    return sa is not None and sa == sb and (sa != "module" or abs(a - b) <= _MODULE_SPAN)
-
-
 def _cuts(entry) -> dict:
     """{line: string-tail column (int) or f-string field code (str)} for `_text_at`; a tail wins (fix G1)."""
     return {**(entry.get("fields") or {}), **(entry.get("tails") or {})}
@@ -209,61 +203,117 @@ def _text_at(n, lines, tails) -> str:
     return text[cut:] if cut is not None else text
 
 
-def _anchors(hits, lines, tails) -> list:
-    """Matched lines that can support Connected — its names and its position both (fix I1): live, not a bare
-    `import`/`from ... import` line, and carrying at least one name after `_names`'s exclusions. A quoted padding
-    line (`pass`, a lone `)`, a copied import line) adds neither a name nor a position."""
-    out = []
-    for n in {m for ns in hits for m in ns}:
-        text = _text_at(n, lines, tails)
-        if _live(text) and not _IMPORT_LINE.match(text) and _names(text):
-            out.append(n)
-    return out
+def _depth(text: str) -> tuple:
+    """(net, low): a line's bracket balance and the lowest point its running balance reaches (P3a)."""
+    net = low = 0
+    for t in _tokens(text):
+        if t.type == tokenize.OP and t.string in ("(", "[", "{"):
+            net += 1
+        elif t.type == tokenize.OP and t.string in (")", "]", "}"):
+            net -= 1
+            low = min(low, net)
+    return net, low
 
 
-def _connected(src_hits, snk_hits, entry) -> bool:
-    """Spec F §3.3 check 4 (user choice G1, plan review I6): (a) the ends share an identifier; or (b) a source line
-    and a sink line are near (_near); or (c) ONE hop: a name bound on a source line is read on a shown, live line R
-    of the same file and not inside a string (fix F3), and R is near some sink line (R may be the sink line). No
-    hop without scopes; never two.
-    Only anchor lines (fix I1) supply names or positions for (a)/(b); the hop's hit end is likewise anchor-only."""
-    lines = entry.get("lines") or {}
-    tails = _cuts(entry)
-    src = _anchors(src_hits, lines, tails)
-    snk = _anchors(snk_hits, lines, tails)
+class _File:
+    """One shown file's per-line facts, each computed at most once per gate call (P1: the gate stays linear in the
+    shown lines -- no fact is recomputed per group or per pair)."""
+
+    def __init__(self, entry):
+        self.lines = entry.get("lines") or {}
+        self.cuts = _cuts(entry)
+        self.scopes = entry.get("scopes") or {}
+        self.strings = set(entry.get("strings") or [])
+        self.unreadable = self.strings - set(entry.get("fields") or {})   # field code may read (N1)
+        self._memo: dict = {}
+
+    def text(self, n) -> str:
+        return _text_at(n, self.lines, self.cuts)
+
+    def _fact(self, fn, n):
+        key = (fn, n)
+        if key not in self._memo:
+            self._memo[key] = fn(self.text(n))
+        return self._memo[key]
+
+    def live(self, n) -> bool:
+        return self._fact(_live, n)
+
+    def names(self, n) -> set:
+        return self._fact(_names, n)
+
+    def bound(self, n) -> set:
+        return self._fact(_bound, n)
+
+    def depth(self, n) -> tuple:
+        return (0, 0) if n in self.strings and n not in self.cuts else self._fact(_depth, n)
+
+    def anchor(self, n) -> bool:
+        """A matched line that can support Connected -- its names and its position both (fix I1): live, not a bare
+        `import`/`from ... import` line, and carrying at least one name after `_names`'s exclusions. A quoted
+        padding line (`pass`, a lone `)`, a copied import line) adds neither a name nor a position."""
+        return self.live(n) and not _IMPORT_LINE.match(self.text(n)) and bool(self.names(n))
+
+
+def _near_any(lines, scopes):
+    """Rule (b) against a set of lines at once: `near(n)` is true when n and one of `lines` share a scope other than
+    module, or are both module-level within _MODULE_SPAN lines -- set and bisect lookups, not a pairwise scan (P1)."""
+    inner = {scopes.get(b) for b in lines} - {None, "module"}
+    module = sorted(b for b in lines if scopes.get(b) == "module")
+
+    def near(n) -> bool:
+        s = scopes.get(n)
+        if s is None:
+            return False
+        if s != "module":
+            return s in inner
+        i = bisect.bisect_left(module, n - _MODULE_SPAN)
+        return i < len(module) and module[i] <= n + _MODULE_SPAN
+    return near
+
+
+def _connected(src, snk, f) -> bool:
+    """Spec F §3.3 check 4 (user choice G1, plan review I6) between the lines of each end's evidence-bearing groups
+    (P2): (a) the ends share an identifier; or (b) a source line and a sink line are near (same scope other than
+    module, or both module-level within _MODULE_SPAN lines); or (c) ONE hop: a name bound on a source line is read
+    on a shown, live line R of the same file and not inside a string (fix F3), and R is near some sink line (R may
+    be the sink line). No hop without scopes; never two. Only anchor lines (fix I1) supply names or positions for
+    (a)/(b); the hop's hit end is likewise anchor-only."""
+    src = [n for n in src if f.anchor(n)]
+    snk = [n for n in snk if f.anchor(n)]
     if not src or not snk:
         return False
-    if (set().union(*(_names(_text_at(n, lines, tails)) for n in src))
-            & set().union(*(_names(_text_at(n, lines, tails)) for n in snk))):
+    if set().union(*map(f.names, src)) & set().union(*map(f.names, snk)):
         return True
-    scopes = entry.get("scopes")
-    if not scopes:
+    if not f.scopes:
         return False
-    if any(_near(a, b, scopes) for a in src for b in snk):
+    near = _near_any(snk, f.scopes)
+    if any(near(a) for a in src):
         return True
-    bound = set().union(*(_bound(_text_at(n, lines, tails)) for n in src))
+    bound = set().union(*map(f.bound, src))
     if not bound:
         return False
-    strings = set(entry.get("strings") or []) - set(entry.get("fields") or {})   # field code may read (N1)
-    readers = [r for r in lines if r not in src and r not in strings and _live(_text_at(r, lines, tails))
-               and bound & _names(_text_at(r, lines, tails))]
-    return any(r == b or _near(r, b, scopes) for r in readers for b in snk)
+    src_set, snk_set = set(src), set(snk)
+    return any(r in snk_set or near(r) for r in f.lines
+               if r not in src_set and r not in f.unreadable and f.live(r) and bound & f.names(r))
 
 
-_GROUP_CAP = 64          # K1: at most this many anchor-bearing groups per end are paired below
+_BRIDGE = 3              # P4: a group bridges at most this many consecutive blank/comment lines
 
 
 def _groups(hits, lines) -> list:
     """K1: one end's matched line numbers (all occurrences of all its quoted lines) split into contiguous
-    groups. Sorted n < m share a group only when every shown line strictly between them exists in `lines` and is
-    blank or comment-only (`#...`); a line that is not shown at all breaks the group. Without this, Connected and
-    Kind evidence could be stitched together from scattered, unrelated occurrences of the quoted text."""
+    groups. Sorted n < m share a group only when at most _BRIDGE shown lines lie strictly between them (P4) and
+    every one exists in `lines` and is blank or comment-only (`#...`); a line that is not shown at all breaks the
+    group. Without this, Connected and Kind evidence could be stitched together from scattered, unrelated
+    occurrences of the quoted text."""
     ns = sorted({m for xs in hits for m in xs})
     groups: list = []
     cur: list = []
     for n in ns:
-        if cur and all(k in lines and (not lines[k].strip() or lines[k].strip().startswith("#"))
-                       for k in range(cur[-1] + 1, n)):
+        if cur and n - cur[-1] - 1 <= _BRIDGE and all(
+                k in lines and (not lines[k].strip() or lines[k].strip().startswith("#"))
+                for k in range(cur[-1] + 1, n)):
             cur.append(n)
         else:
             if cur:
@@ -274,27 +324,57 @@ def _groups(hits, lines) -> list:
     return groups
 
 
-def _anchor_groups(hits, lines, tails) -> list:
-    """This end's groups (K1) that carry at least one anchor line, capped to the first `_GROUP_CAP` in line
-    order -- bounds the O(groups) pairing work in `_gate_file`."""
-    out = []
-    for g in _groups(hits, lines):
-        if _anchors([g], lines, tails):
-            out.append(g)
-            if len(out) >= _GROUP_CAP:
-                break
-    return out
+def _merged(groups, f) -> list:
+    """P3: one end's groups, merged where the model quoted one statement or one flow and left lines out.
+    (a) A group whose brackets are still open at its end (running balance, unmatched closers ignored) takes in the
+    end's next group when every shown line between them keeps the brackets open -- the same statement. A statement
+    that closes first, or a line not shown, stops the merge, so an open line near the sink cannot pull in a far,
+    unrelated quoted line. Repeats while still open.
+    (b) A later group that reads (`_names`) a name an earlier group binds (`_bound`) joins that group."""
+    runs: list = []                     # [lines, open brackets after its last line]
+    for g in groups:
+        bal = 0
+        if runs and runs[-1][1] > 0:
+            b, k = runs[-1][1], runs[-1][0][-1] + 1
+            while k < g[0] and k in f.lines and b + f.depth(k)[1] > 0:
+                b += f.depth(k)[0]
+                k += 1
+            if k == g[0]:
+                bal = b
+        if bal == 0:
+            runs.append([[], 0])
+        for n in g:
+            net, low = f.depth(n)
+            bal = max(bal + net, net - low)
+        runs[-1][0].extend(g)
+        runs[-1][1] = bal
+    parent = list(range(len(runs)))
 
-
-_LEVEL_RANK = {"connected": 1, "src-kind": 2, "snk-kind": 2, "pair": 3}
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    owner: dict = {}
+    for i, (g, _) in enumerate(runs):
+        for name in set().union(*map(f.names, g)):
+            if name in owner and root(owner[name]) != i:
+                parent[root(owner[name])] = i
+        for name in set().union(*map(f.bound, g)):
+            owner[name] = i
+    out: dict = {}
+    for i, (g, _) in enumerate(runs):
+        out.setdefault(root(i), []).extend(g)
+    return sorted(sorted(g) for g in out.values())
 
 
 def _gate_file(verdict, path, entry, src_hits, snk_hits) -> str:
-    """Checks 3-6 for one candidate file (Live, Connected, Kind, Pair); "" when this file makes the chain stand.
-    K1: Connected and Kind are checked per contiguous group of matched lines (`_groups`), not across all of an
-    end's occurrences at once -- the chain stands only when SOME (source group, sink group) pair passes Connected
-    and then Kind on that pair's own texts. When no pair passes, the reason returned is from whichever pair got
-    furthest (Connected < Kind < Pair), preferring a source-Kind reason over a sink-Kind one at the same depth."""
+    """Checks 3-6 for one candidate file (Live, Kind, Connected, Pair); "" when this file makes the chain stand.
+    K1/P2: each end's matched lines are split into groups (`_groups`, then `_merged`), and only groups whose own
+    texts show that end's declared Kind evidence are kept, so evidence and connection are never stitched together
+    from different, unrelated occurrences. Connected then runs over the kept groups of both ends at once: each of
+    its rules is a union over lines, so this is exactly "some kept source group connects to some kept sink group",
+    in time linear in the shown lines and with no pair cap for decoy copies to exhaust."""
     cls = entry.get("cls")
     if cls == "not-shipped":
         return f"chain is in not-shipped code ({path})"
@@ -302,40 +382,30 @@ def _gate_file(verdict, path, entry, src_hits, snk_hits) -> str:
         return f"chain is in inert code ({path})"                # fix I4
     if cls in (None, "unknown"):
         return f"chain is in unclassified code ({path})"
-    lines = entry.get("lines") or {}
-    tails = _cuts(entry)
-    if not any(_live(_text_at(n, lines, tails)) for ns in src_hits for n in ns):
+    f = _File(entry)
+    if not any(f.live(n) for ns in src_hits for n in ns):
         return "source is only a comment or a string"
-    if not any(_live(_text_at(n, lines, tails)) for ns in snk_hits for n in ns):
+    if not any(f.live(n) for ns in snk_hits for n in ns):
         return "sink is only a comment or a string"
-    src_groups = _anchor_groups(src_hits, lines, tails)
-    snk_groups = _anchor_groups(snk_hits, lines, tails)
-    if not src_groups or not snk_groups:
-        return "no dataflow shown between source and sink"
-    strings = set(entry.get("strings") or [])
-    kind_lines = {n: t for n, t in lines.items() if n not in strings}       # import table skips string lines (R8-1)
+    kind_lines = {n: t for n, t in f.lines.items() if n not in f.strings}   # import table skips string lines (R8-1)
     table = _import_table(t for t in kind_lines.values() if t.lstrip().startswith(("import ", "from ")))
-    best_rank, best_level, best_reason = -1, None, None
-    for sg in src_groups:
-        for kg in snk_groups:
-            if not _connected([sg], [kg], entry):
-                level, reason = "connected", "no dataflow shown between source and sink"
-            else:
-                reason = _kinds(verdict, [_text_at(n, lines, tails) for n in sg],
-                                [_text_at(n, lines, tails) for n in kg], table)
-                if reason == "":
-                    return ""
-                level = "src-kind" if reason.startswith("source quoted") else \
-                    "snk-kind" if reason.startswith("sink quoted") else "pair"
-            rank = _LEVEL_RANK[level]
-            if rank > best_rank or (rank == best_rank and level == "src-kind" and best_level == "snk-kind"):
-                best_rank, best_level, best_reason = rank, level, reason
-    return best_reason
+    ends = []
+    for end, kind, hits in (("source", verdict.source_kind, src_hits), ("sink", verdict.sink_kind, snk_hits)):
+        kept = [n for g in _merged(_groups(hits, f.lines), f) if _evidence(kind, [f.text(n) for n in g], table)
+                for n in g]
+        if not kept:
+            return f"{end} quoted as {kind}, but the quoted lines show no {kind}"
+        ends.append(kept)
+    if not _connected(*ends, f):
+        return "no dataflow shown between source and sink"
+    if (verdict.source_kind, verdict.sink_kind) not in PAIRS:
+        return f"{verdict.source_kind} → {verdict.sink_kind} is not a chain that makes a release malicious"
+    return ""
 
 
 def gate(verdict, shown) -> str:
     """Why a malicious verdict's chain does not stand, or "" when it does (spec F §3.3). Checks in order, the first
-    failure is the reason: Present, Found (one file), Live, Connected, Kind, Pair. Every candidate file (both ends
+    failure is the reason: Present, Found (one file), Live, Kind, Connected, Pair (P2). Every candidate file (both ends
     found there) is gated; the chain stands if any of them passes, else the first candidate's reason is returned
     (fix I5)."""
     if not cited(verdict):
@@ -366,9 +436,9 @@ PAIRS = frozenset({("secret-read", "send"), ("payload", "exec"), ("fetch", "exec
                    ("payload", "write-and-run")})
 _CRED = re.compile(r"\.ssh|\.aws|\.pypirc|\.netrc|\.git-credentials|\.npmrc|\.docker/config\.json|\.kube/config|"
                    r"keyring|/proc/[^/'\"]+/(?:environ|cmdline)|Cookies|Login Data|Local State|key4\.db|wallet\.dat|"
-                   r"Exodus|Electrum")
-_PERSIST = re.compile(r"\.pth$|(?:site|user)customize\.py$|(?:^|/)\.(?:bashrc|zshrc|profile|bash_profile)$|"
-                      r"crontab|/etc/cron|systemd/.*\.service$|LaunchAgents/")
+                   r"Exodus|Electrum|cookies\.sqlite|\.electrum|exodus\.wallet|logins\.json")
+_PERSIST = re.compile(r"(?i:\.pth)$|(?:site|user)customize\.py$|(?:^|/)\.(?:bashrc|zshrc|profile|bash_profile)$|"
+                      r"crontab|/etc/cron|systemd/.*\.service$|LaunchAgents/|(?:^|/)LaunchAgents(?:/|$)")
 _BLOB = re.compile(r"^(?:(?=.*\d)(?=.*[A-Z])(?=.*[a-z])[A-Za-z0-9+/=_-]{128,}|(?:[0-9a-fA-F]{2}){65,})$")
 _DECODE = {"b64decode", "urlsafe_b64decode", "b16decode", "b32decode", "a85decode", "b85decode", "unhexlify",
            "decompress", "fromhex", "a2b_base64", "a2b_hex", "a2b_uu"}
@@ -377,7 +447,7 @@ _NET_FUNCS = {"urlopen", "urlretrieve", "Request", "create_connection"}
 _NET_PRIMS = {"urlopen", "urlretrieve", "Request", "get", "post", "put", "patch", "delete", "head", "request",
               "stream", "socket", "create_connection", "connect", "send", "sendall", "sendto", "recv", "Client",
               "AsyncClient", "Session", "ClientSession", "PoolManager", "HTTPConnection", "HTTPSConnection", "SMTP",
-              "SMTP_SSL", "FTP"}
+              "SMTP_SSL", "FTP", "FTP_TLS", "build_opener"}
 _FETCH_METHODS = {"recv", "recv_into", "get", "read", "urlopen", "urlretrieve"}
 _SEND_METHODS = {"send", "sendall", "sendto", "request", "post", "put", "patch", "sendmail"}
 _PROCESS = {"os.system", "os.popen", "subprocess.Popen", "subprocess.run", "subprocess.call",
@@ -457,7 +527,9 @@ def _last(n):
 
 
 def _net_call(c):
-    return (c.split(".", 1)[0] in _NET_ROOTS and _last(c) in _NET_PRIMS) or _last(c) in _NET_FUNCS
+    root = c.split(".", 1)[0]
+    return (root in _NET_ROOTS and _last(c) in _NET_PRIMS) or _last(c) in _NET_FUNCS \
+        or (root == "urllib" and _last(c) == "open")          # an opener's open; plain `open` is never network
 
 
 def _is_exec(f):
@@ -496,17 +568,8 @@ def _evidence(kind, texts, table) -> bool:
     if kind == "write-and-run":
         writes = any(_is_write(f) for f in fs)
         runs = any(_is_exec(f) or any("chmod" in _last(c) for c in f["calls"]) for f in fs)
-        persist = any(_PERSIST.search(s) for f in fs for s in f["strings"])
+        persist = any(any(_PERSIST.search(s) for s in f["strings"])
+                      or (any("systemd" in s for s in f["strings"])
+                          and any(s.endswith(".service") for s in f["strings"])) for f in fs)
         return writes and (runs or persist)
     return False
-
-
-def _kinds(verdict, src_lines, snk_lines, table) -> str:
-    """Checks 5 (Kind) and 6 (Pair). `table` is `_gate_file`'s import table (K1: built once, reused per group)."""
-    if not _evidence(verdict.source_kind, src_lines, table):
-        return f"source quoted as {verdict.source_kind}, but the quoted lines show no {verdict.source_kind}"
-    if not _evidence(verdict.sink_kind, snk_lines, table):
-        return f"sink quoted as {verdict.sink_kind}, but the quoted lines show no {verdict.sink_kind}"
-    if (verdict.source_kind, verdict.sink_kind) not in PAIRS:
-        return f"{verdict.source_kind} → {verdict.sink_kind} is not a chain that makes a release malicious"
-    return ""

