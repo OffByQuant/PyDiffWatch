@@ -415,7 +415,7 @@ def analyze(cfg, dl, owners, ruleset, backend=None):
         d, tr, prior_error = _decode_output(_run(cfg, backend, _encode_input(cfg, dl, ruleset)), cfg, dl, ruleset)
     d = dataclasses.replace(d, added_dep_findings=list(dl.added_dep_findings),
                             signals=differ.render_signals(dl.requires_dist_change, dl.added_dep_findings,
-                                                          d.added_binaries, owners))
+                                                          d.added_binaries, owners, dl.publishing))
     return d, _with_parent_rules(cfg, dl, d, tr, owners, ruleset), prior_error
 
 

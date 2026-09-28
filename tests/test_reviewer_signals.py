@@ -161,10 +161,12 @@ def test_differ_lists_every_signal():
         "dependency ghost-pkg: not on PyPI (dependency confusion)",
         "dependency fresh: brand-new on PyPI",
         "dependency late: not screened (lookup cap reached)",
-        "added file p/x.so: 1234 bytes, new-binary",
-        "added file p/big.py: 9000000 bytes, source-too-large",
-        "added file p/l.php: 10 bytes, foreign-language-source (.php)",
         "maintainer set changed: alice -> mallory",
+    ]
+    assert differ.render_unreadable(art.added_binaries).split("\n") == [
+        "p/x.so: 1234 bytes, new-binary",
+        "p/big.py: 9000000 bytes, source-too-large",
+        "p/l.php: 10 bytes, foreign-language-source (.php)",
     ]
 
 
@@ -176,8 +178,8 @@ def test_no_signal_data_renders_no_signal_line_and_no_block():
 
 def test_each_kind_of_signal_is_capped_at_twenty_items():
     art = _art(added_binaries=[{"path": f"b{i}.so", "size": 1, "sha256": "x"} for i in range(50)])
-    lines = differ.render_signals(art.requires_dist_change, art.added_dep_findings, art.added_binaries, None).split("\n")
-    assert len(lines) == 21 and lines[-1] == "added file: … (+30 more)"
+    lines = differ.render_unreadable(art.added_binaries).split("\n")
+    assert len(lines) == 21 and lines[-1] == "not readable: … (+30 more)"
 
 
 def test_a_dependency_typosquat_is_shown_inside_the_markers_after_the_execution_context():

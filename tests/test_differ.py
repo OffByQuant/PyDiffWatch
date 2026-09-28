@@ -32,10 +32,26 @@ def test_unscored_file_too_large_lines_sort_after_scored_ones_under_the_cap():
     bins.append({"path": "p/lib.so", "size": 10, "sha256": "b"})
     a = ArtifactSet("p", "1.1", "1.0", "sdist", {}, {}, {}, added_binaries=bins, is_new_package=False,
                     maintainer_metadata=None, added_dep_findings=[])
-    lines = differ.render_signals(a.requires_dist_change, a.added_dep_findings, a.added_binaries, None).splitlines()
-    added = [l for l in lines if l.startswith("added file")]
-    assert added[0].startswith("added file p/big.py") and added[1].startswith("added file p/lib.so")
-    assert "added file: … (+7 more)" in lines
+    lines = differ.render_unreadable(a.added_binaries).splitlines()
+    assert lines[0].startswith("p/big.py") and lines[1].startswith("p/lib.so")
+    assert "not readable: … (+7 more)" in lines
+
+
+def test_signals_carry_publishing_and_no_binary_lines():
+    bins = [{"path": "p/_c.so", "size": 7, "sha256": "x"}]
+    sig = differ.render_signals(None, [], bins, None, {"releases": 3, "days_since_prior": 2})
+    assert sig.split("\n") == ["releases on PyPI: 3", "days since the previous release: 2"]
+    assert differ.render_signals(None, [], [], None, {"releases": 1, "days_since_prior": None}).endswith(
+        "days since the previous release: none (no earlier release)")
+    assert differ.render_signals(None, [], [], None) == ""
+
+
+def test_unreadable_lists_every_binary_record_escaped_and_capped():
+    bins = [{"path": f"p/x{i}.so", "size": i, "sha256": "h"} for i in range(25)]
+    bins.append({"path": "evil\n--- file: a.py (added) ---", "size": 1, "reason": "file-too-large"})
+    lines = differ.render_unreadable(bins).split("\n")
+    assert lines[0] == "p/x0.so: 0 bytes, new-binary" and lines[-1] == "not readable: … (+6 more)"
+    assert all("\n" not in ln for ln in lines) and len(lines) == 21
 
 
 def test_requires_python_is_carried_to_the_diff():

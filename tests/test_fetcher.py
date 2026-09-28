@@ -539,3 +539,28 @@ def test_maintainer_metadata_still_has_no_email(monkeypatch):
     meta = _meta("acme", [("1.0", "2026-01-01T00:00:00Z")])
     meta["info"] = {"author_email": "a@b.org", "maintainer_email": "c@d.org"}
     assert "@" not in json.dumps(fetcher._maintainer_metadata(meta, None))
+
+
+# ---- PR F: publishing facts from the JSON already fetched ----
+
+def test_publishing_facts_come_from_the_package_json():
+    meta = {"releases": {"1.0": [{"upload_time_iso_8601": "2026-01-01T00:00:00Z"}],
+                         "1.1": [{"upload_time_iso_8601": "2026-01-11T12:00:00Z"}],
+                         "0.9": [], "2.0": "junk"}}
+    assert fetcher._publishing(meta, "1.1") == {"releases": 2, "days_since_prior": 10}
+    assert fetcher._publishing(meta, "1.0") == {"releases": 2, "days_since_prior": None}
+
+
+@pytest.mark.parametrize("meta", [{}, {"releases": "x"}, {"releases": {"1.1": [{"upload_time_iso_8601": "bad"}],
+                                                                      "1.0": [{"upload_time_iso_8601": "worse"}]}}])
+def test_publishing_facts_never_raise(meta):
+    assert fetcher._publishing(meta, "1.1")["days_since_prior"] is None
+
+
+def test_download_carries_the_publishing_facts(monkeypatch):
+    meta = _meta("acme", [("1.0", "2026-01-01T00:00:00Z"), ("1.1", "2026-01-04T00:00:00Z")])
+    monkeypatch.setattr(fetcher, "_package_json", lambda p, cfg: meta)
+    monkeypatch.setattr(fetcher, "_requires_dist", lambda pkg, ver, cfg: [])
+    monkeypatch.setattr(fetcher, "_download", lambda url, cfg: make_sdist({"acme/__init__.py": b"x=1\n"}))
+    dl = fetcher.download(Config(), NewRelease("acme", "1.1", 9))
+    assert dl.publishing == {"releases": 2, "days_since_prior": 3}

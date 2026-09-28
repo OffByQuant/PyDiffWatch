@@ -38,6 +38,7 @@ class Download:
     added_dep_findings: list[dict]  # signal 5, screened here: the lookups need the network
     requires_dist_change: dict | None
     description: str | None         # the JSON info.summary; PKG-INFO's Summary replaces it once extracted
+    publishing: dict | None = None  # {"releases", "days_since_prior"} from the package JSON (parent-side; spec F)
 
 @dataclass(frozen=True)
 class Hunk:

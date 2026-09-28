@@ -63,25 +63,35 @@ def _dep_line(f) -> str:
     return f"dependency {name}: {_DEP_REASONS.get(reason) or _esc(reason)}"
 
 
-def render_signals(requires_dist_change, added_dep_findings, added_binaries, maintainer_context) -> str:
-    """The dependency / binary / ownership signals triage scored, one line each, for the reviewer (spec B2).
-    Rendered by the parent from its own data (parse-sandbox spec decision 5). Every author-written value (names,
-    specifiers, paths, owners) is escaped to one line here."""
+def render_signals(requires_dist_change, added_dep_findings, added_binaries, maintainer_context,
+                   publishing=None) -> str:
+    """The dependency / ownership / publishing signals, one line each, for the reviewer (spec B2, F decision 6).
+    Rendered by the parent from its own data (parse-sandbox spec decision 5). Every author-written value is escaped
+    to one line here. Binaries are listed by render_unreadable instead (spec F Ruling F4); `added_binaries` stays in
+    the signature for callers."""
     out = []
     for key in ("added", "removed"):
         if items := (requires_dist_change or {}).get(key):
             out.append(f"requires-dist {key}: {_list(items)}")
-    deps = [_dep_line(f) for f in added_dep_findings]
-    out += _capped("dependency", deps)
-    bins = []
-    # unscored oversized files last: the shared cap must never cut a scored line for one
-    for b in sorted(facts._normalize_binaries(added_binaries), key=lambda b: b["reason"] == "file-too-large"):
-        reason = _esc(b.get("reason") or "unknown") + (f" ({_esc(b['ext'])})" if b.get("ext") else "")
-        bins.append(f"added file {_esc(b.get('path'))}: {_esc(b.get('size'))} bytes, {reason}")
-    out += _capped("added file", bins)
+    out += _capped("dependency", [_dep_line(f) for f in added_dep_findings])
     if change := facts.roles_change(maintainer_context):
         out.append(f"maintainer set changed: {_list(change[0])} -> {_list(change[1])}")
+    if isinstance(publishing, dict):
+        n, d = publishing.get("releases"), publishing.get("days_since_prior")
+        out.append(f"releases on PyPI: {n if type(n) is int else 'unknown'}")
+        out.append("days since the previous release: "
+                   + (str(d) if type(d) is int else "none (no earlier release)"))
     return "\n".join(out)
+
+
+def render_unreadable(added_binaries) -> str:
+    """The changed files DiffWatch could not show as text (binaries, oversized or foreign-language members), one
+    line each, unscored oversized files last (spec F §3.2). Author paths escaped to one line."""
+    lines = []
+    for b in sorted(facts._normalize_binaries(added_binaries), key=lambda b: b["reason"] == "file-too-large"):
+        reason = _esc(b.get("reason") or "unknown") + (f" ({_esc(b['ext'])})" if b.get("ext") else "")
+        lines.append(f"{_esc(b.get('path'))}: {_esc(b.get('size'))} bytes, {reason}")
+    return "\n".join(_capped("not readable", lines))
 
 
 _MAX_HOOK_TARGETS = 20      # carried to the reviewer, which shows at most 5 whole (spec F §3.2)

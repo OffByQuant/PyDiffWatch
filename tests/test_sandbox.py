@@ -105,7 +105,7 @@ def test_the_request_round_trips_without_the_parents_facts(tmp_path):
     got_cfg, got_dl, got_rs = sandbox._decode_input(json.loads(line), io.BytesIO(rest))
     # Review Focus 3: every path arrives absolute (the worker never resolves one against its own cwd)
     assert got_cfg == dataclasses.replace(cfg, **{k: Path(getattr(cfg, k)).resolve() for k in sandbox._PATH_FIELDS})
-    assert got_dl == dataclasses.replace(dl, added_dep_findings=[], requires_dist_change=None)
+    assert got_dl == dataclasses.replace(dl, added_dep_findings=[], requires_dist_change=None, publishing=None)
     assert got_rs == rs                                       # the parent's rules, JSON round-tripped
 
 
@@ -410,7 +410,7 @@ def test_a_lying_worker_cannot_hide_the_parents_rules_or_its_signal_line(monkeyp
         assert ("autoexec-location" in fired) == bool(kept)          # a worker's code result is kept
         assert fired == sorted(fired, key=order.index)                # ruleset order
         assert d.signals == differ.render_signals(dl.requires_dist_change, dl.added_dep_findings,
-                                                  d.added_binaries, _OWNERS)
+                                                  d.added_binaries, _OWNERS, dl.publishing)
         assert "the same PyPI owner" not in d.signals and d.added_dep_findings == dl.added_dep_findings
 
 

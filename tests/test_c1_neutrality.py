@@ -1,6 +1,7 @@
 """C1 neutrality: the download/extract split and sandbox.analyze(backend="off") must reproduce, byte for byte,
 what fetch_artifacts + build_diff(art, owners) + triage(d, cfg, ruleset, owners) produced before the split
-(spec §4, §6). The golden files were written once from the pre-split code; never regenerate them."""
+(spec §4, §6). The golden files were written once from the pre-split code; regenerated only for a field a later
+PR changes on purpose (PR F: the scan golden's `signals`), and the diff checked."""
 import dataclasses, hashlib, json, os, pathlib
 
 from pydiffwatch import fetcher, rules
