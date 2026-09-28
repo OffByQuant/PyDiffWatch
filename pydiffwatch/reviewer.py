@@ -3,6 +3,7 @@ bytes — §6.1), builds a compact injection-delimited prompt over triage-flagge
 pluggable backend (local Qwen by default, Claude optionally — see backends.py) for a verdict under a
 forced structured-output contract. This module owns the prompt/schema/parsing only; all model I/O
 and network egress live in the backend, keeping the diff-handling code network-free (containment)."""
+import ast
 import json
 import logging
 import math
@@ -479,12 +480,127 @@ def _not_shown_reserve(diff, ranked_paths, cut, cap) -> int:
     return len(_not_shown_block(diff, paths, cap)) + 1 if paths else 0
 
 
+_URL = re.compile(r"https?://([^/\s'\"<>\\?#]+)", re.I)
+_IPV4 = re.compile(r"(?<![\d.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?![\d.])")
+_MAX_ENDPOINTS = 30
+
+
 def _endpoints(diff) -> list[str]:
-    return []          # Task 5
+    """Hosts of http(s) URLs and IPv4 literals (each octet <= 255) in ADDED lines of changed files, first-seen order,
+    at most 30 (spec F §3.2). Listed, never fetched. IPv6 and bare hostnames are out (they false-match)."""
+    out: list[str] = []
+    for fd in diff.changed:
+        for ln in (ln for h in fd.hunks for ln in h.added):
+            for m in _URL.finditer(ln):
+                host = m.group(1).rsplit("@", 1)[-1].split(":", 1)[0].lower()
+                if host and host not in out:
+                    out.append(_one_line(host)[:200])
+            for m in _IPV4.finditer(ln):
+                if all(int(g) <= 255 for g in m.groups()) and (ip := f"IP {m.group(0)}") not in out:
+                    out.append(ip)
+            if len(out) >= _MAX_ENDPOINTS:
+                return out[:_MAX_ENDPOINTS]
+    return out
+
+
+def _scopes(text) -> dict | None:
+    """{line: innermost enclosing def/class as "name@line", else "module"} from the new file's AST; None when it
+    does not parse (Connected then uses shared names only; R2-8)."""
+    if text is None:
+        return None
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return None
+    out: dict[int, str] = {}
+    stack = [tree]
+    spans = []
+    while stack:
+        node = stack.pop()
+        for ch in ast.iter_child_nodes(node):
+            if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                spans.append((ch.lineno, ch.end_lineno or ch.lineno, f"{ch.name}@{ch.lineno}"))
+            stack.append(ch)
+    for start, end, name in sorted(spans):               # outer spans first; inner ones overwrite them
+        for n in range(start, end + 1):
+            out[n] = name
+    return out
 
 
 def _shown_entry(fd, cls, whole) -> dict:
-    return {"cls": cls, "lines": {}}   # Task 5
+    """The lines a rendered file put in front of the model (added lines, or every line of a whole-file render),
+    by new-file line number, with each line's scope when the file parses (spec F §3.2 `shown`)."""
+    if whole:
+        lines = dict(enumerate(fd.new_text.splitlines(), 1))
+    else:
+        lines = {h.new_range[0] + 1 + k: t for h in fd.hunks for k, t in enumerate(h.added)}
+    entry = {"cls": cls, "lines": lines}
+    scopes = _scopes(fd.new_text)
+    if scopes is not None:
+        entry["scopes"] = {n: scopes.get(n, "module") for n in lines}
+    return entry
+
+
+def shown_to_json(shown) -> str:
+    return json.dumps({p: {k: ({str(n): v for n, v in e[k].items()} if k in ("lines", "scopes") else e[k])
+                           for k in e} for p, e in (shown or {}).items()})
+
+
+def shown_from_json(s) -> dict:
+    raw = json.loads(s) if s else {}
+    return {p: {k: ({int(n): v for n, v in e[k].items()} if k in ("lines", "scopes") else e[k]) for k in e}
+            for p, e in raw.items()}
+
+
+_HEADING = re.compile(r"^--- file: (.*) \((added|removed|modified|unchanged)(?:; class=([a-z-]+))?(?:; run by .*)?\) ---$")
+_NEW_POS = re.compile(r"^@@ new L(\d+)-\d+$")
+_WHOLE_POS = re.compile(r"^@@ whole file, new L1-\d+ ")
+_BLOCK_HEADINGS = (_NOT_SHOWN_HEADING, _UNREADABLE_HEADING, _ENDPOINTS_HEADING)
+
+
+def shown_from_text(text: str) -> dict:
+    """The rendered lines of a stored review input, rebuilt from its headings and positions (the drain's path when
+    no review_shown is stored; a pre-F heading without class= gives class "unknown"). No scopes."""
+    marker = _marker_of(text)
+    body = text.split(marker, 3)[2] if text.count(marker) >= 2 else ""
+    out, cur, n = {}, None, 1
+    for ln in body.split("\n"):
+        if m := _HEADING.match(ln):
+            cur = out.setdefault(m.group(1), {"cls": m.group(3) or "unknown", "lines": {}})
+            n = 1
+            continue
+        if ln in _BLOCK_HEADINGS or cur is None:
+            cur = None if ln in _BLOCK_HEADINGS else cur
+            continue
+        if m := _NEW_POS.match(ln):
+            n = int(m.group(1))
+        elif _WHOLE_POS.match(ln) or ln.startswith("@@ "):
+            continue
+        elif ln.startswith("+ ") or (ln.startswith("  ") and cur is not None):
+            cur["lines"][n] = ln[2:]
+            n += 1
+    return out
+
+
+def not_seen_from_text(text: str):
+    """(not-shown paths, unreadable paths) listed in a stored input's two blocks; None for a pre-F text (no
+    class= heading), whose caller falls back to dropped_from_text (Ruling F11)."""
+    lines = text.split("\n")
+    if not any(_HEADING.match(ln) and "; class=" in ln for ln in lines) and _NOT_SHOWN_HEADING not in lines \
+            and _UNREADABLE_HEADING not in lines:
+        return None
+
+    def block(heading, split):
+        if heading not in lines:
+            return []
+        out = []
+        for ln in lines[lines.index(heading) + 1:]:
+            if not ln.startswith("  "):
+                break
+            if not ln.startswith("  … (+") and not ln.startswith("  not readable: … (+"):
+                out.append(ln[2:].rsplit(split, 1)[0])
+        return out
+    return block(_NOT_SHOWN_HEADING, " ("), block(_UNREADABLE_HEADING, ": ")
 
 
 _CHANGE_KINDS = ("added", "removed", "modified", "unchanged")
