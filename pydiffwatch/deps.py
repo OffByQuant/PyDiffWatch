@@ -19,6 +19,7 @@ _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")   # leading token of a Requ
 _MIN_TYPOSQUAT_LEN = 5   # don't flag distance-1 noise on very short names (<=4 chars)
 _ESTABLISHED_DAYS = 365       # a typosquat-close dep this old AND with this many releases is not a fresh squat
 _ESTABLISHED_RELEASES = 5
+MIN_ORG_PACKAGES = 2          # an organisation must own this many top-PyPI packages to clear a lookalike dep
 _CODE_HOSTS = {"github.com", "gitlab.com", "codeberg.org", "bitbucket.org"}
 
 logger = logging.getLogger(__name__)
@@ -91,11 +92,12 @@ def org_of(meta) -> str | None:
     return (normalize_name(org) or None) if isinstance(org, str) else None
 
 
-def load_popular_orgs(path: str | None = None, min_packages: int = 2) -> frozenset[str]:
+def load_popular_orgs(path: str | None = None, min_packages: int = MIN_ORG_PACKAGES) -> frozenset[str]:
     """Organisations owning at least `min_packages` top-PyPI packages, from the vendored `org<TAB>package` map
     (tools/build_top_orgs.py). Whoever controls such an organisation already controls popular packages, so a
     lookalike dependency it publishes is not read as a typosquat. A missing file gives an empty set (today's
-    behaviour); comments, blanks, malformed and duplicate lines are skipped."""
+    behaviour), and so does an unreadable one; comments, blanks, duplicates and lines without exactly two
+    tab-separated columns are skipped."""
     pkgs = {}
     try:
         with open(path or _ORGS_PATH, encoding="utf-8") as f:
@@ -103,13 +105,15 @@ def load_popular_orgs(path: str | None = None, min_packages: int = 2) -> frozens
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
-                org, _, pkg = line.partition("\t")
-                org, pkg = normalize_name(org), normalize_name(pkg)
+                parts = line.split("\t")
+                if len(parts) != 2:
+                    continue
+                org, pkg = normalize_name(parts[0]), normalize_name(parts[1])
                 if org and pkg:
                     pkgs.setdefault(org, set()).add(pkg)
-    except FileNotFoundError:
-        logger.warning("no PyPI organisation map at %s; organisation-owned lookalike deps stay flagged",
-                       path or _ORGS_PATH)
+    except (OSError, UnicodeDecodeError) as e:
+        logger.warning("no usable PyPI organisation map at %s (%s); organisation-owned lookalike deps stay flagged",
+                       path or _ORGS_PATH, type(e).__name__)
         return frozenset()
     return frozenset(o for o, p in pkgs.items() if len(p) >= min_packages)
 

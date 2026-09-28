@@ -18,7 +18,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from pydiffwatch import deps, fetcher              # noqa: E402
+from pydiffwatch import deps, egress, fetcher              # noqa: E402
 from pydiffwatch.config import Config               # noqa: E402
 
 MAX_FAIL_RATE = 0.05
@@ -27,6 +27,7 @@ MIN_ORGS = 20
 
 def _org(name: str, cfg: Config):
     url = f"{cfg.pypi_base}/pypi/{urllib.parse.quote(name, safe='')}/json"
+    egress.assert_web_scheme(url)   # pypi_base is configurable: reject file:// before urllib reads a local path
     req = urllib.request.Request(url, headers={"User-Agent": "diffwatch/0.1", "Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=cfg.fetch_timeout_s) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
         return deps.org_of(json.loads(fetcher.read_body(r, cfg, cfg.max_metadata_bytes, cfg.packument_deadline_s)))
@@ -49,9 +50,9 @@ def main() -> int:
     failed = [n for n, _, e in results if e is not None]
     rows = sorted({(org, name) for name, org, _ in results if org})
     orgs = {o for o, _ in rows}
-    popular = {o for o in orgs if sum(1 for oo, _ in rows if oo == o) >= 2}
+    popular = {o for o in orgs if sum(1 for oo, _ in rows if oo == o) >= deps.MIN_ORG_PACKAGES}
     print(f"names {len(names)}, failed {len(failed)}, packages with an organisation {len(rows)}, "
-          f"organisations {len(orgs)}, owning 2+ packages {len(popular)}")
+          f"organisations {len(orgs)}, owning {deps.MIN_ORG_PACKAGES}+ packages {len(popular)}")
     if len(failed) > MAX_FAIL_RATE * len(names):
         print(f"too many failures ({len(failed)}); not writing. First: {failed[:10]}", file=sys.stderr)
         return 1

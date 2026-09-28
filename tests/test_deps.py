@@ -307,5 +307,26 @@ def test_load_popular_orgs_missing_file_is_empty(tmp_path):
     assert deps.load_popular_orgs(str(tmp_path / "absent.txt")) == frozenset()
 
 
-def test_the_vendored_org_map_loads():
-    assert isinstance(deps.load_popular_orgs(), frozenset)
+def test_load_popular_orgs_skips_lines_without_exactly_two_columns(tmp_path):
+    p = tmp_path / "orgs.txt"
+    p.write_text("solo-org\tacme-a\ta note\nsolo-org\tacme-a\n")
+    assert deps.load_popular_orgs(str(p)) == frozenset()
+
+
+def test_load_popular_orgs_unreadable_file_is_empty(tmp_path):
+    p = tmp_path / "orgs.txt"
+    p.write_bytes(b"acme-org\tacme-a\n\xff\xfe\x00bad\n")
+    assert deps.load_popular_orgs(str(p)) == frozenset()
+
+
+def test_the_vendored_org_map_is_populated_and_matches_the_names_corpus():
+    import re
+    assert len(deps.load_popular_orgs()) >= 20
+    corpus = deps.load_corpus()
+    with open(deps._ORGS_PATH, encoding="utf-8") as f:
+        text = f.read()
+    rows = [ln.split("\t") for ln in text.splitlines() if ln and not ln.startswith("#")]
+    assert rows and all(len(r) == 2 and r[1] in corpus for r in rows)
+    with open(deps._CORPUS_PATH, encoding="utf-8") as f:
+        names_date = re.search(r"fetched (\d{4}-\d{2}-\d{2})", f.read()).group(1)
+    assert f"(itself fetched {names_date})" in text     # rebuilt in the same refresh as top_pypi_names.txt
