@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "OffByQuant" }]
-dependencies = ["PyYAML>=6.0", "defusedxml>=0.7"]
+dependencies = ["PyYAML>=6.0"]
 
 [project.optional-dependencies]
 claude = ["anthropic>=0.40"]

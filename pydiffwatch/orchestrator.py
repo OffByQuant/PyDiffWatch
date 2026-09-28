@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 # Stages that represent a completed analysis or permanent decision; skipped on future ticks.
 # pending_review is terminal for the cursor: the LLM-review queue retries it, not the scan. Likewise
 # metadata_retry: a release whose metadata or sdist download, or diff/triage, failed is retried from its
-# release row (bounded, then gave_up), not the changelog. So is no_sdist_wait: a wheel-only release re-checked
+# release row (bounded, then gave_up), not ingest. So is no_sdist_wait: a wheel-only release re-checked
 # for a late sdist once wheel_only_grace_minutes are over.
 TERMINAL = {"triaged", "alerted", "reviewed", "new_package_skipped", "needs_adjudication",
             "refused_to_extract", "no_sdist", "refused_to_fetch", "pending_review",
@@ -691,7 +691,7 @@ def seed_now(cfg: Config):
 
 
 def _to_fetch(conn, rel) -> bool:
-    """Whether run_once fetches and processes this changelog item. A release not yet at a TERMINAL stage is
+    """Whether run_once fetches and processes this ingest item. A release not yet at a TERMINAL stage is
     fetched. An sdist upload re-scans a release left wheel-only (its wheels uploaded first); on any other
     release it is a no-op (one SELECT, no fetch), since that release's own `new release` event covers it."""
     stg = store.get_stage(conn, rel.package, rel.version)
@@ -986,8 +986,8 @@ def _cursor(cfg) -> int:
 
 
 def _behind(cfg, before: int) -> bool:
-    """True when the tick moved the cursor and at least max_releases_per_run PyPI changelog events are
-    still waiting. A pinned cursor (the PyPI changelog call keeps failing) is never "behind": retrying it
+    """True when the tick moved the cursor and at least max_releases_per_run PyPI serials are
+    still waiting. A pinned cursor (the PyPI index call keeps failing) is never "behind": retrying it
     back-to-back would hammer PyPI."""
     after = _cursor(cfg)
     if after <= before:

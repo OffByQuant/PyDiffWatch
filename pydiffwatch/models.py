@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 @dataclass(frozen=True)
 class NewRelease:
     package: str; version: str; serial: int
-    new_release: bool = True     # the changelog's `new release` event (the release's first file upload)
+    new_release: bool = True     # a version first seen by ingest (not yet in the store)
     sdist_upload: bool = False   # its sdist upload event; re-scans a release left no_sdist_wait/no_sdist (wheels first)
     removed_at: str | None = None # a same-batch `remove release` event's time (ISO-8601 UTC): PyPI removed it
 

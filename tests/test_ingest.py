@@ -248,3 +248,11 @@ def test_a_truncated_gzip_index_body_is_contained(tmp_path, monkeypatch, caplog)
         got = ingest.changes_since(cfg, 0, floor=T0, stage=lambda p, v: None)
     assert list(got) == [] and got.ceiling is None
     assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+def test_ingest_no_longer_uses_xml_rpc():
+    import pathlib
+    src = pathlib.Path(ingest.__file__).read_text()
+    assert "xmlrpc" not in src and "changelog_since_serial" not in src
+    toml = (pathlib.Path(ingest.__file__).parent.parent / "pyproject.toml").read_text()
+    assert "defusedxml" not in toml

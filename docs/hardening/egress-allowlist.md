@@ -17,7 +17,7 @@ does not replace the OS-level boundary.)
 
 | Host | Why | Address shape |
 |---|---|---|
-| `pypi.org` | package JSON + XML-RPC changelog | Fastly CDN — large, changing IP set |
+| `pypi.org` | package JSON + JSON simple index (`/simple/`) | Fastly CDN — large, changing IP set |
 | `files.pythonhosted.org` | sdist downloads | Fastly CDN — large, changing IP set |
 | the LLM endpoint | reviewer (`reviewer.base_url`, e.g. a local/LAN model, or `api.anthropic.com` when `reviewer.provider = "anthropic"`) | usually fixed |
 | the webhook host | alerts (`webhook_url`, if set) | usually fixed |

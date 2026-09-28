@@ -353,8 +353,8 @@ pydiffwatch -c pydiffwatch.toml seed-now
 ```
 
 (You can skip this: a plain `run` on a fresh database self-seeds the cursor to "now" and processes
-nothing that tick, then the next tick polls forward. `run --recent N` (or `watch --recent N`) starts N PyPI
-changelog events back instead and scans them right away; one release is several events, so that is fewer
+nothing that tick, then the next tick polls forward. `run --recent N` (or `watch --recent N`) starts N
+PyPI serials back instead and scans them right away; each upload, yank or edit is one serial, so that is fewer
 than N releases. Use `run --backfill` to process historical releases from genesis instead.)
 
 **Each tick** — this is what your scheduler runs:
@@ -377,7 +377,7 @@ JSON metadata at `packument_deadline_s` (300s total, since a big project lists e
 published); metadata is also capped at `max_metadata_bytes` (64 MB). A release PyPI no longer serves (its
 project answers **404**, or its JSON no longer lists the version) is **removed before scan**: recorded with its
 kind (`project gone` / `version gone`), with no alert and no `pending` entry, since the files are gone and nobody
-can act on it; the status strip counts them. Unless the changelog already showed its `remove release` event, it
+can act on it; the status strip counts them. It
 is re-checked once, `wheel_only_grace_minutes` later, before it is recorded, so a JSON that lags a new upload is
 never mistaken for a removal. Any other failure on a release (a metadata timeout, 5xx
 or malformed JSON, a failed or timed-out sdist download, an error while diffing or scoring it) retries on
@@ -574,14 +574,13 @@ refreshes the dashboard after each tick, and — with `--serve` — serves it th
 you a running monitor plus a live results page:
 
 ```bash
-pydiffwatch -c pydiffwatch.toml watch --serve --recent 500   # start 500 changelog events back + live dashboard
+pydiffwatch -c pydiffwatch.toml watch --serve --recent 500   # start 500 PyPI serials back + live dashboard
 pydiffwatch --model qwen-singleshot watch --serve             # same, no config file: OpenAI-compatible server
 # → open http://127.0.0.1:8787/dashboard.html
 ```
 
 Without `--recent`, a fresh database starts "from now" and the first results appear on the next scan.
-`--recent N` counts PyPI changelog events, not releases: one release is several events (the release plus
-one per uploaded file). While a backlog is waiting (a `--recent` start, or a restart after downtime), `watch`
+`--recent N` counts PyPI serials, not releases: each upload, yank or edit is one serial. While a backlog is waiting (a `--recent` start, or a restart after downtime), `watch`
 scans back-to-back and sleeps only once it has caught up. `--model` / `--endpoint` (default
 `http://localhost:8000/v1`) override the config's reviewer with an OpenAI-compatible server; no API key needed.
 

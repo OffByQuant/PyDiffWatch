@@ -36,7 +36,7 @@ def _configure_logging():
 
 
 def _non_negative(text):
-    """argparse type for --recent: a count of changelog events; 0 means start now, as with no --recent."""
+    """argparse type for --recent: a count of PyPI serials; 0 means start now, as with no --recent."""
     n = int(text)
     if n < 0:
         raise argparse.ArgumentTypeError(f"must be 0 or more, got {n}")
