@@ -333,6 +333,189 @@ def _pth(path, data) -> str:
     return f"{path}: {n} import line{'s' if n != 1 else ''}" if n else f"{path}: paths only"
 
 
+# ---- execution classes (spec F §3.1) ----
+
+CLASSES = ("build", "startup", "import", "user-command", "plugin-host", "runtime-call", "not-shipped", "data",
+           "inert")
+RUNNABLE = CLASSES[:6]
+_RANK = {c: i for i, c in enumerate(CLASSES)}
+_CODE_EXT = (".py", ".pyx", ".pth")
+_INERT_EXT = (".pyi", ".md", ".rst", ".txt")
+_INERT_NAMES = {"PKG-INFO", "LICENSE", "LICENCE", "COPYING", "NOTICE", "AUTHORS"}
+_STARTUP_NAMES = {"sitecustomize.py", "usercustomize.py"}
+
+
+def classify_path(path: str) -> str:
+    """A file's class from its path alone: the fallback for any file `classify` was not asked about."""
+    base = path.rsplit("/", 1)[-1]
+    top = path.split("/", 1)[0] if "/" in path else ""
+    if path == "setup.py":
+        return "build"
+    if base.endswith(".pth") or base in _STARTUP_NAMES:
+        return "startup"
+    if top in _NOT_PACKAGES or base == "conftest.py":
+        return "not-shipped"
+    if base == "__init__.py" or path.split("/")[-1][:-3] in _modules([path]):
+        return "import"
+    if base.lower().endswith(_CODE_EXT):
+        return "runtime-call"
+    if base.lower().endswith(_INERT_EXT) or base in _INERT_NAMES:
+        return "inert"
+    return "data"
+
+
+def module_file(mod, files, base: str = "") -> str | None:
+    """The sdist file a dotted module name resolves to (under `base`, flat, or src/), or None."""
+    if not isinstance(mod, str) or not mod or not all(p.isidentifier() for p in mod.split(".")):
+        return None
+    stem = mod.replace(".", "/")
+    roots = ([base.strip("/") + "/"] if base.strip("/") not in ("", ".") else []) + ["", "src/"]
+    for root in roots:
+        for cand in (f"{root}{stem}.py", f"{root}{stem}/__init__.py", f"{root}{stem}.pyx"):
+            if cand in files:
+                return cand
+    return None
+
+
+def local_imports(path: str, data: bytes, files) -> set:
+    """The sdist files `path`'s own import statements name, absolute or relative. Never raises on content."""
+    try:
+        tree = ast.parse(data)
+    except _PARSE_ERRORS:
+        return set()
+    here = path.rsplit("/", 1)[0].split("/") if "/" in path else []
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            mods = [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                if node.level - 1 > len(here):
+                    continue
+                pkg = here[:len(here) - (node.level - 1)]
+                head = ".".join(pkg + ([node.module] if node.module else []))
+            else:
+                head = node.module or ""
+            mods = ([head] if head else []) + [f"{head}.{a.name}" if head else a.name
+                                               for a in node.names if a.name != "*"]
+        else:
+            continue
+        for m in mods:
+            if (p := module_file(m, files)) and p != path:
+                out.add(p)
+    return out
+
+
+def _ep_module(target) -> str | None:
+    """`pkg.mod:func [extra]` -> `pkg.mod`."""
+    return target.split(":", 1)[0].split("[", 1)[0].strip() if isinstance(target, str) else None
+
+
+def _references(files) -> dict:
+    """{path: {classes}} the release's own metadata gives files (spec F §3.1's metadata rows)."""
+    refs: dict[str, set] = {}
+
+    def add(p, cls):
+        if p:
+            refs.setdefault(p, set()).add(cls)
+
+    def mapping(name, kind):
+        return (parse_mapping(files[name], kind) or {}) if name in files else {}
+
+    pp, cfg = mapping("pyproject.toml", "toml"), mapping("setup.cfg", "ini")
+    setup_kw = {}
+    if "setup.py" in files:
+        try:
+            setup_kw = _setup_kwargs(ast.parse(files["setup.py"]))[0]
+        except _PARSE_ERRORS:
+            pass
+        for p in local_imports("setup.py", files["setup.py"], files):
+            add(p, "build")
+    tool, bs = _dict(pp.get("tool")), _dict(pp.get("build-system"))
+    options = _dict(cfg.get("options"))
+    # build: an in-tree backend, backend hook files, cmdclass targets
+    bpath = [d.strip().removeprefix("./").strip("/") for d in (_strs(bs.get("backend-path")) or [])]
+    backend = bs.get("build-backend")
+    for d in bpath:
+        add(module_file(_ep_module(backend), files, base=d) if isinstance(backend, str) else None, "build")
+        if d not in ("", "."):
+            for p in files:
+                if p.startswith(d + "/"):
+                    add(p, "build")
+    hatch = _dict(_dict(tool.get("hatch")).get("build"))
+    for hooks in [hatch.get("hooks")] + [_dict(t).get("hooks") for t in _dict(hatch.get("targets")).values()]:
+        if isinstance(hooks, dict) and isinstance(hooks.get("custom"), dict):
+            path = hooks["custom"].get("path", "hatch_build.py")
+            if isinstance(path, str) and (path := path.strip().removeprefix("./")) in files:
+                add(path, "build")
+    if "pdm_build.py" in files:
+        add("pdm_build.py", "build")
+    pbuild = _dict(tool.get("poetry")).get("build")
+    script = pbuild if isinstance(pbuild, str) else _dict(pbuild).get("script")
+    if isinstance(script, str) and (script := script.strip().removeprefix("./")) in files:
+        add(script, "build")
+    cmd = list(_dict(_dict(tool.get("setuptools")).get("cmdclass")).values())
+    cmd += [ln.split("=", 1)[1] for ln in str(options.get("cmdclass", "")).splitlines() if "=" in ln]
+    for v in cmd:
+        if isinstance(v, str) and "." in v.strip():
+            add(module_file(v.strip().rsplit(".", 1)[0], files), "build")
+    # import: declared packages (package_dir aware) and py-modules
+    pdir = setup_kw.get("package_dir") if isinstance(setup_kw.get("package_dir"), dict) else {}
+    pdir = pdir or _dict(_dict(tool.get("setuptools")).get("package-dir"))
+    root = pdir.get("", "") if isinstance(pdir.get("", ""), str) else ""
+    cfg_pkgs = str(options.get("packages", ""))
+    pkgs = (_strs(setup_kw.get("packages")) or _strs(_dict(tool.get("setuptools")).get("packages"))
+            or ([] if cfg_pkgs.strip().startswith("find") else _cfg_list(cfg_pkgs)))
+    for pkg in pkgs:
+        if all(x.isidentifier() for x in pkg.split(".")):
+            base = pdir.get(pkg) if isinstance(pdir.get(pkg), str) else f"{root}/{pkg.replace('.', '/')}".strip("/")
+            add(f"{base.strip('/')}/__init__.py" if f"{base.strip('/')}/__init__.py" in files else None, "import")
+    for m in (_strs(setup_kw.get("py_modules")) or _strs(_dict(tool.get("setuptools")).get("py-modules")) or []):
+        add(module_file(m, files), "import")
+    # commands and plugins
+    eps: dict = {}
+    project = _dict(pp.get("project"))
+    _add_groups(eps, {"console_scripts": project.get("scripts"), "gui_scripts": project.get("gui-scripts")})
+    _add_groups(eps, project.get("entry-points"))
+    for tname, scripts, groups in (("poetry", "scripts", "plugins"), ("flit", "scripts", "entrypoints")):
+        t = _dict(tool.get(tname))
+        _add_groups(eps, {"console_scripts": t.get(scripts)})
+        _add_groups(eps, _table(t.get(groups)))
+    _add_groups(eps, setup_kw.get("entry_points"))
+    _add_groups(eps, cfg.get("options.entry_points"))
+    for p in _egg_info(files, "entry_points.txt")[:_MAX_EGG_EPS]:
+        _add_groups(eps, parse_mapping(files[p], "entry_points"))
+    for group, (kept, _more) in eps.items():
+        if group == COMPUTED:
+            continue
+        cls = "user-command" if group in _COMMAND_GROUPS else "plugin-host"
+        for _name, target in kept:
+            add(module_file(_ep_module(target), files), cls)
+    for s in _strs(setup_kw.get("scripts")) or []:
+        add(s.strip().removeprefix("./") if s.strip().removeprefix("./") in files else None, "user-command")
+    # a module an import-time __init__.py imports runs at import too (one level)
+    for p in [p for p in files if p.endswith("/__init__.py") or p == "__init__.py"]:
+        if classify_path(p) == "import" or "import" in refs.get(p, ()):
+            for q in local_imports(p, files[p], files):
+                add(q, "import")
+    return refs
+
+
+def classify(new_files: dict, paths) -> dict:
+    """{path: class} for `paths` (spec F §3.1). The metadata rows (build, startup, import, user-command,
+    plugin-host) outrank not-shipped; the path rules decide the rest. Pure; never raises on package content."""
+    try:
+        refs = _references(new_files)
+    except (TypeError, AttributeError, ValueError, RecursionError):
+        refs = {}
+    out = {}
+    for p in paths:
+        by_path = classify_path(p)
+        cands = set(refs.get(p, ())) | ({by_path} if by_path in ("build", "startup", "import") else set())
+        out[p] = min(cands, key=_RANK.__getitem__) if cands else by_path
+    return out
+
+
 _BUILD_FILES = ("setup.py", "pyproject.toml", "setup.cfg")
 NOT_LITERAL = "none declared literally in setup.py (setup.py runs arbitrary code at build)"
 AUTO_NONE = "none found by DiffWatch (setuptools auto-discovery may also find modules and namespace packages)"
