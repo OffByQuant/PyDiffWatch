@@ -799,14 +799,21 @@ def run_once(cfg: Config, *, seed_if_fresh: bool = True, recent: int | None = No
                         terminal = _process_fetched(cfg, conn, rvw, ruleset, rel, futs[i].result(), offline, guard)
                     if terminal and not blocked:
                         advance_to = rel.serial
-                    else:
+                    elif not terminal:
+                        # Under the simple index every release of one project shares that project's serial:
+                        # a non-terminal release must cap advance_to BELOW its own serial, even if an earlier
+                        # terminal release at the same serial already raised advance_to to it.
+                        advance_to = min(advance_to, rel.serial - 1)
                         blocked = True  # stop advancing past the first non-terminal release
+                    else:
+                        blocked = True  # a later terminal release after the block: still can't advance
         if ceiling is not None:
             advance_to = ceiling if not blocked else min(advance_to, ceiling)
             if not blocked and getattr(found, "complete", False):
                 margin = datetime.timedelta(minutes=cfg.floor_margin_minutes)
                 new = tick_start - margin
-                if floor is None or new > datetime.datetime.fromisoformat(floor):
+                old = ingest._when(floor)      # None on a naive/malformed stored floor: always rewrite
+                if old is None or new > old:
                     store.set_meta(conn, "ingest_floor", _iso(new))      # the floor only moves forward
         store.set_last_serial(conn, max(advance_to, store.get_last_serial(conn)))
         try:

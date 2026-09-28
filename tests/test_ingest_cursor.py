@@ -87,3 +87,45 @@ def test_a_plain_list_stub_keeps_the_old_advance(tmp_path, monkeypatch):
     _stub_tick(monkeypatch, [NewRelease("alpha-demo", "1.0", 130)])
     orchestrator.run_once(cfg)
     assert store.get_last_serial(store.connect(cfg)) == 130
+
+
+def test_a_naive_or_malformed_stored_floor_does_not_crash_the_tick(tmp_path, monkeypatch):
+    for bad_floor in ("2026-01-01T00:00:00", "garbage"):
+        cfg = _cfg(tmp_path / bad_floor.replace(":", "_"))
+        conn = store.connect(cfg); store.init_schema(conn); store.set_last_serial(conn, 100)
+        store.set_meta(conn, "ingest_floor", bad_floor)
+        ch = ingest.Changes(); ch.ceiling = 120
+        ch.complete = True
+        _stub_tick(monkeypatch, ch)
+        orchestrator.run_once(cfg)          # must not raise
+        assert store.get_last_serial(store.connect(cfg)) == 120
+        new_floor = store.get_meta(store.connect(cfg), "ingest_floor")
+        got = datetime.datetime.fromisoformat(new_floor)
+        assert got.tzinfo is not None
+        expect = datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=cfg.floor_margin_minutes)
+        assert abs(got - expect) < datetime.timedelta(minutes=1)
+
+
+def test_the_cursor_never_reaches_a_serial_whose_releases_are_not_all_terminal(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    conn = store.connect(cfg); store.init_schema(conn); store.set_last_serial(conn, 100)
+    ch = ingest.Changes([NewRelease("a-demo", "1.0", 150), NewRelease("a-demo", "1.1", 150)])
+    ch.ceiling = 150
+    _stub_tick(monkeypatch, ch)
+
+    def fetched(cfg, conn, rvw, ruleset, rel, result, offline, guard):
+        return rel.version == "1.0"
+    monkeypatch.setattr(orchestrator, "_process_fetched", fetched)
+    orchestrator.run_once(cfg)
+    assert store.get_last_serial(store.connect(cfg)) == 149
+
+
+def test_an_index_failure_leaves_the_cursor_and_floor_unchanged(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    conn = store.connect(cfg); store.init_schema(conn); store.set_last_serial(conn, 100)
+    store.set_meta(conn, "ingest_floor", "2026-01-01T00:00:00+00:00")
+    ch = ingest.Changes(); ch.ceiling = None
+    _stub_tick(monkeypatch, ch)
+    orchestrator.run_once(cfg)
+    assert store.get_last_serial(store.connect(cfg)) == 100
+    assert store.get_meta(store.connect(cfg), "ingest_floor") == "2026-01-01T00:00:00+00:00"
