@@ -983,7 +983,7 @@ def test_q1_reads_counts_a_name_only_beyond_its_assignment_targets():
     assert chain._reads("x = 1") == set()
     assert chain._reads("a = b = 1") == set()
     assert chain._reads("if (k := f(v)):") == {"f", "v"}
-    assert chain._reads("for a in items: use(a)") == {"items", "use", "a"}
+    assert chain._reads("for a in items: use(a)") == {"items", "use"}   # round 5 T4a: the header binds a
     assert chain._reads("with open(p) as fh:") == {"p"}
     assert chain._reads("token.strip()") == {"token"}
     assert chain._reads("requests.post(U, data=body)") == {"requests", "U", "body"}
@@ -1205,3 +1205,78 @@ def test_s_reads_is_linear_and_never_raises_on_hostile_lines(line):
     t0 = time.perf_counter()
     assert isinstance(chain._reads(line), set)
     assert time.perf_counter() - t0 < 1.0
+
+
+# ---- Task 8 fix round 5 (rulings T1-T5) ----
+
+_TOK5 = "token = os.environ.get('API_KEY')"
+
+
+def _mod5(body):
+    return ("import os, requests\n" + _TOK5 + "\n" + _PAD4 + "def upload(url, raw, keys):\n" + body
+            + "    requests.post(url, json=out)\n")
+
+
+@pytest.mark.parametrize("body", [
+    "    out = [\n        token.strip()\n        for token in raw\n    ]\n",
+    "    out = list(\n        token.lower()\n        for token in raw\n    )\n",
+], ids=["list-comp", "genexpr-arg"])
+def test_t1_a_multi_line_comprehension_target_does_not_hop(body):
+    assert _one("pkg/a.py", _mod5(body), _TOK5, "requests.post(url, json=out)", "secret-read", "send") == \
+        "no dataflow shown between source and sink"
+
+
+def test_t1_a_multi_line_comprehension_filter_still_reads_the_outer_name():
+    body = "    out = [\n        x\n        for x in raw\n        if x in token\n    ]\n"
+    assert _one("pkg/a.py", _mod5(body), _TOK5, "requests.post(url, json=out)", "secret-read", "send") == ""
+
+
+def test_t1_complocal_is_recorded_for_multi_line_comprehensions_and_round_trips():
+    text = "def f(raw, ks):\n    out = [\n        t.strip()\n        for t in raw\n    ]\n    one = [k for k in ks]\n"
+    entry = reviewer._shown_entry(FileDiff("a.py", "modified", [], text), "runtime-call", whole=True)
+    assert entry["complocal"] == {2: ["t"], 3: ["t"], 4: ["t"], 5: ["t"]}
+    shown = {"a.py": entry}
+    assert reviewer.shown_from_json(reviewer.shown_to_json(shown)) == shown
+    bad = reviewer._shown_entry(FileDiff("a.py", "modified", [], "def (:\n" + text), "runtime-call", whole=True)
+    assert "complocal" not in bad
+
+
+@pytest.mark.parametrize("line", [
+    "r = " + "[a for (" * 98 + "x, " * 330_000 + "z" + ") in y]" * 98,
+    "r = [a for " + "(" * 198 + "x, " * 330_000 + "z" + ")" * 198 + " in y]",
+    "f(" + "lambda a=(" * 198 + "x, " * 330_000 + "0" + "): 0" * 198 + ")",
+    "def f(a=" + "lambda b=(" * 197 + "x, " * 330_000 + "0" + "): 0" * 197 + "):",
+    "g = " + "lambda a=(" * 180 + "x, " * 330_000 + "0" + "): 0" * 180,
+    "r = " + "(lambda q: [q for (" * 90 + "x, " * 330_000 + "z" + ") in y])" * 90,
+], ids=["nested-comp", "flat-comp", "lambda-call", "def-default-lambda", "nested-lambdas", "lambda-comp"])
+def test_t2_nested_spans_are_not_rescanned(line):
+    t0 = time.perf_counter()
+    assert isinstance(chain._reads(line), set)
+    assert time.perf_counter() - t0 < 2.0
+
+
+@pytest.mark.parametrize("line, read, not_read", [
+    ('if f"{h}:{p}" in allowed: token = 1', {"h", "p", "allowed"}, {"token"}),
+    ('x += f"{h}:{p}"', {"x", "h", "p"}, set()),
+    ('assert ok, f"{h}:{p}"', {"ok", "h", "p"}, set()),
+    # T4a: position-aware
+    ("lambda token=token: token", {"token"}, set()),
+    ("def f(token=token): pass", {"token"}, {"f"}),
+    ("y = [t for t in ts]; send(t)", {"ts", "send", "t"}, {"y"}),
+    ("f(tok, [tok for tok in xs])", {"f", "tok", "xs"}, set()),
+    ("x = y = [data for data in data]", {"data"}, {"x", "y"}),
+    ("g = lambda a=lambda b: b: a", set(), {"g", "a", "b"}),
+    ("for i in r[::2]: out[i] = tok", {"r", "out", "tok"}, {"i"}),
+    # T4b: case only as a match case
+    ("case [a] if a == token:", {"token"}, {"a"}),
+    ("case = tok", {"tok"}, set()),
+    ("case.run(tok)", {"tok"}, set()),
+    ("case Point(x=0, y=y):", {"Point"}, {"x", "y"}),
+    # T5: a tuple target on a comma-ending line
+    ("x, y = raw,", {"raw"}, {"x", "y"}),
+    ("token, = raw,", {"raw"}, {"token"}),
+    ("    URL, TOKEN, timeout=5,", {"URL", "TOKEN"}, {"timeout"}),
+])
+def test_t3_t5_reads(line, read, not_read):
+    got = chain._reads(line)
+    assert read <= got and not (got & not_read), got

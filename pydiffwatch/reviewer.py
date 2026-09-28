@@ -693,13 +693,31 @@ def _field_code(tree, pos) -> dict:
     return {n: " ".join(seg for _, seg in sorted(segs)) for n, segs in out.items()}
 
 
+def _comp_locals(tree, pos) -> dict:
+    """{shown line: the names a comprehension's own `for` targets bind} for every shown line a ListComp, SetComp,
+    DictComp or GeneratorExp spanning more than one shown line covers (T1): a black-formatted element line such as
+    `token.strip()` reads the comprehension's `token`, not an outer one. A one-line comprehension is left to
+    chain's position-aware lexical reading."""
+    out: dict = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)) or not node.end_lineno:
+            continue
+        names = {t.id for g in node.generators for t in ast.walk(g.target) if isinstance(t, ast.Name)}
+        first = pos.shown_line(pos.offset(node.lineno, node.col_offset))
+        last = pos.shown_line(pos.offset(node.end_lineno, node.end_col_offset))
+        if names and last > first:
+            for n in range(first, last + 1):
+                out.setdefault(n, set()).update(names)
+    return out
+
+
 def _shown_entry(fd, cls, whole) -> dict:
     """The lines a rendered file put in front of the model (added lines, or every line of a whole-file render),
     by new-file line number, with each line's scope, whether it lies inside a string constant, and (fix R3) a
     string-tail column for a line where a multi-line string ends mid-line with real code after it, and (fix G1)
-    the field code of a line otherwise inside a string but holding f-string `{...}` code — when the
-    file parses (spec F §3.2 `shown`). Line numbers are the differ's str.splitlines() numbering throughout; ast
-    positions are mapped onto it (fix F2)."""
+    the field code of a line otherwise inside a string but holding f-string `{...}` code, and (T1) the names
+    local to a multi-line comprehension covering a line — when the file parses (spec F §3.2 `shown`). Line
+    numbers are the differ's str.splitlines() numbering throughout; ast positions are mapped onto it (fix F2)."""
     if whole:
         lines = dict(enumerate(fd.new_text.splitlines(), 1))
     else:
@@ -718,10 +736,12 @@ def _shown_entry(fd, cls, whole) -> dict:
         tails = {n: c for n, c in _string_tails(tree, pos).items() if n in lines}
         if tails:
             entry["tails"] = tails
+        if local := {n: sorted(v) for n, v in _comp_locals(tree, pos).items() if n in lines}:
+            entry["complocal"] = local                  # names local to a multi-line comprehension (T1)
     return entry
 
 
-_LINE_KEYED = ("lines", "scopes", "tails", "fields")      # shown entry maps keyed by line number
+_LINE_KEYED = ("lines", "scopes", "tails", "fields", "complocal")      # shown entry maps keyed by line number
 
 
 def shown_to_json(shown) -> str:
