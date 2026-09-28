@@ -9,6 +9,7 @@ import math
 import re
 import secrets
 from .models import Verdict
+from . import differ, execctx
 from .backends import ReviewUnavailable, make_backend   # re-exported: orchestrator imports reviewer.ReviewUnavailable
 
 logger = logging.getLogger(__name__)
@@ -176,23 +177,26 @@ def _file_weights(triage) -> dict:
     return w
 
 
-def _render_file(fd, whole: bool = True) -> str:
-    """One file's heading and hunks. A modified setup.py / __init__.py is shown whole when `whole` is set and the
-    whole render stays within _WHOLE_FILE_MAX_CHARS (spec H); otherwise, and with whole=False, hunks only."""
+def _render_file(fd, whole: bool = True, cls=None) -> str:
+    """One file's heading and hunks. A modified setup.py / __init__.py, or an unchanged hook target, is shown whole
+    when `whole` is set and the whole render stays within _WHOLE_FILE_MAX_CHARS (spec H, F); otherwise hunks only.
+    `cls` (the review input) puts the run class in the heading; evidence (cls None) keeps the old heading."""
     if whole and _whole_candidate(fd) and (new_lines := fd.new_text.splitlines()):
-        rendered = _render_lines(fd, new_lines)             # the differ's own split: positions line up
+        rendered = _render_lines(fd, new_lines, cls)        # the differ's own split: positions line up
         if len(rendered) <= _WHOLE_FILE_MAX_CHARS:
             return rendered
-    return _render_lines(fd, None)
+    return _render_lines(fd, None, cls)
 
 
-def _render_lines(fd, new_lines) -> str:
+def _render_lines(fd, new_lines, cls=None) -> str:
     # fd.path is an author-chosen sdist member name: escaped (_one_line) so it can never smuggle a
     # raw newline into the heading and forge an extra, unprefixed line that looks like another file's
     # heading (dropped_from_text below parses headings back out of already-rendered text).
     # Every author line keeps a two-character prefix ("+ ", "- ", or "  " for an unchanged line of a whole file),
     # so none can pose as a heading, a marker or a context line; "@@" lines are ours.
-    lines = [f"--- file: {_one_line(fd.path)} ({fd.change_kind}) ---"]
+    kind = fd.change_kind if cls is None else f"{fd.change_kind}; class={cls}" + (
+        f"; run by {_one_line(fd.run_by)}" if getattr(fd, "run_by", None) else "")
+    lines = [f"--- file: {_one_line(fd.path)} ({kind}) ---"]
     if new_lines:
         lines.append(f"@@ whole file, new L1-{len(new_lines)} (unchanged lines start with two spaces)")
     new_lines = new_lines or []
@@ -214,9 +218,22 @@ _WHOLE_FILE_MAX_CHARS = 4_000     # on the rendered whole-file block (a blank li
 
 
 def _whole_candidate(fd) -> bool:
-    """A modified setup.py (build time) or __init__.py (import time): shown with its context when small (spec H)."""
-    return (fd.change_kind == "modified" and fd.new_text is not None
-            and (fd.path == "setup.py" or fd.path == "__init__.py" or fd.path.endswith("/__init__.py")))
+    """A modified setup.py (build time) or __init__.py (import time) shown with its context when small (spec H), and
+    an unchanged hook target (spec F), which has no hunks and is only ever shown whole."""
+    return fd.new_text is not None and (fd.change_kind == "unchanged" or (
+        fd.change_kind == "modified"
+        and (fd.path == "setup.py" or fd.path == "__init__.py" or fd.path.endswith("/__init__.py"))))
+
+
+_RUNNABLE = execctx.RUNNABLE
+_CLASS_RANK = {c: i for i, c in enumerate(execctx.CLASSES)}
+_MAX_HOOK_SHOWN = 5
+_NEW_BLOCK_MAX = 3_000
+
+
+def _cls(diff, path) -> str:
+    """A file's run class: the worker's (Diff.file_classes), else its path's (Ruling F8)."""
+    return (getattr(diff, "file_classes", None) or {}).get(path) or execctx.classify_path(path)
 
 
 _BUILD_FILES = ("setup.py", "pyproject.toml", "setup.cfg")
@@ -256,32 +273,49 @@ def _names_a_dep(fd, pattern) -> bool:
 
 
 def _rank_files(diff, triage):
+    """(ranked paths, {path: FileDiff}, cut). Weighted files first, by summed weight (a payload the rules found is
+    never pushed out by churn; spec F R2-1); then, only when something is weighted, the other added/modified
+    runnable files and up to _MAX_HOOK_SHOWN unchanged hook targets, in run order (class rank), smallest first;
+    with nothing weighted, exactly today's dependency-only selection and order (plan review C3). First releases
+    keep the top 40 by weight. `cut`: selected files never offered to the cap (weighted first-release files past
+    the top 40, hook targets past the fifth), listed as not shown (R2-2)."""
     weights = _file_weights(triage)
     by_path = {fd.path: fd for fd in diff.changed}
     if diff.is_first_release:
-        ranked_paths = sorted(by_path, key=lambda p: (-weights.get(p, 0.0),
-                                                      _zero_weight_rank(p, weights.get(p, 0.0))))
-        ranked_paths = ranked_paths[:_FIRST_RELEASE_TOP_FILES]
-    else:
-        flagged = [p for p in by_path if weights.get(p, 0.0) > 0.0]
-        pattern = None if flagged else _dep_names_pattern(diff, triage)
-        # A fire on dependencies, binaries or owners only has no changed file to point at: show the changed
-        # build files (where dependencies are declared), then files whose added lines name a flagged dependency
-        # (PKG-INFO's Requires-Dist, a requirements helper setup.py reads). Never every changed file.
-        ranked_paths = (sorted(flagged, key=lambda p: -weights[p])
-                        or [p for p in _BUILD_FILES if p in by_path]
-                        + sorted(p for p in by_path if p not in _BUILD_FILES and pattern is not None
-                                 and _names_a_dep(by_path[p], pattern)))
-    return ranked_paths, by_path
+        ranked = sorted(by_path, key=lambda p: (-weights.get(p, 0.0), _zero_weight_rank(p, weights.get(p, 0.0))))
+        cut = [p for p in ranked[_FIRST_RELEASE_TOP_FILES:] if weights.get(p, 0.0) > 0.0]
+        return ranked[:_FIRST_RELEASE_TOP_FILES], by_path, cut
+    hooks = [h for h in getattr(diff, "hook_targets", ()) or () if h.path not in by_path]
+    for h in hooks[:_MAX_HOOK_SHOWN]:
+        by_path[h.path] = h
+    size = {p: len(_render_file(fd)) for p, fd in by_path.items()}
+    rank = lambda p: _CLASS_RANK.get(_cls(diff, p), len(_CLASS_RANK))
+    weighted = sorted((p for p in by_path if weights.get(p, 0.0) > 0.0),
+                      key=lambda p: (-weights[p], rank(p), size[p], p))
+    if not weighted:
+        # A fire on dependencies, binaries or owners only: exactly today's selection and order (plan review C3) — the
+        # build files (where dependencies are declared), then files whose added lines name a flagged dependency.
+        # Unrelated churn is never shown, so a fire with nothing to show stays UNREVIEWED and alerts (no_content).
+        pattern = _dep_names_pattern(diff, triage)
+        return ([p for p in _BUILD_FILES if p in by_path]
+                + sorted(p for p in by_path if p not in _BUILD_FILES and pattern is not None
+                         and _names_a_dep(by_path[p], pattern))), by_path, []
+    # the rules found something: every other added/modified runnable file (and the hook targets) may run with it
+    rest = {p for p, fd in by_path.items() if fd.change_kind in ("added", "modified", "unchanged")
+            and _cls(diff, p) in _RUNNABLE}
+    ordered = sorted(rest - set(weighted), key=lambda p: (rank(p), size[p], p))
+    return weighted + ordered, by_path, [h.path for h in hooks[_MAX_HOOK_SHOWN:]]
 
 
 _DESC_HEADING = "--- package description (the author's claim; context, not evidence) ---"
 _LOC_HEADING = "flagged_locations:"
 _EXEC_HEADING = ("--- execution context (from pyproject/setup.cfg/setup.py/entry_points.txt/.pth; "
                  "how this version's files run) ---")
-_SIG_HEADING = ("--- dependency / binary / ownership signals (PyPI metadata and the sdist's file list; "
-                "context, not code) ---")
-_CONTEXT_HEADINGS = (_EXEC_HEADING, _SIG_HEADING)
+_SIG_HEADING = ("--- dependency / ownership / publishing signals (PyPI metadata; context, not code) ---")
+_ENDPOINTS_HEADING = "--- new network endpoints (hosts and IP addresses in added lines; context, not code) ---"
+_UNREADABLE_HEADING = "--- not readable as text (changed files DiffWatch could not show you) ---"
+_NOT_SHOWN_HEADING = "--- not shown (selected files that did not fit; you did not see them) ---"
+_CONTEXT_HEADINGS = (_EXEC_HEADING, _SIG_HEADING, _ENDPOINTS_HEADING, _UNREADABLE_HEADING)
 
 
 def _one_line(s: str) -> str:
@@ -320,24 +354,21 @@ def _block_cap(max_chars: int) -> int:
 
 
 def build_review_input(diff, triage, *, max_chars: int, dropped: list | None = None,
-                       block_cap: int | None = None) -> str:
-    """Assemble the user-message text for the reviewer. Pure and deterministic.
+                       block_cap: int | None = None, unreadable: list | None = None,
+                       shown: dict | None = None) -> str:
+    """Assemble the user-message text for the reviewer. Pure and deterministic (spec F §3.2).
 
-    Selection (§7): files containing >=1 fired rule, ranked by summed contributed weight;
-    first releases rank all changed files by per-file score and keep the top 40. The selected
-    file diffs are wrapped in injection delimiters; fired rules + score + is_first_release are
-    surfaced as metadata. Over max_chars -> drop lowest-ranked files and append TRUNCATION_NOTE.
-
-    When `dropped` is passed, it is extended (highest-weight first) with the paths of changed
-    files that carried fired-rule weight > 0 but were not rendered — either cut by the char cap
-    or, for a first release, past the top-40 cutoff. Weight-0 files that are simply never
-    candidates (the normal "only flagged files are shown" filtering) are not reported.
+    Selection and order: _rank_files. A file that does not fit whole falls back to hunks; if its hunks do not
+    fit either, the top-ranked file ends the build (nothing renders: prepare raises InputTooLarge, as before F) and
+    any other file is skipped. Every selected file not rendered is listed in the not-shown block and appended to
+    `dropped` (in rank order: weighted files first). `unreadable` gets every added_binaries path; `shown` gets
+    {path: {"cls", "lines", "scopes"?}} for every rendered file (Task 5).
 
     `block_cap` pins the context-block cap (default: scaled from max_chars), so InputTooLarge can rebuild at a
     larger `needed` with the blocks at the size `needed` was measured with.
     """
     marker = _new_marker()
-    ranked_paths, by_path = _rank_files(diff, triage)
+    ranked_paths, by_path, cut = _rank_files(diff, triage)
     ranked_set = set(ranked_paths)
 
     # Surface WHERE triage drew attention (file:line, for files we actually send) but NOT the rule
@@ -356,13 +387,9 @@ def build_review_input(diff, triage, *, max_chars: int, dropped: list | None = N
     prior = getattr(diff, "baseline_unavailable", "")
     baseline = (f"\nbaseline: the prior release {_one_line(prior)[:100]} could not be fetched, so every file below "
                 "shows as (added); most of it existed before this release" if prior else "")
-    header = (
-        f"package: {diff.package}\nversion: {diff.version}\n"
-        f"is_first_release: {diff.is_first_release}{first}{baseline}"
-        + f"\ntriage_score: {triage.score:.0f}\n"
-        + f"untrusted_content_marker: {marker}\n"
-        + f"\n{marker}\n"
-    )
+    header = (f"package: {diff.package}\nversion: {diff.version}\n"
+              f"is_first_release: {diff.is_first_release}{first}{baseline}\n"
+              f"untrusted_content_marker: {marker}\n\n{marker}\n")
 
     # File paths are author-chosen (sdist member names), so the flagged locations are fenced too.
     loc_text = f"{_LOC_HEADING} {', '.join(seen)}" if seen else ""
@@ -374,44 +401,92 @@ def build_review_input(diff, triage, *, max_chars: int, dropped: list | None = N
     ctx = getattr(diff, "exec_context", "")
     block_cap = block_cap if block_cap is not None else _block_cap(max_chars)
     exec_text = _render_block(_EXEC_HEADING, ctx, min(_EXEC_MAX_CHARS, block_cap)) if ctx else ""
-    # Dependency / binary / ownership signals (B2): context the model can weigh, never content on its own.
+    # Dependency / ownership / publishing signals (B2): context the model can weigh, never content on its own.
     sig = getattr(diff, "signals", "")
     sig_text = _render_block(_SIG_HEADING, sig, min(_SIG_MAX_CHARS, block_cap)) if sig else ""
-    body_parts = [t for t in (loc_text, desc_text, exec_text, sig_text) if t]
-    # Exact: text = header + "\n".join(body_parts) + "\n" + marker + a note no longer than _NOTE_RESERVE.
-    used, truncated = len(header) + len("\n".join(body_parts)) + 1 + len(marker) + _NOTE_RESERVE, False
-    weights = _file_weights(triage)
-    rendered_paths = []
-    for path in ranked_paths:
-        rendered = _render_file(by_path[path])
+    new_cap = min(_NEW_BLOCK_MAX, block_cap)
+    ep = _endpoints(diff)
+    ep_text = _render_block(_ENDPOINTS_HEADING, "\n".join(ep), new_cap) if ep else ""
+    bins = getattr(diff, "added_binaries", ()) or ()
+    unread = differ.render_unreadable(bins) if bins else ""
+    un_text = _render_block(_UNREADABLE_HEADING, unread, new_cap) if unread else ""
+    body_parts = [t for t in (loc_text, desc_text, exec_text, sig_text, ep_text, un_text) if t]
+    # Exact: text = header + "\n".join(body_parts) + "\n" + marker + a note no longer than _NOTE_RESERVE; the
+    # not-shown block's real worst case (every selected path listed) is reserved up front so it always fits
+    # (plan review C2; Ruling F14). One selected file reserves ~90 chars, not the block cap.
+    reserve = _not_shown_reserve(diff, ranked_paths, cut, new_cap)
+    used = len(header) + len("\n".join(body_parts)) + 1 + len(marker) + _NOTE_RESERVE + reserve
+    truncated, weights = False, _file_weights(triage)
+    rendered_paths, rendered_text, skipped = [], {}, []
+    for i, path in enumerate(ranked_paths):
+        fd, cls = by_path[path], _cls(diff, path)
+        rendered = _render_file(fd, cls=cls)
         add = len(rendered) + (1 if body_parts else 0)
-        if used + add > max_chars:               # a whole file that does not fit falls back to its hunks
-            rendered = _render_file(by_path[path], whole=False)
+        if used + add > max_chars and fd.change_kind != "unchanged":   # a whole file falls back to its hunks
+            rendered = _render_file(fd, whole=False, cls=cls)
             add = len(rendered) + (1 if body_parts else 0)
-        if used + add > max_chars:
+        whole_only = fd.change_kind == "unchanged" and "\n@@ whole file" not in rendered
+        if used + add > max_chars or whole_only:
             truncated = True
-            # A weighted file, or the top-ranked one, that does not fit stops here (InputTooLarge keys on the top
-            # file). A zero-weight file after something rendered is skipped, so it cannot hide smaller ones.
-            if weights.get(path, 0.0) > 0.0 or not rendered_paths:
+            if i == 0 and not whole_only:        # the top-ranked file: nothing renders (InputTooLarge, as before F)
+                skipped = list(ranked_paths)
                 break
+            if weights.get(path, 0.0) > 0.0 or cls in _RUNNABLE:     # spec §3.2 `dropped`: runnable or weighted
+                skipped.append(path)                                 # (Ruling F16)
             continue
         body_parts.append(rendered)
         used += add
         rendered_paths.append(path)
+        rendered_text[path] = rendered
+    not_shown = skipped + [p for p in cut if p not in skipped]
+    if not_shown:
+        body_parts.append(_not_shown_block(diff, not_shown, new_cap))
 
     text = header + "\n".join(body_parts) + f"\n{marker}"
+    changed_paths = [fd.path for fd in diff.changed]
     if truncated:
         text += TRUNCATION_NOTE
-    elif len(ranked_paths) != len(diff.changed):
+    elif any(p not in rendered_text for p in changed_paths):
         text += FIRST_RELEASE_NOTE if diff.is_first_release else SELECTION_NOTE
     if dropped is not None:
-        rendered_set = set(rendered_paths)
-        dropped.extend(sorted((p for p in by_path if p not in rendered_set and weights.get(p, 0.0) > 0.0),
-                              key=lambda p: -weights[p]))
+        dropped.extend(not_shown)
+    if unreadable is not None:
+        unreadable.extend(b["path"] for b in bins if isinstance(b, dict) and isinstance(b.get("path"), str))
+    if shown is not None:
+        for p in rendered_paths:
+            shown[p] = _shown_entry(by_path[p], _cls(diff, p), "\n@@ whole file" in rendered_text[p])
     return text
 
 
-_CHANGE_KINDS = ("added", "removed", "modified")
+def _not_shown_line(diff, p) -> str:
+    return f"{_one_line(p)} ({_cls(diff, p)})"
+
+
+def _not_shown_block(diff, paths, cap) -> str:
+    lines = [_not_shown_line(diff, p) for p in paths[:40]]
+    if len(paths) > 40:
+        lines.append(f"… (+{len(paths) - 40} more)")
+    return _render_block(_NOT_SHOWN_HEADING, "\n".join(lines), cap)
+
+
+def _not_shown_reserve(diff, ranked_paths, cut, cap) -> int:
+    """The most the not-shown block can take, plus its newline: the block listing every selected path, longest
+    lines first. Any subset renders no longer: its first 40 lines are no longer than the 40 longest, and the
+    "+N more" count only shrinks. 0 when nothing is selected."""
+    paths = list(ranked_paths) + [p for p in cut if p not in ranked_paths]
+    paths.sort(key=lambda p: -len(_not_shown_line(diff, p)))
+    return len(_not_shown_block(diff, paths, cap)) + 1 if paths else 0
+
+
+def _endpoints(diff) -> list[str]:
+    return []          # Task 5
+
+
+def _shown_entry(fd, cls, whole) -> dict:
+    return {"cls": cls, "lines": {}}   # Task 5
+
+
+_CHANGE_KINDS = ("added", "removed", "modified", "unchanged")
 
 
 def dropped_from_text(fired_rules, text: str) -> list[str]:
@@ -436,9 +511,10 @@ def dropped_from_text(fired_rules, text: str) -> list[str]:
         if r.lines == (0, 0):
             continue
         weights[r.file] = weights.get(r.file, 0.0) + r.weight
-    lines = set(text.split("\n"))
+    lines = text.split("\n")
     return [p for p, w in sorted(weights.items(), key=lambda kv: -kv[1])
-            if w > 0.0 and not any(f"--- file: {_one_line(p)} ({k}) ---" in lines for k in _CHANGE_KINDS)]
+            if w > 0.0 and not any(ln.startswith(f"--- file: {_one_line(p)} ({k}") and ln.endswith(") ---")
+                                   for ln in lines for k in _CHANGE_KINDS)]
 
 
 def build_evidence(diff, triage, *, max_chars: int) -> str:
@@ -481,12 +557,12 @@ def build_evidence(diff, triage, *, max_chars: int) -> str:
 
 
 class InputTooLarge(Exception):
-    """The highest-risk file alone exceeds reviewer.max_input_chars. `text` is the review input built
-    with a cap of `needed` (context blocks kept at the size they had at `cap`), so it holds the top file and a
-    larger-context model can review it later without re-fetching."""
-    def __init__(self, needed: int, cap: int, text: str):
+    """The highest-risk file alone exceeds reviewer.max_input_chars. `text` is the review input built with a cap of
+    `needed` (context blocks kept at the size they had at `cap`), so it holds the top file and a larger-context model
+    can review it later without re-fetching; `shown` is that text's shown lines (spec F R2-4)."""
+    def __init__(self, needed: int, cap: int, text: str, shown: dict | None = None):
         super().__init__(f"needs {needed} chars, cap {cap}")
-        self.needed, self.cap, self.text = needed, cap, text
+        self.needed, self.cap, self.text, self.shown = needed, cap, text, shown or {}
 
 
 def _marker_of(review_input: str) -> str:
@@ -507,7 +583,7 @@ def _has_reviewable_content(review_input: str) -> bool:
         body = body.split("\n", 1)[1].lstrip() if "\n" in body else ""
     if body.startswith(_DESC_HEADING):               # heading line + one flattened description line
         body = body.split("\n", 2)[2] if body.count("\n") >= 2 else ""
-    for heading in _CONTEXT_HEADINGS:                # in render order: heading line + indented lines
+    for heading in _CONTEXT_HEADINGS + (_NOT_SHOWN_HEADING,):   # in render order: heading line + indented lines
         if body.lstrip().startswith(heading):
             rest = body.lstrip().split("\n")[1:]
             while rest and rest[0].startswith("  "):
@@ -538,21 +614,25 @@ class Reviewer:
         """Build the review input, or raise InputTooLarge if the highest-risk file can't fit in `cap`
         (default: max_input_chars; the guard passes the endpoint's measured cap).
 
-        Also stashes `self.dropped_files`: the weighted files the cap dropped from this build (see
-        build_review_input), so a benign verdict on this text can be told apart from a full review
-        (spec U2) without changing this method's return type."""
+        Also stashes what this build did not show (spec U2, F §3.4; Ruling F9): `self.dropped_files` (selected
+        files not rendered), `self.unreadable` (added_binaries paths) and `self.shown` (the rendered lines)."""
         cap = cap if cap is not None else self.cfg.reviewer.max_input_chars
-        self.dropped_files = []
-        text = build_review_input(diff, triage, max_chars=cap, dropped=self.dropped_files)
-        ranked_paths, by_path = _rank_files(diff, triage)
+        self.dropped_files, self.unreadable, self.shown = [], [], {}
+        text = build_review_input(diff, triage, max_chars=cap, dropped=self.dropped_files,
+                                  unreadable=self.unreadable, shown=self.shown)
+        ranked_paths, by_path, cut = _rank_files(diff, triage)
         if not _has_reviewable_content(text) and ranked_paths:
-            top = len(_render_file(by_path[ranked_paths[0]], whole=False))   # the smallest render that fits
+            top = len(_render_file(by_path[ranked_paths[0]], whole=False, cls=_cls(diff, ranked_paths[0])))
             if top:
-                needed = len(text) + _NOTE_RESERVE + top + 1
+                # The not-shown reserve is counted again (an upper bound): the text measured here already holds
+                # a not-shown block listing every selected path.
+                reserve = _not_shown_reserve(diff, ranked_paths, cut, min(_NEW_BLOCK_MAX, _block_cap(cap)))
+                needed = len(text) + _NOTE_RESERVE + top + 1 + reserve
                 # Blocks pinned at the size `needed` was measured with: scaled to `needed` they would grow and
                 # crowd the top file out again, and the stored text would hold nothing to review.
+                shown = {}
                 raise InputTooLarge(needed, cap, build_review_input(diff, triage, max_chars=needed,
-                                                                    block_cap=_block_cap(cap)))
+                                                                    block_cap=_block_cap(cap), shown=shown), shown)
         return text
 
     def review(self, diff, triage, *, attempt: int = 1) -> Verdict:

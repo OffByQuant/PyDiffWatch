@@ -85,7 +85,8 @@ def test_first_release_caps_to_top_40_files():
     d = Diff("p", "1.0", True, files, [])
     tr = TriageResult(100.0, rules, True)
     text = reviewer.build_review_input(d, tr, max_chars=1_000_000)
-    assert "m0.py" in text and "m59.py" not in text
+    assert "--- file: m0.py (" in text and "--- file: m59.py (" not in text
+    assert "  m59.py (import)" in text.split(reviewer._NOT_SHOWN_HEADING)[1]     # not shown, and said so (F R2-2)
 
 
 def test_build_evidence_renders_flagged_payload():

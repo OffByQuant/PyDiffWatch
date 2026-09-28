@@ -351,7 +351,8 @@ def test_a_large_pkg_info_never_crowds_setup_py_out_of_a_first_release_review(mo
     text = reviewer.build_review_input(differ.build_diff(art), TriageResult(50.0, [], True),
                                        max_chars=Config().reviewer.max_input_chars)
     lines = text.split("\n")
-    assert "--- file: setup.py (added) ---" in lines and "--- file: pyproject.toml (added) ---" in lines
+    assert ("--- file: setup.py (added; class=build) ---" in lines
+            and "--- file: pyproject.toml (added; class=data) ---" in lines)
     assert "PKG-INFO" not in text and "curl -sSL" not in text
 
 

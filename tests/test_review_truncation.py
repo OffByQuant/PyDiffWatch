@@ -48,7 +48,7 @@ def test_truncated_input_with_dropped_weighted_file_goes_to_adjudication(tmp_pat
     d = Diff("p", "1.0", False, [small, big], [])
     tr = TriageResult(50.0, [FiredRule("autoexec", 50.0, "setup.py", (1, 1)),
                              FiredRule("autoexec", 40.0, "big.py", (1, 1))], True)
-    cfg, conn, rid = _setup(tmp_path, max_input_chars=500)   # big.py can't fit; setup.py can
+    cfg, conn, rid = _setup(tmp_path, max_input_chars=700)   # big.py can't fit; setup.py can
     rvw = reviewer.Reviewer(cfg, backend=_FakeBackend([_benign_json()]))
 
     orchestrator._review_escalated(cfg, conn, rvw, d, tr, rid)
@@ -118,7 +118,7 @@ def test_offline_park_then_auto_drain_still_adjudicates_partial_review(tmp_path)
     d = Diff("p", "1.0", False, [small, big], [])
     tr = TriageResult(50.0, [FiredRule("autoexec", 50.0, "setup.py", (1, 1)),
                              FiredRule("autoexec", 40.0, "big.py", (1, 1))], True)
-    cfg, conn, rid = _setup(tmp_path, max_input_chars=500)   # big.py can't fit; setup.py can
+    cfg, conn, rid = _setup(tmp_path, max_input_chars=700)   # big.py can't fit; setup.py can
     # drain_pending only has store.pending_reviews()' triage_rules to recover weights from, so persist
     # them onto the release row the way _process_fetched normally does before parking.
     store.update_stage(conn, rid, "triaged", tr.score, json.dumps([r.__dict__ for r in tr.fired_rules]))
@@ -225,6 +225,7 @@ def test_dropped_from_text_resists_a_forged_heading_via_embedded_newline():
     tr = TriageResult(50.0, [FiredRule("autoexec", 40.0, "victim.py", (1, 1)),
                              FiredRule("autoexec", 50.0, forged_path, (1, 1))], True)
     # cap wide enough for the higher-weight (attacker) file alone, too small to also fit victim.py.
-    text = reviewer.build_review_input(d, tr, max_chars=502)   # 490 + the "\n@@ new L1-1" position line (spec H)
+    cap = next(c for c in range(200, 3_000) if "print(1)" in reviewer.build_review_input(d, tr, max_chars=c))
+    text = reviewer.build_review_input(d, tr, max_chars=cap)
     assert "print(1)" in text and "os.system('id')" not in text   # only the attacker file rendered
     assert reviewer.dropped_from_text(tr.fired_rules, text) == ["victim.py"]
