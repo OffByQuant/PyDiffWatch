@@ -302,8 +302,8 @@ in first-seen order, at most 30. They are listed for the model to weigh, never f
 **Not readable as text.** A `--- not readable as text (changed files DiffWatch could not show you) ---`
 block lists every changed file DiffWatch could not show as text — a binary, an oversized member, or one in a
 foreign (non-Python) language — with its size and the reason it couldn't be shown. A changed non-source file
-under the size limit (a `.sh` script, say) is not held back for this reason: it is simply shown as text like
-any other changed file, so it is never listed here.
+under the size limit (a `.sh` script, say) is not recorded at all: the model neither sees it nor is told it
+exists.
 
 **Not shown.** A `--- not shown (selected files that did not fit; you did not see them) ---` block lists,
 by path and class, any selected file that did not fit the input and so was left out — the model is told it
@@ -576,11 +576,12 @@ then suspicious, then not-scanned/partial-review, then benign:
   (rendered as **NOT SCANNED** — the badge's CSS uppercases it, same as every other badge), the recorded
   reason, a plain PyPI link, and **no** report button — nobody has looked at the code, so there's nothing
   to report.
-- **Partial review** — the model reviewed the release but not all of it: a benign verdict parked for
-  adjudication because some flagged content was dropped from its input (spec U2). Badge text
-  `partial review` (**PARTIAL REVIEW**). The card still shows the model's own classification
-  (`model: benign`) and only carries a report button if the model called that partial review malicious or
-  suspicious.
+- **Partial review** — the model reviewed the release but couldn't see or read every selected file: a
+  `benign` verdict, or a `suspicious` one that quoted no chain, routed to `reviewed_partial` instead of
+  being saved silently or alerted (§10). A `malicious` verdict never lands here — it goes through the chain
+  gate instead. Badge text `partial review` (**PARTIAL REVIEW**). The card still shows the model's own
+  classification (`model: benign` or `model: suspicious`) and only carries a report button when that
+  classification is `suspicious`.
 
 A release still waiting for a model review has no card; the status strip counts it by reason. A label you give
 such a release shows `no model review` instead of what the model said.
