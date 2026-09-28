@@ -3,6 +3,7 @@ JSON of each project that changed since the cursor. PyPI's XML-RPC changelog is 
 deprecation", docs.pypi.org/api/) and returned 503 from 2026-09-28; this replaces it. The cursor stays a serial.
 A removal no longer arrives as an event: the fetcher's 404 path (fetcher.Removed) catches it, so `removed_at`
 stays None."""
+import datetime
 import email.message
 import gzip
 import io
@@ -10,10 +11,13 @@ import json
 import logging
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 from .config import Config
-from .fetcher import read_body
+from .fetcher import RefusedToFetch, read_body
+from .models import NewRelease
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +32,11 @@ class Changes(list):
     """Releases a poll found, in ascending serial, plus `ceiling`: the highest serial the cursor may reach once
     every listed release is terminal (the index's own serial, lowered below any project this poll could not
     resolve, or cut by a per-run cap). A plain list (a test stub) has no ceiling: the cursor then advances only
-    to listed serials."""
+    to listed serials. `complete`: True only when the ceiling reached the index's own serial untouched — no
+    project was held, stale or cut, and no release cap lowered it (Task 3 uses this to decide whether the
+    poll fully caught the index up)."""
     ceiling: int | None = None
+    complete: bool = False
 
 
 def _get(cfg: Config, url: str, headers: dict, limit: int, deadline: float):
@@ -114,5 +121,117 @@ def current_serial(cfg: Config) -> int | None:
         return None
 
 
+_WHEEL_ONLY = ("no_sdist", "no_sdist_wait")
+
+
+def _when(ts):
+    """An aware UTC datetime from PyPI's `upload_time_iso_8601` (or our stored floor); None when unparseable.
+    Compared as datetimes, never as strings: `...Z` and `...+00:00` do not sort alike."""
+    if not isinstance(ts, str):
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=datetime.UTC)
+
+
+def _fetch_summary(cfg: Config, name: str):
+    """Fetch one project's /pypi/<name>/json and reduce it to (served serial, display name, {version: (first
+    upload as an aware datetime, has an sdist)}) — never the parsed JSON itself, so the thread pool never holds
+    every changed project's full document at once (a big project's JSON runs several MB, and a tick may fetch
+    up to `max_projects_per_run` of them). (None, None, None) for a 404. Malformed shapes give an empty version
+    map; versions with no parseable upload time are skipped."""
+    try:
+        _, hdrs, body = _get(cfg, f"{cfg.pypi_base}/pypi/{urllib.parse.quote(name, safe='')}/json",
+                             {"Accept": "application/json"}, cfg.max_metadata_bytes, cfg.packument_deadline_s)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None, None, None
+        raise
+    data = json.loads(body)
+    raw = hdrs.get("X-PyPI-Last-Serial") or (data.get("last_serial") if isinstance(data, dict) else None)
+    served = int(raw)
+    info = data.get("info") if isinstance(data, dict) else None
+    releases = data.get("releases") if isinstance(data, dict) else None
+    if not isinstance(info, dict) or not isinstance(info.get("name"), str) or not isinstance(releases, dict):
+        return served, None, {}
+    versions = {}
+    for ver, files in releases.items():
+        if not isinstance(files, list) or not files:
+            continue
+        times = [_when(f.get("upload_time_iso_8601")) for f in files if isinstance(f, dict)]
+        times = [t for t in times if t is not None]
+        if not times:
+            continue
+        has_sdist = any(isinstance(f, dict) and f.get("packagetype") == "sdist" for f in files)
+        versions[ver] = (min(times), has_sdist)
+    return served, info["name"], versions
+
+
+def _new_versions(pkg, versions, serial: int, floor, stage) -> list[NewRelease]:
+    """The versions of one changed project to hand the orchestrator, from `_fetch_summary`'s reduced form:
+    unseen ones first uploaded at/after the floor (every unseen one when floor is None), and wheel-only ones
+    whose sdist has now arrived. `pkg` is None when the project's JSON was malformed: nothing to emit."""
+    if pkg is None:
+        return []
+    out = []
+    for ver, (first_upload, has_sdist) in versions.items():
+        st = stage(pkg, ver)
+        if st is None and (floor is None or first_upload >= floor):
+            out.append(NewRelease(pkg, ver, serial))
+        elif st in _WHEEL_ONLY and has_sdist:
+            out.append(NewRelease(pkg, ver, serial, new_release=False, sdist_upload=True))
+    return out
+
+
 def changes_since(cfg: Config, since_serial: int, *, floor=None, stage=None) -> Changes:
-    return Changes()   # Task 2
+    """Releases in projects whose index serial is above `since_serial`, ascending serial, with `ceiling` set
+    (spec: Design 1-4). `floor` (ISO-8601 UTC) bounds which unseen versions count as new; `stage(pkg, ver)` is the
+    store's stage lookup, called only on this thread. Never raises: an index failure returns an empty Changes
+    with no ceiling, so the cursor holds and the next tick retries."""
+    stage = stage or (lambda p, v: None)
+    floor = _when(floor)                                # None (backfill, or unparseable) accepts every unseen version
+    try:
+        meta, changed = _changed(_index_text(cfg), since_serial)
+    except Exception as e:
+        logger.warning("PyPI simple index unavailable (%s: %s); retrying from serial %d next tick",
+                       type(e).__name__, e, since_serial)
+        return Changes()
+    ceiling = meta
+    if len(changed) > cfg.max_projects_per_run:
+        ceiling = min(ceiling, changed[cfg.max_projects_per_run][0] - 1)
+        changed = changed[:cfg.max_projects_per_run]
+
+    def fetch(item):
+        try:
+            return _fetch_summary(cfg, item[1])
+        except Exception as e:
+            return e
+    with ThreadPoolExecutor(max_workers=max(1, cfg.fetch_concurrency)) as ex:
+        results = list(ex.map(fetch, changed))
+    out = []
+    for (serial, name), got in zip(changed, results):
+        if isinstance(got, RefusedToFetch):
+            # Permanently over cfg.max_metadata_bytes: never fetchable, so never let it freeze the cursor.
+            logger.error("PyPI JSON for %s refused (%s); skipping it (over the metadata size cap)", name, got)
+            continue
+        if isinstance(got, Exception):
+            logger.warning("PyPI JSON for %s failed (%s: %s); cursor held below serial %d",
+                           name, type(got).__name__, got, serial)
+            ceiling = min(ceiling, serial - 1)
+            continue
+        served, pkg, versions = got
+        if served is None:
+            continue                                    # 404: project gone, nothing new to scan
+        if served < serial:                             # a stale CDN copy: re-read it next tick
+            ceiling = min(ceiling, serial - 1)
+        out.extend(_new_versions(pkg, versions, serial, floor, stage))
+    out.sort(key=lambda r: r.serial)
+    if len(out) > cfg.max_releases_per_run:
+        ceiling = min(ceiling, out[cfg.max_releases_per_run].serial - 1)
+        out = out[:cfg.max_releases_per_run]
+    res = Changes(out)
+    res.ceiling = ceiling
+    res.complete = (ceiling == meta)
+    return res

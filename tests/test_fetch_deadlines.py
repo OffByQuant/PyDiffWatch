@@ -91,16 +91,13 @@ def test_index_requests_carry_the_socket_timeout(monkeypatch):
     assert seen == [17.0, 17.0]
 
 
-def test_a_failed_changelog_call_is_logged_and_keeps_the_cursor(monkeypatch, caplog):
-    class Proxy:
-        def __init__(self, *a, **k):
-            pass
-
-        def changelog_since_serial(self, s):
-            raise TimeoutError("timed out")
-    monkeypatch.setattr(ingest.xmlrpc.client, "ServerProxy", Proxy)
+def test_a_failed_index_call_is_logged_and_keeps_the_cursor(monkeypatch, caplog):
+    def boom(*a):
+        raise TimeoutError("timed out")
+    monkeypatch.setattr(ingest, "_get", boom)
     with caplog.at_level(logging.WARNING):
-        assert ingest.changes_since(Config(), 1) == []
+        got = ingest.changes_since(Config(), 1)
+    assert list(got) == [] and got.ceiling is None
     assert "timed out" in caplog.text
 
 

@@ -158,18 +158,6 @@ def test_prune_keeps_the_waiting_and_the_switch_rows(tmp_cfg, monkeypatch, capsy
 
 # --- the upload race -------------------------------------------------------------------------------------
 
-def test_ingest_carries_sdist_uploads_and_merges_them_with_the_release(monkeypatch):
-    _proxy(monkeypatch, [
-        ("a", "1.0", 0, "new release", 10),
-        ("a", "1.0", 0, "add source file a-1.0.tar.gz", 11),    # same batch as its release: one item
-        ("b", "2.0", 0, "add py3 file b-2.0-py3-none-any.whl", 12),  # a wheel upload: ignored
-        ("c", "3.0", 0, "add source file c-3.0.tar.gz", 13),    # an sdist upload on its own
-    ])
-    out = ingest.changes_since(Config(), since_serial=0)
-    assert [(r.package, r.version, r.serial, r.new_release, r.sdist_upload) for r in out] == [
-        ("a", "1.0", 10, True, True), ("c", "3.0", 13, False, True)]      # a merged item keeps its FIRST serial
-
-
 def test_a_merged_release_is_not_lost_when_the_per_run_cap_cuts_its_sdist_event(tmp_cfg, monkeypatch):
     metas = {p: _meta(p, [("1.0", "2026-01-01T00:00:00Z", True)]) for p in "xabc"}
     _pypi(monkeypatch, metas)
