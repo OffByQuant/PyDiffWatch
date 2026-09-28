@@ -49,13 +49,35 @@ def cited(verdict) -> bool:
             and bool(clean(getattr(verdict, "chain_sink", None))))
 
 
-def _tokens(text: str) -> list:
+_CLOSERS = ('"""', "'''", '"', "'")
+
+
+def _raw_tokens(text: str) -> list | None:
+    """`text`'s tokens in full, or None on any tokenize error (an incomplete list would misread the line)."""
     out = []
     try:
         for t in tokenize.generate_tokens(io.StringIO(text.strip() + "\n").readline):
             out.append(t)
+        return out
     except (tokenize.TokenError, IndentationError, SyntaxError):
-        pass
+        return None
+
+
+def _tokens(text: str) -> list:
+    """A shown line's tokens, isolated from the rest of its file. A line that is really the tail end of a string
+    opened on an earlier (unshown) line — the closing line of a multi-line string argument (fix R2) — reads on
+    its own as an unterminated string and fails to tokenize; retried after the first quote run in the text, so
+    the real code that follows it still tokenizes."""
+    out = _raw_tokens(text)
+    if out is None:
+        for closer in _CLOSERS:
+            i = text.find(closer)
+            if i >= 0:
+                out = _raw_tokens(text[i + len(closer):])
+                if out is not None:
+                    break
+        else:
+            out = []
     return [t for t in out if t.type not in _NOISE]
 
 
@@ -87,7 +109,11 @@ def _live(text: str) -> bool:
 def _names(text: str) -> set:
     """Identifiers a line binds or reads (Ruling F3): keywords and builtins out; a name used only as a dotted
     receiver (`os` in `os.getenv(...)`) out; names a `for` on the line binds out; a keyword-argument NAME
-    (`timeout` in `f(timeout=5)`) out — its value still counts (fix I2)."""
+    (`timeout` in `f(timeout=5)`) out — its value still counts (fix I2). Tokenizing is per shown line, so a
+    continuation line reads as depth 0 even when it is really inside a call opened on an earlier line; a NAME
+    followed by `=` there is still a kwarg name when the line's own bracket balance is negative (it closes more
+    than it opens — e.g. a lone `timeout=5)`), or when the NAME is the line's first token and the line ends with
+    `,` (e.g. a black-formatted `data=token,`) (fix R1)."""
     toks = _tokens(text)
     loop, bound = set(), False
     for t in toks:
@@ -97,6 +123,8 @@ def _names(text: str) -> set:
             bound = False
         elif bound and t.type == tokenize.NAME:
             loop.add(t.string)
+    net = sum(1 for t in toks if t.string in ("(", "[", "{")) - sum(1 for t in toks if t.string in (")", "]", "}"))
+    ends_comma = bool(toks) and toks[-1].string == ","
     free: set = set()
     depth = 0
     for i, t in enumerate(toks):
@@ -110,7 +138,7 @@ def _names(text: str) -> set:
             continue                                          # an attribute, not a variable
         if i + 1 < len(toks) and toks[i + 1].string == ".":
             continue                                          # only a receiver here
-        if depth > 0 and i + 1 < len(toks) and toks[i + 1].string == "=":
+        if i + 1 < len(toks) and toks[i + 1].string == "=" and (depth > 0 or net < 0 or (ends_comma and i == 0)):
             continue                                          # a keyword-argument name, not a read
         free.add(t.string)
     return free
@@ -136,18 +164,19 @@ def _hits(idx, pairs, strings) -> list | None:
 
 
 def _bound(text: str) -> set:
-    """Names a line binds (plan review I6): targets before a top-level `=` (not `==`, `<=`, ...), a `:=` at any
-    depth (fix m6 — a parenthesised walrus like `if (k := f()):` still binds `k`), names between `for` and `in`,
-    and the name after `as`. Never a keyword, a builtin, or a dotted part."""
+    """Names a line binds (plan review I6): targets before a top-level `=` (not `==`, `<=`, ...); for a `:=` at
+    any depth, ONLY the single NAME directly before it (fix R3 — `if check(k := f()):` binds `k`, not `check`;
+    fix m6 for the parenthesised case); names between `for` and `in`; and the name after `as`. Never a keyword,
+    a builtin, or a dotted part."""
     toks = _tokens(text)
-    out, depth, eq = set(), 0, None
+    out, depth, eq, walrus = set(), 0, None, False
     for i, t in enumerate(toks):
         if t.string in ("(", "[", "{"):
             depth += 1
         elif t.string in (")", "]", "}"):
             depth -= 1
         elif t.type == tokenize.OP and t.string == ":=":
-            eq = i
+            eq, walrus = i, True
             break
         elif depth == 0 and t.type == tokenize.OP and t.string == "=":
             eq = i
@@ -156,7 +185,11 @@ def _bound(text: str) -> set:
                          and not (k and toks[k - 1].string == ".") and not (k + 1 < len(toks)
                                                                              and toks[k + 1].string == ".")}
     if eq is not None:
-        out |= names([(k, toks[k]) for k in range(eq)])
+        if walrus:
+            if eq:
+                out |= names([(eq - 1, toks[eq - 1])])
+        else:
+            out |= names([(k, toks[k]) for k in range(eq)])
     for k, t in enumerate(toks):
         if t.string == "for":
             j = k + 1

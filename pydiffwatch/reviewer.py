@@ -557,17 +557,49 @@ def _is_str(node) -> bool:
     return isinstance(node, ast.JoinedStr) or (isinstance(node, ast.Constant) and isinstance(node.value, str))
 
 
-def _string_lines(tree) -> list:
-    """1-based line numbers lying inside a string constant (fix I3b): every line of a bare-string expression
-    statement (a docstring, a bare string, a doctest) in full, plus the interior lines (lineno+1..end_lineno) of
-    any other string constant that spans more than one line — its own first line still carries real code."""
+def _blank_outside(line: str, start_byte, end_byte) -> bool:
+    """True when the parts of `line` before `start_byte` and/or after `end_byte` hold nothing but whitespace or a
+    trailing `#` comment (fix R2). `None` skips that side's check (it is inside the string by construction).
+    ast column offsets are UTF-8 BYTE offsets, so they are converted back to character indices before slicing."""
+    b = line.encode("utf-8")
+
+    def to_char(i):
+        return len(b[:i].decode("utf-8"))
+
+    def blank(s):
+        s = s.strip()
+        return not s or s.startswith("#")
+
+    left = line[:to_char(start_byte)] if start_byte is not None else ""
+    right = line[to_char(end_byte):] if end_byte is not None else ""
+    return blank(left) and blank(right)
+
+
+def _string_lines(tree, source_lines) -> list:
+    """1-based line numbers whose every non-whitespace, non-comment character lies inside a string constant (fix
+    I3b, precision fix R2): the full span of a bare-string expression statement (a docstring, a bare string, a
+    doctest), the always-covered interior lines of any string spanning more than one line, and that span's first
+    (bare only) / last line only when nothing but the string (and maybe a comment) shares that physical line —
+    a line that also holds real code outside the string's span is dropped, even at a span's edge."""
     out: set[int] = set()
+
+    def add_span(lineno, col, end_lineno, end_col, bare):
+        if lineno == end_lineno:
+            if bare and _blank_outside(source_lines[lineno - 1], col, end_col):
+                out.add(lineno)
+            return
+        if bare and _blank_outside(source_lines[lineno - 1], col, None):
+            out.add(lineno)
+        out.update(range(lineno + 1, end_lineno))            # interior lines: always fully inside the string
+        if _blank_outside(source_lines[end_lineno - 1], None, end_col):
+            out.add(end_lineno)
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Expr) and _is_str(node.value):
             v = node.value
-            out.update(range(v.lineno, (v.end_lineno or v.lineno) + 1))
+            add_span(v.lineno, v.col_offset, v.end_lineno or v.lineno, v.end_col_offset, bare=True)
         elif _is_str(node) and (node.end_lineno or node.lineno) > node.lineno:
-            out.update(range(node.lineno + 1, node.end_lineno + 1))
+            add_span(node.lineno, node.col_offset, node.end_lineno, node.end_col_offset, bare=False)
     return sorted(out)
 
 
@@ -584,7 +616,7 @@ def _shown_entry(fd, cls, whole) -> dict:
     if tree is not None:
         scopes = _scopes(tree)
         entry["scopes"] = {n: scopes.get(n, "module") for n in lines}
-        strings = set(_string_lines(tree))
+        strings = set(_string_lines(tree, fd.new_text.splitlines()))
         entry["strings"] = sorted(n for n in lines if n in strings)
     return entry
 

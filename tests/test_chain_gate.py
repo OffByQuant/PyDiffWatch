@@ -261,3 +261,69 @@ def test_an_at_marker_prefix_is_stripped_not_the_whole_line():
 
 def test_the_fixture_chain_still_passes_after_fix_round_1():
     assert chain.gate(_v(), chains.SHOWN) == ""
+
+
+# ---- Fix round 2 (controller rulings) ----
+
+def test_a_continuation_line_kwarg_name_is_not_a_shared_identifier():
+    # R1: `timeout=5)` alone (its own physical line) tokenizes at depth 0, but its net bracket balance is
+    # negative, so `timeout` must still read as a kwarg name, not a shared identifier.
+    text = ("import subprocess, requests\ndef f():\n    r = requests.get(URL,\n        timeout=5)\n"
+            + "pass\n" * 60 + "def g():\n    subprocess.run(CMD, env=E,\n        timeout=9)\n")
+    v = _v(chain_source="r = requests.get(URL,\n        timeout=5)",
+           chain_sink="subprocess.run(CMD, env=E,\n        timeout=9)")
+    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == "no dataflow shown between source and sink"
+
+
+def test_names_excludes_a_continuation_line_kwarg_but_a_plain_assignment_still_binds():
+    assert chain._names("        timeout=5)") == set()
+    assert chain._names("x = 1") == {"x"}
+
+
+def test_a_black_formatted_kwarg_value_on_its_own_line_still_connects():
+    # R1: `data=token,` is its own physical line, first token, ending in ','; `data` is a kwarg name (excluded)
+    # but `token` (the value) still counts, so the real chain still stands.
+    text = ("import os, requests\ntoken = os.getenv('K')\n" + "pass\n" * 80
+            + "requests.post(\n    url,\n    data=token,\n)\n")
+    v = _v(chain_source="token = os.getenv('K')", chain_sink="requests.post(\n    url,\n    data=token,\n)")
+    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == ""
+
+
+def test_real_code_after_a_bare_empty_string_statement_is_found():
+    # R2: only `""` lies inside the string; `; requests.post(...)` is real code sharing the same physical line.
+    text = 'import os, requests\ntoken = os.getenv("K")\n""; requests.post(U, data=token)\n'
+    v = _v(chain_source='token = os.getenv("K")', chain_sink='""; requests.post(U, data=token)')
+    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == ""
+
+
+def test_real_code_on_the_closing_line_of_a_multiline_string_argument_is_found():
+    # R2: the string closes partway through the line; the rest of that line (the real requests.post call) is code.
+    text = 'import os, requests\ntoken = os.getenv("K")\nx = foo("""abc\ndef""", requests.post(U, data=token))\n'
+    v = _v(chain_source='token = os.getenv("K")', chain_sink='def""", requests.post(U, data=token))')
+    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == ""
+
+
+def test_string_line_precision_uses_char_offsets_not_utf8_byte_offsets():
+    # R2: a non-ASCII character before the boundary must not shift it — the trailing ';' after the closing ""\"
+    # is real code and must exclude this line from "strings" (a naive byte-as-char slice would drop it entirely
+    # and wrongly mark the line as pure string).
+    text = 'x = 1\n"""\né""";\ny = 2\n'
+    entry = reviewer._shown_entry(FileDiff("a.py", "modified", [], text), "build", whole=True)
+    assert entry["strings"] == [2]
+
+
+def test_a_walrus_binds_only_the_name_directly_before_it():
+    # R3
+    assert chain._bound("if check(k := os.getenv('K')):") == {"k"}
+    assert chain._bound("requests.post(U, data=(t := token))") == {"t"}
+
+
+def test_the_walrus_hop_test_still_passes_after_fix_round_2():
+    text = ("import os, requests\nif (k := os.getenv('K')):\n    pass\n" + "pass\n" * 80
+            + "def g():\n    v = k\n    requests.post(U, json=v)\n")
+    v = _v(chain_source="if (k := os.getenv('K')):", chain_sink="requests.post(U, json=v)")
+    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == ""
+
+
+def test_the_fixture_chain_still_passes_after_fix_round_2():
+    assert chain.gate(_v(), chains.SHOWN) == ""
