@@ -3,8 +3,10 @@ bytes — §6.1), builds a compact injection-delimited prompt over triage-flagge
 pluggable backend (local Qwen by default, Claude optionally — see backends.py) for a verdict under a
 forced structured-output contract. This module owns the prompt/schema/parsing only; all model I/O
 and network egress live in the backend, keeping the diff-handling code network-free (containment)."""
+import array
 import ast
 import bisect
+import itertools
 import json
 import logging
 import math
@@ -559,6 +561,12 @@ def _is_str(node) -> bool:
 
 
 _AST_BREAK = re.compile(r"\r\n|\r|\n")      # the tokenizer's line breaks; str.splitlines also splits on \x0c etc.
+_NON_SPACE = re.compile(r"\S")
+
+
+def _utf8_len(c: str) -> int:
+    o = ord(c)
+    return 1 if o < 0x80 else 2 if o < 0x800 else 3 if o < 0x10000 else 4
 
 
 class _Positions:
@@ -575,13 +583,22 @@ class _Positions:
             self.spans.append((pos, pos + len(piece.splitlines()[0])))
             pos += len(piece)
         self.starts = [st for st, _ in self.spans]
+        self._byte_starts = {}                           # ast line index -> each char's UTF-8 byte offset (G2)
 
     def offset(self, lineno: int, byte_col: int) -> int:
-        """An ast (line, UTF-8 byte column) as an absolute character offset; a cut multibyte char is dropped."""
+        """An ast (line, UTF-8 byte column) as an absolute character offset; a cut multibyte char is dropped. Each
+        line's byte table is built once, so many strings on one long line map in linear time (fix G2)."""
         i = min(max(lineno, 1), len(self.ast_starts)) - 1
         start = self.ast_starts[i]
         end = self.ast_starts[i + 1] if i + 1 < len(self.ast_starts) else len(self.text)
-        return start + len(self.text[start:end].encode("utf-8")[:max(byte_col, 0)].decode("utf-8", errors="ignore"))
+        if i not in self._byte_starts:
+            line = self.text[start:end]
+            self._byte_starts[i] = None if line.isascii() else array.array(   # 8 bytes a char, not a list's ~36
+                "q", itertools.accumulate(map(_utf8_len, line), initial=0))
+        table = self._byte_starts[i]
+        if table is None:
+            return start + min(max(byte_col, 0), end - start)
+        return start + max(bisect.bisect_right(table, byte_col) - 1, 0)
 
     def shown_line(self, offset: int) -> int:
         """The 1-based shown line holding `offset`."""
@@ -592,9 +609,10 @@ class _Positions:
         return bisect.bisect_right(self.ast_starts, self.spans[n - 1][0])
 
 
-def _blank(s: str) -> bool:
-    s = s.strip()
-    return not s or s.startswith("#")
+def _blank(text: str, a: int, b: int) -> bool:
+    """True when text[a:b] holds nothing but whitespace or a `#` comment; scans only up to its first non-space."""
+    m = _NON_SPACE.search(text, a, b)
+    return m is None or text[m.start()] == "#"
 
 
 def _string_nodes(tree):
@@ -619,13 +637,13 @@ def _string_lines(tree, pos) -> list:
         first, last = pos.shown_line(o1), pos.shown_line(o2)
         (s1, _), (_, e2) = pos.spans[first - 1], pos.spans[last - 1]
         if first == last:
-            if bare and _blank(text[s1:o1]) and _blank(text[o2:e2]):
+            if bare and _blank(text, s1, o1) and _blank(text, o2, e2):
                 out.add(first)
             continue
-        if bare and _blank(text[s1:o1]):
+        if bare and _blank(text, s1, o1):
             out.add(first)
         out.update(range(first + 1, last))              # interior lines: always fully inside the string
-        if _blank(text[o2:e2]):
+        if _blank(text, o2, e2):
             out.add(last)
     return sorted(out)
 
@@ -641,15 +659,35 @@ def _string_tails(tree, pos) -> dict:
         o1, o2 = pos.offset(node.lineno, node.col_offset), pos.offset(node.end_lineno, node.end_col_offset)
         last = pos.shown_line(o2)
         start, end = pos.spans[last - 1]
-        if last > pos.shown_line(o1) and not _blank(pos.text[o2:end]):
+        if last > pos.shown_line(o1) and not _blank(pos.text, o2, end):
             out[last] = max(o2 - start, out.get(last, -1))
     return out
+
+
+def _field_code(tree, pos) -> dict:
+    """{shown line: the code of every f-string replacement field (`{...}`, format-spec fields included) on that
+    line, joined by spaces} (fix G1): that code is real, though it sits inside an f-string's span. A bare f-string
+    statement's fields are left out: the whole statement stays a string line, as before."""
+    bare = {id(c) for n in ast.walk(tree) if isinstance(n, ast.Expr) and isinstance(n.value, ast.JoinedStr)
+            for c in ast.walk(n.value)}
+    out: dict[int, list] = {}
+    for fv in ast.walk(tree):
+        if not (isinstance(fv, ast.FormattedValue) and fv.value.end_lineno) or id(fv) in bare:
+            continue
+        o1 = pos.offset(fv.value.lineno, fv.value.col_offset)
+        o2 = pos.offset(fv.value.end_lineno, fv.value.end_col_offset)
+        for n in range(pos.shown_line(o1), pos.shown_line(o2) + 1):
+            s, e = pos.spans[n - 1]
+            if seg := pos.text[max(o1, s):min(o2, e)].strip():
+                out.setdefault(n, []).append((max(o1, s), seg))
+    return {n: " ".join(seg for _, seg in sorted(segs)) for n, segs in out.items()}
 
 
 def _shown_entry(fd, cls, whole) -> dict:
     """The lines a rendered file put in front of the model (added lines, or every line of a whole-file render),
     by new-file line number, with each line's scope, whether it lies inside a string constant, and (fix R3) a
-    string-tail column for a line where a multi-line string ends mid-line with real code after it — when the
+    string-tail column for a line where a multi-line string ends mid-line with real code after it, and (fix G1)
+    the field code of a line otherwise inside a string but holding f-string `{...}` code — when the
     file parses (spec F §3.2 `shown`). Line numbers are the differ's str.splitlines() numbering throughout; ast
     positions are mapped onto it (fix F2)."""
     if whole:
@@ -663,22 +701,27 @@ def _shown_entry(fd, cls, whole) -> dict:
         scopes = _scopes(tree)
         entry["scopes"] = {n: scopes.get(pos.ast_line(n), "module") if n <= len(pos.spans) else "module"
                            for n in lines}
-        strings = set(_string_lines(tree, pos))
-        entry["strings"] = sorted(n for n in lines if n in strings)
+        strings, fields = set(_string_lines(tree, pos)), _field_code(tree, pos)
+        entry["strings"] = sorted(n for n in lines if n in strings and n not in fields)
+        if code := {n: fields[n] for n in lines if n in strings and n in fields}:
+            entry["fields"] = code                      # a string line holding `{...}` code: that code only (G1)
         tails = {n: c for n, c in _string_tails(tree, pos).items() if n in lines}
         if tails:
             entry["tails"] = tails
     return entry
 
 
+_LINE_KEYED = ("lines", "scopes", "tails", "fields")      # shown entry maps keyed by line number
+
+
 def shown_to_json(shown) -> str:
-    return json.dumps({p: {k: ({str(n): v for n, v in e[k].items()} if k in ("lines", "scopes", "tails") else e[k])
+    return json.dumps({p: {k: ({str(n): v for n, v in e[k].items()} if k in _LINE_KEYED else e[k])
                            for k in e} for p, e in (shown or {}).items()})
 
 
 def shown_from_json(s) -> dict:
     raw = json.loads(s) if s else {}
-    return {p: {k: ({int(n): v for n, v in e[k].items()} if k in ("lines", "scopes", "tails") else e[k]) for k in e}
+    return {p: {k: ({int(n): v for n, v in e[k].items()} if k in _LINE_KEYED else e[k]) for k in e}
             for p, e in raw.items()}
 
 

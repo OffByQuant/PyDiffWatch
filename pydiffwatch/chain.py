@@ -191,13 +191,21 @@ def _near(a, b, scopes) -> bool:
     return sa is not None and sa == sb and (sa != "module" or abs(a - b) <= _MODULE_SPAN)
 
 
+def _cuts(entry) -> dict:
+    """{line: string-tail column (int) or f-string field code (str)} for `_text_at`; a tail wins (fix G1)."""
+    return {**(entry.get("fields") or {}), **(entry.get("tails") or {})}
+
+
 def _text_at(n, lines, tails) -> str:
     """The text to tokenize for shown line `n` (fix R3): from its recorded string-tail column onward when one is
     present (a line that is really the tail of a multi-line string, with real code following the string's close
-    on that same line — reviewer's "tails"), else the whole line."""
+    on that same line — reviewer's "tails"); for a line inside an f-string, only its `{...}` field code
+    (reviewer's "fields", fix G1); else the whole line. `tails` is `_cuts(entry)`."""
     text = lines.get(n, "")
-    col = tails.get(n)
-    return text[col:] if col is not None else text
+    cut = tails.get(n)
+    if isinstance(cut, str):
+        return cut
+    return text[cut:] if cut is not None else text
 
 
 def _anchors(hits, lines, tails) -> list:
@@ -219,7 +227,7 @@ def _connected(src_hits, snk_hits, entry) -> bool:
     hop without scopes; never two.
     Only anchor lines (fix I1) supply names or positions for (a)/(b); the hop's hit end is likewise anchor-only."""
     lines = entry.get("lines") or {}
-    tails = entry.get("tails") or {}
+    tails = _cuts(entry)
     src = _anchors(src_hits, lines, tails)
     snk = _anchors(snk_hits, lines, tails)
     if not src or not snk:
@@ -251,7 +259,7 @@ def _gate_file(verdict, path, entry, src_hits, snk_hits) -> str:
     if cls in (None, "unknown"):
         return f"chain is in unclassified code ({path})"
     lines = entry.get("lines") or {}
-    tails = entry.get("tails") or {}
+    tails = _cuts(entry)
     if not any(_live(_text_at(n, lines, tails)) for ns in src_hits for n in ns):
         return "source is only a comment or a string"
     if not any(_live(_text_at(n, lines, tails)) for ns in snk_hits for n in ns):

