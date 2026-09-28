@@ -690,6 +690,36 @@ def seed_now(cfg: Config):
     return s
 
 
+def _alert_project(cfg, conn, name, serial, stage, what):
+    """The project-level unscanned alert: a project whose new releases the ingest could not list (its JSON was
+    refused, or it held the cursor for max_hold_ticks and was passed). It is recorded as a synthetic release
+    `<name>==*` at a terminal stage, so it waits in `pending` like any unscanned release; version `*` is never
+    in a project's JSON, so nothing ever downloads it."""
+    rid = store.record_release(conn, name, "*", serial, False, None, "sdist")
+    store.update_stage(conn, rid, stage)
+    _alert_unscanned(cfg, conn, rid, name, "*",
+                     f"UNREVIEWED: {what}, so new releases in project {name} could not be listed. "
+                     f"Not scanned. Needs manual review.", stage=stage)
+
+
+def _note_holds(cfg, conn, holds, held):
+    """Count, per (project, index serial), the ticks it has held the cursor, in meta `ingest_holds`. A project
+    no longer held is dropped; a new serial restarts its count. At max_hold_ticks it alerts once, and from the
+    next tick on it no longer holds (run_once passes it in release_holds)."""
+    now = {}
+    for name, serial, why in held:
+        was = holds.get(name)
+        ticks = was["ticks"] + 1 if was and was["serial"] == serial else 1
+        now[name] = {"serial": serial, "ticks": ticks}
+        if ticks == cfg.max_hold_ticks:
+            logger.warning("%s has held the cursor below serial %d for %d ticks (%s); passing it", name, serial,
+                           ticks, why)
+            _alert_project(cfg, conn, name, serial, "gave_up",
+                           f"pydiffwatch gave up on project {name}: it held the cursor for {ticks} ticks "
+                           f"({_clip(why)})")
+    store.set_meta(conn, "ingest_holds", json.dumps(now, sort_keys=True))
+
+
 def _to_fetch(conn, rel) -> bool:
     """Whether run_once fetches and processes this ingest item. A release not yet at a TERMINAL stage is
     fetched. An sdist upload re-scans a release left wheel-only (its wheels uploaded first); on any other
@@ -776,7 +806,22 @@ def run_once(cfg: Config, *, seed_if_fresh: bool = True, recent: int | None = No
         _retry_metadata(cfg, conn, rvw, ruleset, offline, guard)
         tick_start = datetime.datetime.now(datetime.UTC)
         floor = store.get_meta(conn, "ingest_floor")
-        found = ingest.changes_since(cfg, last, floor=floor, stage=lambda p, v: store.get_stage(conn, p, v))
+        if last == 0 and not seed_if_fresh:
+            store.set_meta(conn, "ingest_backfill", _iso(tick_start))   # a crawl from genesis: no floor until caught up
+        elif last > 0 and floor is None and store.get_meta(conn, "ingest_backfill") is None:
+            # A database from the changelog build has a cursor and no floor: without one, every old version of
+            # each changed project would count as new. Seed it from the cursor's last move.
+            since = ingest._when((store.get_cursor(conn) or {}).get("updated_at")) or tick_start
+            floor = _iso(since - datetime.timedelta(minutes=cfg.floor_margin_minutes))
+            store.set_meta(conn, "ingest_floor", floor)
+            logger.info("no ingest floor on a cursor at serial %d; seeded it to %s", last, floor)
+        try:
+            holds = json.loads(store.get_meta(conn, "ingest_holds") or "{}")
+        except ValueError:
+            holds = {}
+        released = frozenset(n for n, h in holds.items() if h.get("ticks", 0) >= cfg.max_hold_ticks)
+        found = ingest.changes_since(cfg, last, floor=floor, stage=lambda p, v: store.get_stage(conn, p, v),
+                                     terminal=frozenset(TERMINAL), release_holds=released)
         ceiling = getattr(found, "ceiling", None)   # a plain list (older stubs) has none: advance to listed serials
         releases = list(found)[:cfg.max_releases_per_run]
         prepared = [(rel, _to_fetch(conn, rel)) for rel in releases]
@@ -807,7 +852,12 @@ def run_once(cfg: Config, *, seed_if_fresh: bool = True, recent: int | None = No
                         blocked = True  # stop advancing past the first non-terminal release
                     else:
                         blocked = True  # a later terminal release after the block: still can't advance
-        if ceiling is not None:
+        if ceiling is not None:            # the index was read: account for held and refused projects
+            _note_holds(cfg, conn, holds, getattr(found, "held", []))
+            for name, serial in getattr(found, "refused", []):
+                _alert_project(cfg, conn, name, serial, "refused_to_fetch",
+                               f"pydiffwatch refused to fetch the PyPI JSON of project {name} (it is over the "
+                               f"metadata size cap)")
             advance_to = ceiling if not blocked else min(advance_to, ceiling)
             if not blocked and getattr(found, "complete", False):
                 margin = datetime.timedelta(minutes=cfg.floor_margin_minutes)

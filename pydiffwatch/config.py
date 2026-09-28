@@ -71,6 +71,7 @@ class Config:
     max_index_bytes: int = 256_000_000     # decoded /simple/ index cap (~44 MB in 2026); refuses a gzip bomb
     recent_floor_hours: float = 24.0       # --recent: unseen versions uploaded this far back still count as new
     floor_margin_minutes: float = 120.0    # the new-version floor trails tick start by this (index/JSON CDN lag)
+    max_hold_ticks: int = 12               # ticks one failing/stale project may hold the cursor before it is passed
     fetch_concurrency: int = 4
     new_package_policy: str = "surface"   # "surface" | "skip" | "full"
     threshold_t: float = 40.0             # baseline default; tune for your tolerance

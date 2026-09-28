@@ -379,7 +379,8 @@ project answers **404**, or its JSON no longer lists the version) is **removed b
 kind (`project gone` / `version gone`), with no alert and no `pending` entry, since the files are gone and nobody
 can act on it; the status strip counts them. It
 is re-checked once, `wheel_only_grace_minutes` later, before it is recorded, so a JSON that lags a new upload is
-never mistaken for a removal. Any other failure on a release (a metadata timeout, 5xx
+never mistaken for a removal. A release PyPI removes before ingest lists it is no longer recorded at all,
+because PyPI's simple index reports no removals. Any other failure on a release (a metadata timeout, 5xx
 or malformed JSON, a failed or timed-out sdist download, an error while diffing or scoring it) retries on
 later ticks without holding up the releases after it; after 3 attempts it becomes `gave_up` and shows up
 in `pending`, with the error kept on the release row (`fetch_note`). Each retry attempt gets that many

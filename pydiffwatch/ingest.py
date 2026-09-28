@@ -34,9 +34,15 @@ class Changes(list):
     resolve, or cut by a per-run cap). A plain list (a test stub) has no ceiling: the cursor then advances only
     to listed serials. `complete`: True only when the ceiling reached the index's own serial untouched — no
     project was held, stale or cut, and no release cap lowered it (Task 3 uses this to decide whether the
-    poll fully caught the index up)."""
+    poll fully caught the index up). `held`: (name, index serial, reason) of each project that lowered the ceiling
+    through an error or a stale copy, or would have but for `release_holds` (cap-cut projects are not listed).
+    `refused`: (name, index serial) of each project whose JSON was refused (over the size cap); it never holds."""
     ceiling: int | None = None
     complete: bool = False
+
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.held, self.refused = [], []
 
 
 def _get(cfg: Config, url: str, headers: dict, limit: int, deadline: float):
@@ -44,7 +50,11 @@ def _get(cfg: Config, url: str, headers: dict, limit: int, deadline: float):
     (a 304 included) and URLError/OSError/TimeoutError as urllib does."""
     req = urllib.request.Request(url, headers={"User-Agent": _UA, **headers})
     with urllib.request.urlopen(req, timeout=cfg.fetch_timeout_s) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
-        return r.status, r.headers, read_body(r, cfg, limit, deadline)
+        body = read_body(r, cfg, limit, deadline)
+        declared = r.headers.get("Content-Length")
+        if declared and declared.strip().isdigit() and len(body) < int(declared):
+            raise ValueError(f"body cut short: {len(body)} of {declared} bytes")
+        return r.status, r.headers, body
 
 
 def _gunzip(data: bytes, cap: int) -> bytes:
@@ -83,7 +93,10 @@ def _index_text(cfg: Config) -> str:
 def _changed(text: str, since: int) -> tuple[int, list[tuple[int, str]]]:
     """(the index's own serial, [(serial, name)] of projects with `_last-serial` > since, ascending). Scans flat
     `{...}` objects with a regex and json-decodes only the ones above the cursor, so the ~900k-entry document is
-    never loaded whole. Raises ValueError when the meta serial is missing (a truncated or foreign body)."""
+    never loaded whole. Raises ValueError when the meta serial is missing (a truncated or foreign body), or when the
+    body does not end `]}`: PyPI puts `meta` first and `projects` last, so a cut body loses its close."""
+    if not text.rstrip().endswith("]}"):
+        raise ValueError("simple index is truncated (does not end with ']}')")
     m = _META.search(text)
     meta = json.loads(m.group(1)).get("_last-serial") if m else None
     if not isinstance(meta, int) or isinstance(meta, bool):
@@ -169,27 +182,33 @@ def _fetch_summary(cfg: Config, name: str):
     return served, info["name"], versions
 
 
-def _new_versions(pkg, versions, serial: int, floor, stage) -> list[NewRelease]:
+def _new_versions(pkg, versions, serial: int, floor, stage, terminal=None) -> list[NewRelease]:
     """The versions of one changed project to hand the orchestrator, from `_fetch_summary`'s reduced form:
-    unseen ones first uploaded at/after the floor (every unseen one when floor is None), and wheel-only ones
-    whose sdist has now arrived. `pkg` is None when the project's JSON was malformed: nothing to emit."""
+    unseen ones first uploaded at/after the floor (every unseen one when floor is None), wheel-only ones
+    whose sdist has now arrived, and (when `terminal` is given) recorded ones left at a non-terminal stage, e.g.
+    `ingested` by a crash mid-scan, with no floor check. `pkg` is None when the project's JSON was malformed."""
     if pkg is None:
         return []
     out = []
     for ver, (first_upload, has_sdist) in versions.items():
         st = stage(pkg, ver)
-        if st is None and (floor is None or first_upload >= floor):
-            out.append(NewRelease(pkg, ver, serial))
-        elif st in _WHEEL_ONLY and has_sdist:
+        if st in _WHEEL_ONLY and has_sdist:
             out.append(NewRelease(pkg, ver, serial, new_release=False, sdist_upload=True))
+        elif st is None and (floor is None or first_upload >= floor):
+            out.append(NewRelease(pkg, ver, serial))
+        elif terminal is not None and st is not None and st not in terminal:
+            out.append(NewRelease(pkg, ver, serial))
     return out
 
 
-def changes_since(cfg: Config, since_serial: int, *, floor=None, stage=None) -> Changes:
+def changes_since(cfg: Config, since_serial: int, *, floor=None, stage=None, terminal: frozenset | None = None,
+                  release_holds: frozenset[str] = frozenset()) -> Changes:
     """Releases in projects whose index serial is above `since_serial`, ascending serial, with `ceiling` set
     (spec: Design 1-4). `floor` (ISO-8601 UTC) bounds which unseen versions count as new; `stage(pkg, ver)` is the
-    store's stage lookup, called only on this thread. Never raises: an index failure returns an empty Changes
-    with no ceiling, so the cursor holds and the next tick retries."""
+    store's stage lookup, called only on this thread. `terminal`: stages that are done; a recorded version at any
+    other stage is re-emitted. `release_holds`: index names whose failure or staleness no longer lowers the
+    ceiling (they are still fetched, emitted and reported in `held`). Never raises: an index failure returns an
+    empty Changes with no ceiling, so the cursor holds and the next tick retries."""
     stage = stage or (lambda p, v: None)
     floor = _when(floor)                                # None (backfill, or unparseable) accepts every unseen version
     try:
@@ -210,23 +229,28 @@ def changes_since(cfg: Config, since_serial: int, *, floor=None, stage=None) -> 
             return e
     with ThreadPoolExecutor(max_workers=max(1, cfg.fetch_concurrency)) as ex:
         results = list(ex.map(fetch, changed))
-    out = []
+    out, held, refused = [], [], []
     for (serial, name), got in zip(changed, results):
         if isinstance(got, RefusedToFetch):
             # Permanently over cfg.max_metadata_bytes: never fetchable, so never let it freeze the cursor.
             logger.error("PyPI JSON for %s refused (%s); skipping it (over the metadata size cap)", name, got)
+            refused.append((name, serial))
             continue
         if isinstance(got, Exception):
             logger.warning("PyPI JSON for %s failed (%s: %s); cursor held below serial %d",
                            name, type(got).__name__, got, serial)
-            ceiling = min(ceiling, serial - 1)
+            held.append((name, serial, f"its PyPI JSON failed ({type(got).__name__}: {got})"))
+            if name not in release_holds:
+                ceiling = min(ceiling, serial - 1)
             continue
         served, pkg, versions = got
         if served is None:
             continue                                    # 404: project gone, nothing new to scan
         if served < serial:                             # a stale CDN copy: re-read it next tick
-            ceiling = min(ceiling, serial - 1)
-        out.extend(_new_versions(pkg, versions, serial, floor, stage))
+            held.append((name, serial, f"PyPI served a stale copy of its JSON (serial {served} < {serial})"))
+            if name not in release_holds:
+                ceiling = min(ceiling, serial - 1)
+        out.extend(_new_versions(pkg, versions, serial, floor, stage, terminal))
     out.sort(key=lambda r: r.serial)
     if len(out) > cfg.max_releases_per_run:
         ceiling = min(ceiling, out[cfg.max_releases_per_run].serial - 1)
@@ -234,4 +258,5 @@ def changes_since(cfg: Config, since_serial: int, *, floor=None, stage=None) -> 
     res = Changes(out)
     res.ceiling = ceiling
     res.complete = (ceiling == meta)
+    res.held, res.refused = held, refused
     return res

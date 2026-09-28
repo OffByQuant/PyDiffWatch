@@ -256,3 +256,110 @@ def test_ingest_no_longer_uses_xml_rpc():
     assert "xmlrpc" not in src and "changelog_since_serial" not in src
     toml = (pathlib.Path(ingest.__file__).parent.parent / "pyproject.toml").read_text()
     assert "defusedxml" not in toml
+
+
+# ---- final fix pass: C2 re-list interrupted releases, I1 bounded holds, P1 refused report, I2 truncation ----
+
+def test_an_interrupted_release_is_relisted_and_a_terminal_one_is_not(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    _serve(monkeypatch, _index([(50, "alpha-demo")], 50),
+           {"alpha-demo": (50, _pj("Alpha-Demo", 50, {"1.0": [("sdist", "2019-01-01T00:00:00Z")],
+                                                       "1.1": [("sdist", "2019-01-02T00:00:00Z")]}))})
+    stages = {"1.0": "ingested", "1.1": "triaged"}
+    got = ingest.changes_since(cfg, 40, floor=T0, stage=lambda p, v: stages[v],
+                               terminal=frozenset({"triaged"}))
+    assert [(r.package, r.version, r.serial, r.new_release, r.sdist_upload) for r in got] == \
+        [("Alpha-Demo", "1.0", 50, True, False)]
+    assert got.ceiling == 50
+    assert list(ingest.changes_since(cfg, 40, floor=T0, stage=lambda p, v: stages[v])) == []
+
+
+def test_the_wheel_only_branch_still_wins_when_terminal_is_given(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    _serve(monkeypatch, _index([(60, "alpha-demo")], 60),
+           {"alpha-demo": (60, _pj("Alpha-Demo", 60, {"2.0": [("bdist_wheel", "2026-01-01T00:00:00Z"),
+                                                            ("sdist", "2026-09-28T11:00:00Z")]}))})
+    got = ingest.changes_since(cfg, 40, floor=T0, stage=lambda p, v: "no_sdist_wait", terminal=frozenset())
+    assert [(r.version, r.new_release, r.sdist_upload) for r in got] == [("2.0", False, True)]
+
+
+def test_failed_and_stale_projects_are_reported_as_held(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    _serve(monkeypatch, _index([(50, "stale-demo"), (60, "flaky-demo"), (70, "beta-demo")], 70),
+           {"stale-demo": (45, _pj("Stale-Demo", 45, {"1.0": [("sdist", "2026-09-28T10:05:00Z")]})),
+            "beta-demo": (70, _pj("Beta-Demo", 70, {"3.0": [("sdist", "2026-09-28T10:07:00Z")]}))},
+           fail={"flaky-demo"})
+    got = ingest.changes_since(cfg, 40, floor=T0, stage=lambda p, v: None)
+    assert [(n, s) for n, s, _ in got.held] == [("stale-demo", 50), ("flaky-demo", 60)]
+    assert all(isinstance(why, str) and why for _, _, why in got.held)
+    assert got.ceiling == 49
+
+
+def test_a_released_hold_is_still_fetched_but_no_longer_lowers_the_ceiling(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    fetched = []
+    _serve(monkeypatch, _index([(50, "stale-demo"), (60, "flaky-demo"), (70, "beta-demo")], 70),
+           {"stale-demo": (45, _pj("Stale-Demo", 45, {"1.0": [("sdist", "2026-09-28T10:05:00Z")]})),
+            "beta-demo": (70, _pj("Beta-Demo", 70, {"3.0": [("sdist", "2026-09-28T10:07:00Z")]}))},
+           fail={"flaky-demo"})
+    real = ingest._get
+    monkeypatch.setattr(ingest, "_get", lambda c, url, *a: fetched.append(url) or real(c, url, *a))
+    got = ingest.changes_since(cfg, 40, floor=T0, stage=lambda p, v: None,
+                               release_holds=frozenset({"stale-demo", "flaky-demo"}))
+    assert any("/pypi/flaky-demo/" in u for u in fetched)
+    assert [r.package for r in got] == ["Stale-Demo", "Beta-Demo"]      # a released hold still emits
+    assert got.ceiling == 70
+    assert [(n, s) for n, s, _ in got.held] == [("stale-demo", 50), ("flaky-demo", 60)]
+
+
+def test_a_refused_project_is_reported_and_is_not_held(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+
+    def fake_get(cfg_, url, headers, limit, deadline):
+        if url.endswith("/simple/"):
+            return 200, _hdrs(), _index([(50, "huge-demo"), (60, "beta-demo")], 60)
+        if "huge-demo" in url:
+            raise fetcher.RefusedToFetch("download-size")
+        return 200, _hdrs(X_PyPI_Last_Serial="60"), _pj("Beta-Demo", 60, {"3.0": [("sdist", "2026-09-28T10:07:00Z")]})
+    monkeypatch.setattr(ingest, "_get", fake_get)
+    got = ingest.changes_since(cfg, 40, floor=T0, stage=lambda p, v: None)
+    assert got.refused == [("huge-demo", 50)]
+    assert got.held == [] and got.ceiling == 60
+
+
+def _truncated_index():
+    full = json.dumps({"meta": {"_last-serial": 500},
+                       "projects": [{"_last-serial": 100 + i, "name": f"p{i}-demo"} for i in range(300)]}).encode()
+    return full, full[: len(full) // 2]
+
+
+def test_a_truncated_uncompressed_index_is_refused(tmp_path, monkeypatch):
+    full, cut = _truncated_index()
+    assert full.decode().rstrip().endswith("]}")
+    with pytest.raises(ValueError):
+        ingest._changed(cut.decode(), 0)
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(ingest, "_get", lambda *a: (200, _hdrs(), cut))
+    got = ingest.changes_since(cfg, 0, floor=T0, stage=lambda p, v: None)
+    assert list(got) == [] and got.ceiling is None
+
+
+def test_get_refuses_a_body_shorter_than_its_content_length(tmp_path, monkeypatch):
+    import http.client
+    full, cut = _truncated_index()
+
+    def respond(body, length):
+        raw = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n" % length) + body
+
+        class Sock:
+            def makefile(self, *a, **k):
+                return io.BufferedReader(io.BytesIO(raw))
+        r = http.client.HTTPResponse(Sock())
+        r.begin()
+        return r
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(ingest.urllib.request, "urlopen", lambda req, timeout: respond(cut, len(full)))
+    with pytest.raises(ValueError):
+        ingest._get(cfg, "https://pypi.invalid/simple/", {}, 10**9, 60)
+    monkeypatch.setattr(ingest.urllib.request, "urlopen", lambda req, timeout: respond(full, len(full)))
+    assert ingest._get(cfg, "https://pypi.invalid/simple/", {}, 10**9, 60)[2] == full
