@@ -193,6 +193,13 @@ def _corpus() -> set:
         _CORPUS = deps.load_corpus()
     return _CORPUS
 
+_ORGS = None
+def _orgs() -> frozenset:
+    global _ORGS
+    if _ORGS is None:
+        _ORGS = deps.load_popular_orgs()
+    return _ORGS
+
 def _requires_dist(package: str, version: str, cfg: Config) -> list | None:
     """`info.requires_dist` for an EXACT version (the package-level JSON only carries the latest's); [] when it
     declares none, None when the lookup failed. Never raises."""
@@ -247,7 +254,7 @@ def _screen_added_deps(meta: dict, package: str, pred_version: str | None, cfg: 
         return []
     return deps.screen_added_deps(added, _corpus(), fetch_json=lambda n: _dep_json(n, cfg),
                                   now=datetime.now(timezone.utc), brandnew_days=cfg.dep_brandnew_days,
-                                  cap=cfg.max_dep_lookups, own=deps.identity(meta))
+                                  cap=cfg.max_dep_lookups, own=deps.identity(meta), orgs=_orgs())
 
 def _maintainer_metadata(meta: dict, new_sd: dict | None) -> dict:
     """Maintainer identity captured from the package JSON we already fetched — author/maintainer names,

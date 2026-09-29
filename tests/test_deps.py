@@ -229,3 +229,104 @@ def test_findings_never_carry_an_email():
     meta = _dep_meta(days_ago=730, releases=1, email="dev@example.org")
     out, _ = _screen({"reqursts", "compyps"}, {"reqursts": meta, "compyps": _dep_meta(roles=("acmedev",))})
     assert "@" not in json.dumps(out)
+
+
+# ---- popular PyPI organisation clears a typosquat-close dep (spec 2026-09-29) ----
+_ACME_CORPUS = frozenset({"acme-http", "acme-core", "acme-models"})
+_ORGS = frozenset({"acme-org"})
+
+
+def _org_screen(metas, names=("acme-http2",), **kw):
+    return _screen(set(names), metas, corpus=_ACME_CORPUS, orgs=kw.pop("orgs", _ORGS), **kw)
+
+
+def test_org_of_normalizes_and_rejects_non_strings():
+    assert deps.org_of({"ownership": {"organization": "  Acme_Org "}}) == "acme-org"
+    for meta in ({"ownership": {"organization": ""}}, {"ownership": {"organization": None}},
+                 {"ownership": {"organization": 3}}, {"ownership": None}, {}, None, [1]):
+        assert deps.org_of(meta) is None
+
+
+def test_a_popular_org_dep_is_not_a_typosquat_and_its_target_is_not_fetched():
+    cand = _dep_meta(days_ago=139, releases=18, roles=("successor-dev",), org="acme-org", email="a@example.org")
+    out, calls = _org_screen({"acme-http2": cand, "acme-http": _dep_meta(email="a@example.org")})
+    assert out == [] and calls == ["acme-http2"]
+
+
+def test_a_young_popular_org_dep_is_brand_new_with_its_org():
+    out, _ = _org_screen({"acme-http2": _dep_meta(days_ago=2, org="Acme_Org")})
+    assert out == [{"name": "acme-http2", "reason": "brand-new", "pypi_org": "acme-org"}]
+
+
+def test_same_owner_and_popular_org_carry_both():
+    out, _ = _org_screen({"acme-http2": _dep_meta(days_ago=2, roles=("acmedev",), org="acme-org")})
+    assert out == [{"name": "acme-http2", "reason": "brand-new", "same_owner": True, "pypi_org": "acme-org"}]
+
+
+def test_an_org_outside_the_map_stays_a_typosquat_with_its_org():
+    out, _ = _org_screen({"acme-http2": _dep_meta(days_ago=139, releases=18, org="other-org")})
+    assert out[0]["reason"] == "typosquat" and out[0]["pypi_org"] == "other-org"
+
+
+def test_a_missing_or_odd_org_stays_a_typosquat():
+    for org in (None, "", "   "):
+        meta = _dep_meta(days_ago=139, releases=18)
+        meta["ownership"]["organization"] = org
+        out, _ = _org_screen({"acme-http2": meta})
+        assert out[0]["reason"] == "typosquat"
+
+
+def test_a_young_popular_org_dep_that_is_not_typosquat_close_is_brand_new_with_its_org():
+    out, _ = _org_screen({"zzqx-tool": _dep_meta(days_ago=2, org="acme-org")}, names=("zzqx-tool",))
+    assert out == [{"name": "zzqx-tool", "reason": "brand-new", "pypi_org": "acme-org"}]
+
+
+def test_a_transient_or_capped_lookup_ignores_the_org_map():
+    out, _ = _org_screen({})                                               # fetch_json returned {}
+    assert out == [{"name": "acme-http2", "reason": "typosquat", "target": "acme-http"}]
+    out, _ = _org_screen({"acme-http2": _dep_meta(org="acme-org"), "acme-httpx": _dep_meta(org="acme-org")},
+                         names=("acme-http2", "acme-httpx"), cap=1)
+    assert {"name": "acme-httpx", "reason": "typosquat", "target": "acme-http"} in out
+
+
+def test_without_orgs_the_org_is_only_annotated():
+    meta = _dep_meta(days_ago=139, releases=18, org="acme-org")
+    out, _ = _screen({"acme-http2"}, {"acme-http2": meta}, corpus=_ACME_CORPUS)
+    assert out[0]["reason"] == "typosquat" and out[0]["pypi_org"] == "acme-org"
+
+
+def test_load_popular_orgs_needs_two_packages(tmp_path):
+    p = tmp_path / "orgs.txt"
+    p.write_bytes(b"# header\r\n\r\nacme-org\tacme-core\r\nAcme_Org\tacme-models\r\nacme-org\tacme-core\r\n"
+                  b"solo-org\tacme-http\r\nbroken-line\r\ndup-org\tacme-a\ndup-org\tacme-a\n")
+    assert deps.load_popular_orgs(str(p)) == frozenset({"acme-org"})
+    assert deps.load_popular_orgs(str(p), min_packages=1) == frozenset({"acme-org", "solo-org", "dup-org"})
+
+
+def test_load_popular_orgs_missing_file_is_empty(tmp_path):
+    assert deps.load_popular_orgs(str(tmp_path / "absent.txt")) == frozenset()
+
+
+def test_load_popular_orgs_skips_lines_without_exactly_two_columns(tmp_path):
+    p = tmp_path / "orgs.txt"
+    p.write_text("solo-org\tacme-a\ta note\nsolo-org\tacme-a\n")
+    assert deps.load_popular_orgs(str(p)) == frozenset()
+
+
+def test_load_popular_orgs_unreadable_file_is_empty(tmp_path):
+    p = tmp_path / "orgs.txt"
+    p.write_bytes(b"acme-org\tacme-a\n\xff\xfe\x00bad\n")
+    assert deps.load_popular_orgs(str(p)) == frozenset()
+
+
+def test_the_vendored_org_map_is_populated_and_matches_the_names_corpus():
+    import re
+    assert len(deps.load_popular_orgs()) >= 20
+    corpus = deps.load_corpus()
+    with open(deps._ORGS_PATH, encoding="utf-8") as f:
+        text = f.read()
+    rows = [ln.split("\t") for ln in text.splitlines() if ln and not ln.startswith("#")]
+    assert rows and all(len(r) == 2 and r[1] in corpus for r in rows)
+    with open(deps._CORPUS_PATH, encoding="utf-8") as f:
+        names_date = re.search(r"fetched (\d{4}-\d{2}-\d{2})", f.read()).group(1)
+    assert f"(itself fetched {names_date})" in text     # rebuilt in the same refresh as top_pypi_names.txt

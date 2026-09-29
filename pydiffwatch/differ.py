@@ -58,8 +58,13 @@ def _dep_line(f) -> str:
         return line
     if reason == "nonexistent" and target:
         return f"dependency {name}: not on PyPI (dependency confusion); {near}"
-    if reason == "brand-new" and f.get("same_owner"):
-        return f"dependency {name}: brand-new on PyPI; the same PyPI owner as this package"
+    if reason == "brand-new" and (f.get("same_owner") or f.get("pypi_org")):
+        line = f"dependency {name}: brand-new on PyPI"
+        if f.get("same_owner"):
+            line += "; the same PyPI owner as this package"
+        if f.get("pypi_org"):
+            line += f"; published under the PyPI organisation {_esc(f['pypi_org'])}, which owns popular packages"
+        return line
     return f"dependency {name}: {_DEP_REASONS.get(reason) or _esc(reason)}"
 
 
